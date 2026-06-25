@@ -148,7 +148,8 @@ reference implementation:
 - `test_malformed.py` — malformed-input decode errors + encoder range / state errors + sticky mode
 - `test_varint.py` — varint / zigzag codec
 
-Current coverage: **~91% of statements** (`pytest --cov=sofab`).
+Coverage is measured on every CI run on `main` and reported by the **coverage**
+badge above (updated automatically via the `badges` branch).
 
 [`Encoder`]: src/sofab/encoder.py
 [`Decoder`]: src/sofab/decoder.py

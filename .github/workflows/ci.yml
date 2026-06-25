@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported (matches pyproject requires-python) plus current releases.
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install package and tooling
+        run: python -m pip install -e . pytest ruff mypy
+
+      - name: Lint (ruff)
+        run: ruff check src/sofab tests
+
+      - name: Type-check (mypy)
+        run: mypy --strict src/sofab
+
+      - name: Test
+        run: pytest
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to publish the generated badge to the `badges` branch
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install package and tooling
+        run: python -m pip install -e . pytest pytest-cov coverage
+
+      - name: Run tests with coverage
+        run: pytest --cov=sofab --cov-report=term-missing
+
+      - name: Compute coverage badge data
+        id: cov
+        run: |
+          coverage json -o coverage_py.json
+          pct=$(python -c "import json; print(f\"{json.load(open('coverage_py.json'))['totals']['percent_covered']:.0f}\")")
+          if   [ "$pct" -ge 90 ]; then color=brightgreen
+          elif [ "$pct" -ge 75 ]; then color=green
+          elif [ "$pct" -ge 50 ]; then color=yellow
+          else color=red; fi
+          echo "Coverage: ${pct}% (${color})"
+          echo "pct=${pct}" >> "$GITHUB_OUTPUT"
+          mkdir -p badge
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' \
+            "$pct" "$color" > badge/coverage.json
+
+      - name: Publish badge to the badges branch
+        # Only from CI runs on main itself: PRs (ref refs/pull/*/merge) and runs
+        # on any other branch must not move the published badge.
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./badge
+          publish_branch: badges
+          force_orphan: true
+          commit_message: "chore(badge): update coverage to ${{ steps.cov.outputs.pct }}%"
