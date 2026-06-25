@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sofabuffers"
+version = "0.1.0"
+description = "Pure-Python runtime for the SofaBuffers binary wire format"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "SofaBuffers" }]
+keywords = ["sofabuffers", "serialization", "streaming", "wire-format"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Typing :: Typed",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/sofa-buffers/corelib-py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sofab"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test data tables (byte vectors, parametrize rows) are intentionally wide,
+# and compact "advance; assert" lines keep the vector walks readable.
+"tests/*" = ["E501", "E702"]
+
+[tool.mypy]
+strict = true
+files = ["src/sofab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
