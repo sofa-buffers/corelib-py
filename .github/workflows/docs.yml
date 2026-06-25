@@ -5,19 +5,21 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Official GitHub Pages deployment (no gh-pages branch): build the docs as an
+# artifact and deploy it straight to Pages.
 permissions:
   contents: read
+  pages: write
+  id-token: write
 
 concurrency:
-  group: docs-${{ github.ref }}
-  cancel-in-progress: true
+  group: pages
+  cancel-in-progress: false
 
 jobs:
-  docs:
-    name: Build & publish API docs
+  build:
+    name: Build API docs
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # to publish to the gh-pages branch
     steps:
       - uses: actions/checkout@v4
 
@@ -32,12 +34,22 @@ jobs:
       - name: Build API docs
         run: pdoc -o site sofab
 
-      - name: Publish to GitHub Pages
-        if: github.ref == 'refs/heads/main'
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./site
-          publish_branch: gh-pages
-          force_orphan: true
-          commit_message: "docs: rebuild API documentation"
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
