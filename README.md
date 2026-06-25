@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/sofabuffers_logo.png" alt="SofaBuffers Logo" height="140"></p>
+<p align="center"><img src="assets/sofabuffers_logo.png" alt="SofaBuffers" height="140"></p>
 
 # SofaBuffers
 
@@ -11,6 +11,7 @@
 
 [![CI](https://github.com/sofa-buffers/corelib-py/actions/workflows/ci.yml/badge.svg)](https://github.com/sofa-buffers/corelib-py/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fsofa-buffers%2Fcorelib-py%2Fbadges%2Fcoverage.json)](https://github.com/sofa-buffers/corelib-py/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-online-blue)](https://sofa-buffers.github.io/corelib-py/)
 
 [GitHub repository](https://github.com/sofa-buffers/corelib-py)
 
@@ -24,10 +25,10 @@ runtime.
 
 The wire format is specified, language-neutrally, in the
 [SofaBuffers documentation](https://github.com/sofa-buffers/documentation). The
-unit tests here use the exact byte vectors from the
-[C corelib](https://github.com/sofa-buffers/corelib-c-cpp)'s reference suite
-(`test/c/test_ostream.c`) to guarantee byte-for-byte interoperability with the C,
-C++, Rust, Go and Java implementations.
+unit tests here validate against the shared, language-agnostic conformance suite
+(`assets/test_vectors.json`, copied verbatim from that repo) to guarantee
+byte-for-byte interoperability with the C, C++, Rust, Go and Java
+implementations.
 
 Distribution: `sofabuffers` · import package `sofab`. Requires Python 3.9+.
 
@@ -48,13 +49,6 @@ pip install sofabuffers
 | Typed | Fully type-annotated and ships a `py.typed` marker (PEP 561); clean under `mypy --strict`. |
 | Forward/backward compatible | Unknown fields are consumed with `skip()` — old readers tolerate new fields, new readers tolerate missing ones. |
 | 64-bit value type | Matches the C default configuration, so varint lengths and bytes are identical across languages. |
-
-## Source documentation
-
-The language-neutral wire-format specification lives in the
-[SofaBuffers documentation](https://github.com/sofa-buffers/documentation). API
-documentation for this package is published to GitHub Pages on every push to
-`main`.
 
 ## Usage
 
@@ -110,9 +104,15 @@ arrive — it works correctly even when fed one byte at a time.
 `write_sequence_end`, `bytes_used`, `flush`, `getvalue`, and the `error`
 property.
 
+`Encoder.buffer_set(buf, offset=0)` installs a fresh output buffer mid-stream
+(typically from inside the flush sink).
+
 **Decoder** — `next`, `field`, `unsigned`, `signed`, `bool`, `float32`,
 `float64`, `string`, `bytes`, `read_unsigned_array`, `read_signed_array`,
 `read_float32_array`, `read_float64_array`, `skip`.
+
+**Module** — `API_VERSION` (currently `1`), and the limits `ID_MAX`,
+`ARRAY_MAX`, `UNSIGNED_MAX`, `SIGNED_MIN`, `SIGNED_MAX`.
 
 > **Note on value width:** like the C default configuration, the scalar value
 > type is 64-bit, so varint encodings match byte-for-byte across the C, C++,
@@ -128,28 +128,40 @@ property.
 | `object.c` (descriptor transcoder) | — | not ported. The idiomatic Python equivalent is generated message classes from a schema-driven generator; the streaming core above already covers serialize / deserialize. |
 | — | `_varint.py` / `_core.py` | varint / zigzag + IEEE-754 helpers, isolated as the hot path so a native accelerator can replace them without an API change. |
 
-## Testing & coverage
+## Feature flags / build options
+
+The C library exposes compile-time `SOFAB_DISABLE_*` switches (fixlen, fp64,
+array, sequence, overflow checks) to strip whole code paths for tiny
+microcontrollers. **Python has no equivalent** — the package always builds the
+full format (unsigned / signed varints, fp32 / fp64, strings, blobs, arrays and
+nested sequences), since the desktop, server and cloud targets it runs on are
+not code-size constrained. The scalar value type is 64-bit, matching the C
+default configuration so the wire image and varint lengths are identical.
+
+## Build & test
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -e . pytest ruff mypy
-pytest                       # unit + roundtrip + streaming + malformed
+pytest                       # vectors + roundtrip + streaming + malformed
 ruff check src/sofab tests   # lint
 mypy --strict src/sofab      # type-check
 ```
 
-Tests are split by concern, and every wire vector is taken verbatim from the C
-reference implementation:
+Tests are split by concern; the conformance suite validates against the shared,
+language-agnostic vectors copied verbatim from the `documentation` repo:
 
-- `test_vectors_ostream.py` — encoder, byte-exact vs. the C vectors (incl. the full-scale example)
-- `test_vectors_istream.py` — decoder over the same vectors, walking every field
+- `test_conformance_vectors.py` — every vector in `assets/test_vectors.json`, encode (byte-exact) **and** decode
+- `test_vectors_ostream.py` / `test_vectors_istream.py` — extra encoder/decoder coverage incl. the full-scale example
 - `test_roundtrip.py` — encode → decode value preservation (scalars, arrays, strings/blobs, sequences, boundary values)
 - `test_streaming.py` — 1-byte-granularity decode + tiny-scratch-buffer encode match the one-shot path
 - `test_malformed.py` — malformed-input decode errors + encoder range / state errors + sticky mode
 - `test_varint.py` — varint / zigzag codec
 
 Coverage is measured on every CI run on `main` and reported by the **coverage**
-badge above (updated automatically via the `badges` branch).
+badge above (updated automatically via the `badges` branch). API documentation
+is built with `pdoc` and published to GitHub Pages on every push to `main` (the
+**docs** badge links to it).
 
 ## Benchmarks
 
