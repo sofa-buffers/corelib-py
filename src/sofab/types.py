@@ -12,6 +12,10 @@ from enum import IntEnum
 
 # --- limits (from corelib-c-cpp/src/include/sofab/sofab.h) -------------------
 
+#: SofaBuffers API version (mirrors C ``SOFAB_API_VERSION``). Callers and the
+#: code generator use this to verify wire compatibility.
+API_VERSION = 1
+
 #: Highest valid field ID (``INT32_MAX``).
 ID_MAX = 0x7FFF_FFFF
 #: Largest unsigned wire value (``UINT64_MAX``).

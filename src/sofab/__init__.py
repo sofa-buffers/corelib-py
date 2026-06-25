@@ -10,6 +10,7 @@ from ._varint import zigzag_decode, zigzag_encode
 from .decoder import Decoder
 from .encoder import Encoder
 from .types import (
+    API_VERSION,
     ARRAY_MAX,
     ID_MAX,
     SIGNED_MAX,
@@ -38,6 +39,7 @@ __all__ = [
     "SofaRangeError",
     "SofaStateError",
     "SofaBufferError",
+    "API_VERSION",
     "ID_MAX",
     "ARRAY_MAX",
     "UNSIGNED_MAX",

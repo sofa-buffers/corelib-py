@@ -1,0 +1,570 @@
+{
+  "format": "sofabuffers-test-vectors",
+  "version": 1,
+  "description": "SofaBuffers wire-format test vectors generated from the C encoder. Each vector lists the message structure (ordered encode operations and their values) and the exact bytes the encoder produced.",
+  "notes": {
+    "byte_order": "little-endian",
+    "serialized.hex": "lowercase hex of the full message; authoritative ground truth",
+    "integers": "decimal JSON number literals (full u64/i64 range)",
+    "floats": "finite values as JSON numbers; +/-infinity as the strings 'inf'/'-inf'",
+    "blob.value_hex": "lowercase hex of the blob payload",
+    "array.element_type": "input element width/type fed to the encoder (u8..u64, i8..i64, fp32, fp64)"
+  },
+  "vectors": [
+    {
+      "name": "unsigned_0",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 0 }
+      ],
+      "serialized": { "length": 2, "hex": "0000" }
+    },
+    {
+      "name": "unsigned_0x7F",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 127 }
+      ],
+      "serialized": { "length": 2, "hex": "007f" }
+    },
+    {
+      "name": "unsigned_0x80",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 128 }
+      ],
+      "serialized": { "length": 3, "hex": "008001" }
+    },
+    {
+      "name": "unsigned_0x3FFF",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 16383 }
+      ],
+      "serialized": { "length": 3, "hex": "00ff7f" }
+    },
+    {
+      "name": "unsigned_0x4000",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 16384 }
+      ],
+      "serialized": { "length": 4, "hex": "00808001" }
+    },
+    {
+      "name": "unsigned_0x1FFFFF",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 2097151 }
+      ],
+      "serialized": { "length": 4, "hex": "00ffff7f" }
+    },
+    {
+      "name": "unsigned_0x200000",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 2097152 }
+      ],
+      "serialized": { "length": 5, "hex": "0080808001" }
+    },
+    {
+      "name": "unsigned_0xFFFFFFF",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 268435455 }
+      ],
+      "serialized": { "length": 5, "hex": "00ffffff7f" }
+    },
+    {
+      "name": "unsigned_0x10000000",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 268435456 }
+      ],
+      "serialized": { "length": 6, "hex": "008080808001" }
+    },
+    {
+      "name": "unsigned_0x7FFFFFFFF",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 34359738367 }
+      ],
+      "serialized": { "length": 6, "hex": "00ffffffff7f" }
+    },
+    {
+      "name": "unsigned_0x800000000",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 34359738368 }
+      ],
+      "serialized": { "length": 7, "hex": "00808080808001" }
+    },
+    {
+      "name": "unsigned_0x3FFFFFFFFFF",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 4398046511103 }
+      ],
+      "serialized": { "length": 7, "hex": "00ffffffffff7f" }
+    },
+    {
+      "name": "unsigned_0x40000000000",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 4398046511104 }
+      ],
+      "serialized": { "length": 8, "hex": "0080808080808001" }
+    },
+    {
+      "name": "unsigned_0x1FFFFFFFFFFFF",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 562949953421311 }
+      ],
+      "serialized": { "length": 8, "hex": "00ffffffffffff7f" }
+    },
+    {
+      "name": "unsigned_0x2000000000000",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 562949953421312 }
+      ],
+      "serialized": { "length": 9, "hex": "008080808080808001" }
+    },
+    {
+      "name": "unsigned_0xFFFFFFFFFFFFFF",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 72057594037927935 }
+      ],
+      "serialized": { "length": 9, "hex": "00ffffffffffffff7f" }
+    },
+    {
+      "name": "unsigned_0x100000000000000",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 72057594037927936 }
+      ],
+      "serialized": { "length": 10, "hex": "00808080808080808001" }
+    },
+    {
+      "name": "unsigned_0x7FFFFFFFFFFFFFFF",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 9223372036854775807 }
+      ],
+      "serialized": { "length": 10, "hex": "00ffffffffffffffff7f" }
+    },
+    {
+      "name": "unsigned_0x8000000000000000",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 9223372036854775808 }
+      ],
+      "serialized": { "length": 11, "hex": "0080808080808080808001" }
+    },
+    {
+      "name": "unsigned_0xFFFFFFFFFFFFFFFF",
+      "group": "scalar/unsigned",
+      "description": "Unsigned varint at field id 0 covering a varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 18446744073709551615 }
+      ],
+      "serialized": { "length": 11, "hex": "00ffffffffffffffffff01" }
+    },
+    {
+      "name": "id_min",
+      "group": "scalar/id",
+      "description": "Smallest field id (0) with value 0.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 0 }
+      ],
+      "serialized": { "length": 2, "hex": "0000" }
+    },
+    {
+      "name": "id_max",
+      "group": "scalar/id",
+      "description": "Largest field id (SOFAB_ID_MAX = INT32_MAX) with value 0.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 2147483647, "value": 0 }
+      ],
+      "serialized": { "length": 6, "hex": "f8ffffff3f00" }
+    },
+    {
+      "name": "signed_min",
+      "group": "scalar/signed",
+      "description": "INT64_MIN as a zigzag signed varint.",
+      "offset": 0,
+      "fields": [
+        { "op": "signed", "id": 0, "value": -9223372036854775808 }
+      ],
+      "serialized": { "length": 11, "hex": "01ffffffffffffffffff01" }
+    },
+    {
+      "name": "signed_max",
+      "group": "scalar/signed",
+      "description": "INT64_MAX as a zigzag signed varint.",
+      "offset": 0,
+      "fields": [
+        { "op": "signed", "id": 0, "value": 9223372036854775807 }
+      ],
+      "serialized": { "length": 11, "hex": "01feffffffffffffffff01" }
+    },
+    {
+      "name": "boolean_true",
+      "group": "scalar/boolean",
+      "description": "Boolean true encoded as unsigned 1.",
+      "offset": 0,
+      "fields": [
+        { "op": "boolean", "id": 0, "value": true }
+      ],
+      "serialized": { "length": 2, "hex": "0001" }
+    },
+    {
+      "name": "fp32",
+      "group": "scalar/float",
+      "description": "32-bit float 3.1415f as a little-endian fixed-length field.",
+      "offset": 0,
+      "fields": [
+        { "op": "fp32", "id": 0, "value": 3.1415 }
+      ],
+      "serialized": { "length": 6, "hex": "0220560e4940" }
+    },
+    {
+      "name": "fp64",
+      "group": "scalar/float",
+      "description": "64-bit float (double)3.14159265f as a little-endian fixed-length field.",
+      "offset": 0,
+      "fields": [
+        { "op": "fp64", "id": 0, "value": 3.1415927410125732 }
+      ],
+      "serialized": { "length": 10, "hex": "024100000060fb210940" }
+    },
+    {
+      "name": "string",
+      "group": "scalar/string",
+      "description": "UTF-8 string field.",
+      "offset": 0,
+      "fields": [
+        { "op": "string", "id": 0, "value": "Hello Couch!" }
+      ],
+      "serialized": { "length": 14, "hex": "026248656c6c6f20436f75636821" }
+    },
+    {
+      "name": "string_empty",
+      "group": "scalar/string",
+      "description": "Empty string field.",
+      "offset": 0,
+      "fields": [
+        { "op": "string", "id": 0, "value": "" }
+      ],
+      "serialized": { "length": 2, "hex": "0202" }
+    },
+    {
+      "name": "blob",
+      "group": "scalar/blob",
+      "description": "Binary blob field.",
+      "offset": 0,
+      "fields": [
+        { "op": "blob", "id": 0, "value_hex": "0102030405" }
+      ],
+      "serialized": { "length": 7, "hex": "022b0102030405" }
+    },
+    {
+      "name": "blob_empty",
+      "group": "scalar/blob",
+      "description": "Empty blob field.",
+      "offset": 0,
+      "fields": [
+        { "op": "blob", "id": 0, "value_hex": "" }
+      ],
+      "serialized": { "length": 2, "hex": "0203" }
+    },
+    {
+      "name": "array_unsigned_u32",
+      "group": "array/integer",
+      "description": "Array of unsigned values (u32 input).",
+      "offset": 0,
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "u32", "values": [1, 2, 3, 2147483648, 4294967295] }
+      ],
+      "serialized": { "length": 15, "hex": "03050102038080808008ffffffff0f" }
+    },
+    {
+      "name": "array_signed_i32",
+      "group": "array/integer",
+      "description": "Array of signed values (i32 input).",
+      "offset": 0,
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "i32", "values": [-1, -2, -3, -2147483648, 2147483647] }
+      ],
+      "serialized": { "length": 15, "hex": "0405010305ffffffff0ffeffffff0f" }
+    },
+    {
+      "name": "array_i8",
+      "group": "array/integer",
+      "description": "Array of i8.",
+      "offset": 0,
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "i8", "values": [-1, -2, -3, -128, 127] }
+      ],
+      "serialized": { "length": 9, "hex": "0405010305ff01fe01" }
+    },
+    {
+      "name": "array_u8",
+      "group": "array/integer",
+      "description": "Array of u8.",
+      "offset": 0,
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "u8", "values": [1, 2, 3, 0, 255] }
+      ],
+      "serialized": { "length": 8, "hex": "030501020300ff01" }
+    },
+    {
+      "name": "array_i16",
+      "group": "array/integer",
+      "description": "Array of i16.",
+      "offset": 0,
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "i16", "values": [-1, -2, -3, -32768, 32767] }
+      ],
+      "serialized": { "length": 11, "hex": "0405010305ffff03feff03" }
+    },
+    {
+      "name": "array_u16",
+      "group": "array/integer",
+      "description": "Array of u16.",
+      "offset": 0,
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "u16", "values": [1, 2, 3, 0, 65535] }
+      ],
+      "serialized": { "length": 9, "hex": "030501020300ffff03" }
+    },
+    {
+      "name": "array_u64",
+      "group": "array/integer",
+      "description": "Array of u64.",
+      "offset": 0,
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "u64", "values": [1, 2, 3, 0, 18446744073709551615] }
+      ],
+      "serialized": { "length": 16, "hex": "030501020300ffffffffffffffffff01" }
+    },
+    {
+      "name": "array_i64",
+      "group": "array/integer",
+      "description": "Array of i64.",
+      "offset": 0,
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "i64", "values": [-1, -2, -3, -9223372036854775808, 9223372036854775807] }
+      ],
+      "serialized": { "length": 25, "hex": "0405010305ffffffffffffffffff01feffffffffffffffff01" }
+    },
+    {
+      "name": "array_fp32",
+      "group": "array/float",
+      "description": "Array of fp32.",
+      "offset": 0,
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "fp32", "values": [1, 2, 3, -3.40282347e+38, 3.40282347e+38] }
+      ],
+      "serialized": { "length": 23, "hex": "0505200000803f0000004000004040ffff7fffffff7f7f" }
+    },
+    {
+      "name": "array_fp64",
+      "group": "array/float",
+      "description": "Array of fp64.",
+      "offset": 0,
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "fp64", "values": [1, 2, 3, -1.7976931348623157e+308, 1.7976931348623157e+308] }
+      ],
+      "serialized": { "length": 43, "hex": "050541000000000000f03f00000000000000400000000000000840ffffffffffffefffffffffffffffef7f" }
+    },
+    {
+      "name": "array_fp32_specials",
+      "group": "array/float",
+      "description": "Array of fp32 special values: +0, -0, +inf, -inf (NaN excluded).",
+      "offset": 0,
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "fp32", "values": [0, -0, "inf", "-inf"] }
+      ],
+      "serialized": { "length": 19, "hex": "05042000000000000000800000807f000080ff" }
+    },
+    {
+      "name": "array_fp64_specials",
+      "group": "array/float",
+      "description": "Array of fp64 special values: +0, -0, +inf, -inf (NaN excluded).",
+      "offset": 0,
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "fp64", "values": [0, -0, "inf", "-inf"] }
+      ],
+      "serialized": { "length": 35, "hex": "05044100000000000000000000000000000080000000000000f07f000000000000f0ff" }
+    },
+    {
+      "name": "nested_sequence",
+      "group": "sequence",
+      "description": "A scalar, a nested sequence, then a scalar.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "signed", "id": 2, "value": -42 },
+        { "op": "sequence_end" },
+        { "op": "signed", "id": 2, "value": -42 }
+      ],
+      "serialized": { "length": 10, "hex": "002a0e002a1153071153" }
+    },
+    {
+      "name": "nested_sequence_with_array",
+      "group": "sequence",
+      "description": "A nested sequence containing a signed array.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "sequence_begin", "id": 3 },
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "array", "id": 3, "element_type": "i32", "values": [-42, -43, -44] },
+        { "op": "sequence_end" },
+        { "op": "signed", "id": 2, "value": -42 }
+      ],
+      "serialized": { "length": 13, "hex": "002a1e002a1c03535557071153" }
+    },
+    {
+      "name": "nested_sequence_multilevel",
+      "group": "sequence",
+      "description": "Ten levels of nested sequences.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "signed", "id": 2, "value": -42 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "signed", "id": 2, "value": -42 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "signed", "id": 2, "value": -42 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "signed", "id": 2, "value": -42 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "signed", "id": 2, "value": -42 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "signed", "id": 2, "value": -42 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "signed", "id": 2, "value": -42 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "signed", "id": 2, "value": -42 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "signed", "id": 2, "value": -42 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 42 },
+        { "op": "signed", "id": 2, "value": -42 },
+        { "op": "sequence_end" },
+        { "op": "sequence_end" },
+        { "op": "sequence_end" },
+        { "op": "sequence_end" },
+        { "op": "sequence_end" },
+        { "op": "sequence_end" },
+        { "op": "sequence_end" },
+        { "op": "sequence_end" },
+        { "op": "sequence_end" },
+        { "op": "sequence_end" },
+        { "op": "signed", "id": 2, "value": -42 }
+      ],
+      "serialized": { "length": 64, "hex": "002a0e002a11530e002a11530e002a11530e002a11530e002a11530e002a11530e002a11530e002a11530e002a11530e002a1153070707070707070707071153" }
+    },
+    {
+      "name": "full_scale_example",
+      "group": "composite",
+      "description": "Large message mixing scalars, nested sequences, integer/float arrays and strings.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 200 },
+        { "op": "signed", "id": 1, "value": -100 },
+        { "op": "unsigned", "id": 2, "value": 50000 },
+        { "op": "signed", "id": 3, "value": -20000 },
+        { "op": "unsigned", "id": 4, "value": 3000000000 },
+        { "op": "signed", "id": 5, "value": -1000000000 },
+        { "op": "unsigned", "id": 6, "value": 10000000000000 },
+        { "op": "signed", "id": 7, "value": -5000000000000 },
+        { "op": "sequence_begin", "id": 10 },
+        { "op": "fp32", "id": 0, "value": 3.1400001 },
+        { "op": "fp64", "id": 1, "value": 3.1415926500000002 },
+        { "op": "string", "id": 2, "value": "Hello, World!" },
+        { "op": "blob", "id": 3, "value_hex": "deadbeef" },
+        { "op": "sequence_end" },
+        { "op": "sequence_begin", "id": 100 },
+        { "op": "array", "id": 0, "element_type": "u8", "values": [0, 64, 128, 191, 255] },
+        { "op": "array", "id": 1, "element_type": "i8", "values": [-128, -64, 0, 63, 127] },
+        { "op": "array", "id": 2, "element_type": "u16", "values": [0, 16384, 32768, 49151, 65535] },
+        { "op": "array", "id": 3, "element_type": "i16", "values": [-32768, -16384, 0, 16383, 32767] },
+        { "op": "array", "id": 4, "element_type": "u32", "values": [0, 1073741824, 2147483648, 3221225471, 4294967295] },
+        { "op": "array", "id": 5, "element_type": "i32", "values": [-2147483648, -1073741824, 0, 1073741823, 2147483647] },
+        { "op": "array", "id": 6, "element_type": "u64", "values": [0, 4611686018427387904, 9223372036854775808, 13835058055282163711, 18446744073709551615] },
+        { "op": "array", "id": 7, "element_type": "i64", "values": [-9223372036854775807, -4611686018427387904, 0, 4611686018427387903, 9223372036854775807] },
+        { "op": "sequence_begin", "id": 10 },
+        { "op": "array", "id": 0, "element_type": "fp32", "values": [1, 2, 3, -3.40282347e+38, 3.40282347e+38] },
+        { "op": "array", "id": 1, "element_type": "fp64", "values": [1, 2, 3, -1.7976931348623157e+308, 1.7976931348623157e+308] },
+        { "op": "sequence_end" },
+        { "op": "sequence_end" },
+        { "op": "sequence_begin", "id": 200 },
+        { "op": "string", "id": 0, "value": "Hello, Sofab!" },
+        { "op": "string", "id": 1, "value": "" },
+        { "op": "string", "id": 2, "value": "1234567890" },
+        { "op": "string", "id": 3, "value": "äöüÄÖÜß" },
+        { "op": "string", "id": 4, "value": "This_is_a_very_long_test_string_with_!@#$%^&*()_+-=[]{}" },
+        { "op": "sequence_end" }
+      ],
+      "serialized": { "length": 436, "hex": "00c80109c70110d0860319bfb8022080bcc1960b29ffa7d6b9073080c0caf384a30239ffbfcaf384a302560220c3f548400a41f1d4c853fb210940126a48656c6c6f2c20576f726c64211a23deadbeef07a606030500408001bf01ff010c05ff017f007efe01130500808001808002ffff02ffff031c05ffff03ffff0100feff01feff0323050080808080048080808008ffffffff0bffffffff0f2c05ffffffff0fffffffff0700feffffff07feffffff0f33050080808080808080804080808080808080808001ffffffffffffffffbf01ffffffffffffffffff013c05fdffffffffffffffff01ffffffffffffffff7f00feffffffffffffff7ffeffffffffffffffff01560505200000803f0000004000004040ffff7fffffff7f7f0d0541000000000000f03f00000000000000400000000000000840ffffffffffffefffffffffffffffef7f0707c60c026a48656c6c6f2c20536f666162210a021252313233343536373839301a72c3a4c3b6c3bcc384c396c39cc39f22ba03546869735f69735f615f766572795f6c6f6e675f746573745f737472696e675f776974685f21402324255e262a28295f2b2d3d5b5d7b7d07" }
+    }
+  ]
+}

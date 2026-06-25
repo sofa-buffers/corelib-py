@@ -59,19 +59,32 @@ class Encoder:
         *,
         sticky: bool = False,
     ) -> Encoder:
-        if not 0 <= offset < len(buffer):
-            raise SofaRangeError("offset must be within the buffer")
         self = cls.__new__(cls)
         self._writer = None
         self._buf = bytearray()
-        self._fixed = memoryview(buffer)
-        self._cap = len(buffer)
-        self._cursor = offset
+        self._fixed = None
+        self._cap = 0
+        self._cursor = 0
         self._flush_sink = flush
         self._sticky = sticky
         self._error = None
         self._depth = 0
+        self.buffer_set(buffer, offset)
         return self
+
+    def buffer_set(self, buffer: bytearray, offset: int = 0) -> None:
+        """Install a new fixed output buffer mid-stream.
+
+        Mirrors C ``sofab_ostream_buffer_set`` / Rust ``buffer_set`` / Java
+        ``bufferSet``: typically called from inside the flush sink to hand the
+        encoder a fresh buffer so encoding continues without interruption.
+        ``offset`` bytes are reserved at the front (e.g. for a framing header).
+        """
+        if not 0 <= offset < len(buffer):
+            raise SofaRangeError("offset must be within the buffer")
+        self._fixed = memoryview(buffer)
+        self._cap = len(buffer)
+        self._cursor = offset
 
     # --- error / output handling --------------------------------------------
 
