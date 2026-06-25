@@ -151,5 +151,33 @@ reference implementation:
 Coverage is measured on every CI run on `main` and reported by the **coverage**
 badge above (updated automatically via the `badges` branch).
 
+## Benchmarks
+
+`bench/perfbench.py` mirrors the C / C++ / Rust / Go corelib benchmarks — same
+messages, workloads, ids and values — so the implementations can be compared
+directly. Two complementary views:
+
+```bash
+python bench/perfbench.py time            # throughput on this machine, MB/s (MB = 1e6)
+python bench/perfbench.py encode_typical  # one workload, for the Callgrind harness
+```
+
+The `time` mode reports throughput measured against **process CPU time** (not
+wall-clock), so it reflects the cost of the library rather than scheduling
+noise; absolute numbers still vary with CPU speed, load and the Python
+implementation (CPython vs. PyPy).
+
+For a **CPU-speed-independent** cost metric, `bench/run_callgrind.sh` runs each
+workload under Callgrind and reports **instructions retired per operation** —
+deterministic and comparable across machines (and against the other corelibs):
+
+```bash
+bash bench/run_callgrind.sh               # needs valgrind
+```
+
+Because the workloads are Python functions rather than C symbols, the script
+runs each at two rep counts and subtracts the instruction counts, cancelling
+interpreter startup and one-time setup to isolate the per-operation cost.
+
 [`Encoder`]: src/sofab/encoder.py
 [`Decoder`]: src/sofab/decoder.py
