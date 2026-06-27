@@ -2,8 +2,8 @@
 
 # SofaBuffers
 
-<b>Structured Objects For Anyone</b><br>
-<i>... so optimized, feels amazing.</i>
+**Structured Objects For Anyone** \
+*... so optimized, feels amazing.*
 
 [Would you like to know more?](https://github.com/sofa-buffers)
 
