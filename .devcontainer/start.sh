@@ -7,17 +7,16 @@ ENV_FILE="$SCRIPT_DIR/.env"
 CLAUDE_CONFIG_DIR="$SCRIPT_DIR/.claude-config"
 mkdir -p "$CLAUDE_CONFIG_DIR"
 
+env_args=()
 if [[ -f "$ENV_FILE" ]]; then
-  docker run -it --rm --name sofa-py-dev \
-    --env-file "$ENV_FILE" \
-    -v "$(pwd)":/workspace \
-    -v "$CLAUDE_CONFIG_DIR":/root/.claude \
-    py-devcontainer
+  env_args=(--env-file "$ENV_FILE")
 else
-  echo "warning: $ENV_FILE not found — starting without --env-file." >&2
-  echo "         copy .devcontainer/.env.example to .devcontainer/.env to load secrets." >&2
-  docker run -it --rm --name sofa-py-dev \
-    -v "$(pwd)":/workspace \
-    -v "$CLAUDE_CONFIG_DIR":/root/.claude \
-    py-devcontainer
+  echo "warning: $ENV_FILE not found — copy .devcontainer/.env.example to .devcontainer/.env to load secrets." >&2
 fi
+
+docker run -it --rm --name sofa-py-dev \
+  "${env_args[@]}" \
+  -e CLAUDE_CONFIG_DIR=/root/.claude \
+  -v "$(pwd)":/workspace \
+  -v "$CLAUDE_CONFIG_DIR":/root/.claude \
+  py-devcontainer
