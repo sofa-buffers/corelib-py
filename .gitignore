@@ -13,7 +13,6 @@ venv/
 # secrets / local env (never commit credentials)
 .env
 *.env
-.devcontainer/.env
 
 # tool caches
 .pytest_cache/
