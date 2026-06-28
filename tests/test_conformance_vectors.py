@@ -1,9 +1,20 @@
 """Conformance tests driven by the shared, language-agnostic test suite.
 
-Loads ``assets/test_vectors.json`` (copied verbatim from the `documentation`
-repo — the authoritative ground truth per ARCHITECTURE.md §7) and asserts, for
-every vector, that the encoder produces exactly ``serialized.hex`` and that the
-decoder recovers the original ``fields``.
+Loads ``assets/test_vectors.json`` (copied verbatim from ``corelib-c-cpp`` — the
+authoritative ground truth per ARCHITECTURE.md §7) and runs, for every vector,
+the full scenario matrix the harness mandates:
+
+1. **encode** — replay the fields, assert the bytes equal ``serialized.hex``.
+2. **chunked-encode** — same, but through a fixed buffer of 1/3/7 bytes with a
+   flush sink, exercising mid-stream buffer drains.
+3. **decode** — parse the bytes, assert the recovered fields.
+4. **chunked-decode** — decode fed one byte at a time (streaming worst case).
+5. **skip-ids** — decode while auto-skipping the vector's ``skip_ids`` at every
+   nesting depth; assert the surviving fields.
+6. **chunked skip-ids** — scenario 5 fed one byte at a time.
+7. **roundtrip** — encode then decode, assert the fields survive the trip.
+8. **requires gating** — vectors are skipped when they need a capability this
+   port does not provide (this pure-Python port provides them all).
 """
 
 from __future__ import annotations
@@ -15,6 +26,7 @@ import struct
 from pathlib import Path
 
 import pytest
+from vectors import ChunkReader
 
 from sofab import Decoder, Encoder, FixlenSubtype, WireType
 
@@ -25,6 +37,12 @@ _IDS = [v["name"] for v in VECTORS]
 
 _UNSIGNED_ELEMS = {"u8", "u16", "u32", "u64"}
 _SIGNED_ELEMS = {"i8", "i16", "i32", "i64"}
+
+#: Capabilities this port implements. A vector whose ``requires`` names anything
+#: outside this set is skipped (scenario 8). The pure-Python runtime is
+#: full-featured, so in practice nothing is skipped — but the gate keeps the
+#: harness honest for footprint-reduced ports that share these vectors.
+SUPPORTED = frozenset({"fixlen", "array", "sequence", "fp64", "int64"})
 
 
 def _fval(v):
@@ -37,6 +55,12 @@ def _fval(v):
 def _f32(x: float) -> float:
     """The fp32-rounded value, so encode/decode of an fp32 compares exactly."""
     return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def _check_requires(vec) -> None:
+    missing = set(vec.get("requires", ())) - SUPPORTED
+    if missing:
+        pytest.skip(f"vector requires unsupported capabilities: {sorted(missing)}")
 
 
 # --- encode ------------------------------------------------------------------
@@ -92,14 +116,38 @@ def _encode_vector(vec) -> bytes:
     return bytes(buf[offset : enc.bytes_used()])
 
 
+def _encode_chunked(fields, buf_size: int) -> bytes:
+    """Encode through a fixed buffer of ``buf_size`` bytes, draining via a flush
+    sink each time it fills — the streaming-encoder worst case."""
+    chunks: list[bytes] = []
+    buf = bytearray(buf_size)
+    enc = Encoder.over_buffer(buf, offset=0, flush=chunks.append)
+    _replay(enc, fields)
+    enc.flush()
+    return b"".join(chunks)
+
+
 # --- decode ------------------------------------------------------------------
 
 
-def _decode_stream(data: bytes):
-    dec = Decoder(io.BytesIO(data))
+def _decode_stream(data: bytes, *, chunk: int | None = None, skip_ids=()):
+    """Decode ``data`` into a list of ``(tag, ...)`` tuples.
+
+    ``chunk`` (if set) feeds the decoder that many bytes per ``read`` — use 1 to
+    force byte-at-a-time streaming. ``skip_ids`` are auto-skipped wherever they
+    appear (a skipped sequence-start drops its whole sub-tree)."""
+    skip = frozenset(skip_ids)
+    src = ChunkReader(data, chunk) if chunk is not None else io.BytesIO(data)
+    dec = Decoder(src)
     out = []
     while (fld := dec.next()) is not None:
         t = fld.type
+        if t == WireType.SEQUENCE_END:
+            out.append(("end",))
+            continue
+        if fld.id in skip:
+            dec.skip()  # for a sequence-start this skips the entire sub-tree
+            continue
         if t == WireType.UNSIGNED:
             out.append(("u", fld.id, dec.unsigned()))
         elif t == WireType.SIGNED:
@@ -125,43 +173,67 @@ def _decode_stream(data: bytes):
                 out.append(("f64a", fld.id, dec.read_float64_array()))
         elif t == WireType.SEQUENCE_START:
             out.append(("seq", fld.id))
-        else:  # SEQUENCE_END
-            out.append(("end",))
     return out
 
 
-def _expected_stream(fields):
+def _map_field(f):
+    """The decoded tuple a single value field is expected to produce."""
+    op = f["op"]
+    if op == "unsigned":
+        return ("u", f["id"], f["value"])
+    if op == "boolean":  # boolean encodes as unsigned 0/1 on the wire
+        return ("u", f["id"], 1 if f["value"] else 0)
+    if op == "signed":
+        return ("s", f["id"], f["value"])
+    if op == "fp32":
+        return ("f32", f["id"], _f32(_fval(f["value"])))
+    if op == "fp64":
+        return ("f64", f["id"], _fval(f["value"]))
+    if op == "string":
+        return ("str", f["id"], f["value"])
+    if op == "blob":
+        return ("blob", f["id"], bytes.fromhex(f["value_hex"]))
+    if op == "array":
+        et, vals = f["element_type"], f["values"]
+        if et in _UNSIGNED_ELEMS:
+            return ("ua", f["id"], list(vals))
+        if et in _SIGNED_ELEMS:
+            return ("sa", f["id"], list(vals))
+        if et == "fp32":
+            return ("f32a", f["id"], [_f32(_fval(x)) for x in vals])
+        return ("f64a", f["id"], [_fval(x) for x in vals])
+    raise AssertionError(f"unmappable op {op!r}")
+
+
+def _expected_stream(fields, skip_ids=()):
+    """The tuples a decoder should recover, mirroring the same skip semantics as
+    ``_decode_stream``: a skipped sequence-start swallows its whole sub-tree."""
+    skip = frozenset(skip_ids)
     out = []
-    for f in fields:
+    i, n = 0, len(fields)
+    while i < n:
+        f = fields[i]
+        i += 1
         op = f["op"]
-        if op == "unsigned":
-            out.append(("u", f["id"], f["value"]))
-        elif op == "boolean":  # boolean encodes as unsigned 0/1 on the wire
-            out.append(("u", f["id"], 1 if f["value"] else 0))
-        elif op == "signed":
-            out.append(("s", f["id"], f["value"]))
-        elif op == "fp32":
-            out.append(("f32", f["id"], _f32(_fval(f["value"]))))
-        elif op == "fp64":
-            out.append(("f64", f["id"], _fval(f["value"])))
-        elif op == "string":
-            out.append(("str", f["id"], f["value"]))
-        elif op == "blob":
-            out.append(("blob", f["id"], bytes.fromhex(f["value_hex"])))
-        elif op == "array":
-            et, vals = f["element_type"], f["values"]
-            if et in _UNSIGNED_ELEMS:
-                out.append(("ua", f["id"], list(vals)))
-            elif et in _SIGNED_ELEMS:
-                out.append(("sa", f["id"], list(vals)))
-            elif et == "fp32":
-                out.append(("f32a", f["id"], [_f32(_fval(x)) for x in vals]))
-            elif et == "fp64":
-                out.append(("f64a", f["id"], [_fval(x) for x in vals]))
-        elif op == "sequence_begin":
-            out.append(("seq", f["id"]))
-        elif op == "sequence_end":
+        if op == "sequence_end":
             out.append(("end",))
+            continue
+        if op == "sequence_begin":
+            if f["id"] in skip:
+                depth = 1  # consume the balanced sub-tree without emitting it
+                while depth:
+                    g = fields[i]
+                    i += 1
+                    if g["op"] == "sequence_begin":
+                        depth += 1
+                    elif g["op"] == "sequence_end":
+                        depth -= 1
+            else:
+                out.append(("seq", f["id"]))
+            continue
+        if f["id"] in skip:
+            continue
+        out.append(_map_field(f))
     return out
 
 
@@ -171,7 +243,13 @@ def _expected_stream(fields):
 def test_suite_metadata():
     assert _DATA["format"] == "sofabuffers-test-vectors"
     assert _DATA["version"] == 1
-    assert len(VECTORS) >= 40
+    assert len(VECTORS) >= 67
+    # the new capability/skip features are actually exercised by the suite
+    assert any("requires" in v for v in VECTORS)
+    assert any("skip_ids" in v for v in VECTORS)
+    # every capability a vector asks for is one we know how to gate on
+    declared = {tag for v in VECTORS for tag in v.get("requires", ())}
+    assert declared <= SUPPORTED, f"unknown capability tags: {declared - SUPPORTED}"
 
 
 # The ±0 float-special vectors store both zeros as JSON `0`, which cannot carry
@@ -184,6 +262,7 @@ _SIGN_OF_ZERO_AMBIGUOUS = {"array_fp32_specials", "array_fp64_specials"}
 
 @pytest.mark.parametrize("vec", VECTORS, ids=_IDS)
 def test_vector_encode(vec):
+    _check_requires(vec)
     produced = _encode_vector(vec)
     if vec["name"] in _SIGN_OF_ZERO_AMBIGUOUS:
         expected = bytes.fromhex(vec["serialized"]["hex"])
@@ -193,7 +272,54 @@ def test_vector_encode(vec):
         assert produced.hex() == vec["serialized"]["hex"]
 
 
+@pytest.mark.parametrize("buf_size", [1, 3, 7])
+@pytest.mark.parametrize("vec", VECTORS, ids=_IDS)
+def test_vector_chunked_encode(vec, buf_size):
+    _check_requires(vec)
+    if vec["name"] in _SIGN_OF_ZERO_AMBIGUOUS:
+        pytest.skip("sign-of-zero is unrepresentable in the vector's JSON values")
+    produced = _encode_chunked(vec["fields"], buf_size)
+    assert produced.hex() == vec["serialized"]["hex"]
+
+
 @pytest.mark.parametrize("vec", VECTORS, ids=_IDS)
 def test_vector_decode(vec):
+    _check_requires(vec)
     data = bytes.fromhex(vec["serialized"]["hex"])
     assert _decode_stream(data) == _expected_stream(vec["fields"])
+
+
+@pytest.mark.parametrize("vec", VECTORS, ids=_IDS)
+def test_vector_chunked_decode(vec):
+    _check_requires(vec)
+    data = bytes.fromhex(vec["serialized"]["hex"])
+    assert _decode_stream(data, chunk=1) == _expected_stream(vec["fields"])
+
+
+@pytest.mark.parametrize("vec", VECTORS, ids=_IDS)
+def test_vector_roundtrip(vec):
+    _check_requires(vec)
+    produced = _encode_vector(vec)
+    assert _decode_stream(produced) == _expected_stream(vec["fields"])
+
+
+# --- skip-ids scenarios (only the vectors that declare skip_ids) -------------
+
+_SKIP_VECTORS = [v for v in VECTORS if v.get("skip_ids")]
+_SKIP_IDS = [v["name"] for v in _SKIP_VECTORS]
+
+
+@pytest.mark.parametrize("vec", _SKIP_VECTORS, ids=_SKIP_IDS)
+def test_vector_skip_ids(vec):
+    _check_requires(vec)
+    data = bytes.fromhex(vec["serialized"]["hex"])
+    skip = vec["skip_ids"]
+    assert _decode_stream(data, skip_ids=skip) == _expected_stream(vec["fields"], skip)
+
+
+@pytest.mark.parametrize("vec", _SKIP_VECTORS, ids=_SKIP_IDS)
+def test_vector_chunked_skip_ids(vec):
+    _check_requires(vec)
+    data = bytes.fromhex(vec["serialized"]["hex"])
+    skip = vec["skip_ids"]
+    assert _decode_stream(data, chunk=1, skip_ids=skip) == _expected_stream(vec["fields"], skip)
