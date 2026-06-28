@@ -25,12 +25,14 @@ from .types import (
     SofaStateError,
     WireType,
 )
+from .visitor import Visitor
 
 __version__ = "0.1.0"
 
 __all__ = [
     "Encoder",
     "Decoder",
+    "Visitor",
     "Field",
     "WireType",
     "FixlenSubtype",

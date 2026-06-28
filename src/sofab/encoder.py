@@ -142,10 +142,27 @@ class Encoder:
 
     # --- internal write helpers ---------------------------------------------
 
+    def _emit_varint(self, value: int) -> None:
+        """Append a varint straight into the in-memory buffer with no
+        intermediate ``bytes`` object (the hot path). Fixed-buffer mode falls
+        back to the shared codec + the chunk-aware ``_put``."""
+        if self._fixed is None:
+            buf = self._buf
+            while True:
+                b = value & 0x7F
+                value >>= 7
+                if value:
+                    buf.append(b | 0x80)
+                else:
+                    buf.append(b)
+                    return
+        else:
+            self._put(encode_varint(value))
+
     def _header(self, field_id: int, wtype: WireType) -> None:
         if field_id < 0 or field_id > ID_MAX:
             raise SofaRangeError(f"id {field_id} out of range 0..{ID_MAX}")
-        self._put(encode_varint((field_id << 3) | wtype))
+        self._emit_varint((field_id << 3) | wtype)
 
     def _begin(self) -> bool:
         """Sticky-mode gate. Returns ``False`` if the op should be skipped."""
@@ -167,7 +184,7 @@ class Encoder:
             if value < 0 or value > UNSIGNED_MAX:
                 raise SofaRangeError(f"unsigned value {value} out of range")
             self._header(field_id, WireType.UNSIGNED)
-            self._put(encode_varint(value))
+            self._emit_varint(value)
         except SofaError as exc:
             self._fail(exc)
 
@@ -178,7 +195,7 @@ class Encoder:
             if value < SIGNED_MIN or value > SIGNED_MAX:
                 raise SofaRangeError(f"signed value {value} out of range")
             self._header(field_id, WireType.SIGNED)
-            self._put(encode_varint(zigzag_encode(value)))
+            self._emit_varint(zigzag_encode(value))
         except SofaError as exc:
             self._fail(exc)
 
@@ -202,7 +219,7 @@ class Encoder:
             return
         try:
             self._header(field_id, WireType.FIXLEN)
-            self._put(encode_varint((len(data) << 3) | subtype))
+            self._emit_varint((len(data) << 3) | subtype)
             self._put(data)
         except SofaError as exc:
             self._fail(exc)
@@ -215,11 +232,11 @@ class Encoder:
         try:
             seq = list(values)
             self._array_header(field_id, WireType.ARRAY_UNSIGNED, len(seq))
-            put = self._put
+            emit = self._emit_varint
             for v in seq:
                 if v < 0 or v > UNSIGNED_MAX:
                     raise SofaRangeError(f"unsigned array value {v} out of range")
-                put(encode_varint(v))
+                emit(v)
         except SofaError as exc:
             self._fail(exc)
 
@@ -229,37 +246,35 @@ class Encoder:
         try:
             seq = list(values)
             self._array_header(field_id, WireType.ARRAY_SIGNED, len(seq))
-            put = self._put
+            emit = self._emit_varint
             for v in seq:
                 if v < SIGNED_MIN or v > SIGNED_MAX:
                     raise SofaRangeError(f"signed array value {v} out of range")
-                put(encode_varint(zigzag_encode(v)))
+                emit(zigzag_encode(v))
         except SofaError as exc:
             self._fail(exc)
 
     def write_float32_array(self, field_id: int, values: Iterable[float]) -> None:
-        self._write_float_array(field_id, values, FixlenSubtype.FP32, _core.pack_f32, 4)
+        self._write_float_array(field_id, values, FixlenSubtype.FP32, _core.pack_f32_array, 4)
 
     def write_float64_array(self, field_id: int, values: Iterable[float]) -> None:
-        self._write_float_array(field_id, values, FixlenSubtype.FP64, _core.pack_f64, 8)
+        self._write_float_array(field_id, values, FixlenSubtype.FP64, _core.pack_f64_array, 8)
 
     def _write_float_array(
         self,
         field_id: int,
         values: Iterable[float],
         subtype: FixlenSubtype,
-        pack: Callable[[float], bytes],
+        pack_array: Callable[[list[float]], bytes],
         elem_size: int,
     ) -> None:
         if not self._begin():
             return
         try:
-            seq = list(values)
+            seq = [float(v) for v in values]
             self._array_header(field_id, WireType.ARRAY_FIXLEN, len(seq))
-            self._put(encode_varint((elem_size << 3) | subtype))
-            put = self._put
-            for v in seq:
-                put(pack(v))
+            self._emit_varint((elem_size << 3) | subtype)
+            self._put(pack_array(seq))  # one struct.pack for the whole array
         except SofaError as exc:
             self._fail(exc)
 
@@ -267,7 +282,7 @@ class Encoder:
         if count < 1 or count > ARRAY_MAX:
             raise SofaRangeError(f"array count {count} out of range 1..{ARRAY_MAX}")
         self._header(field_id, wtype)
-        self._put(encode_varint(count))
+        self._emit_varint(count)
 
     # --- sequences ----------------------------------------------------------
 
@@ -286,7 +301,7 @@ class Encoder:
         try:
             if self._depth <= 0:
                 raise SofaStateError("sequence_end without matching begin")
-            self._put(encode_varint(WireType.SEQUENCE_END))
+            self._emit_varint(WireType.SEQUENCE_END)
             self._depth -= 1
         except SofaError as exc:
             self._fail(exc)

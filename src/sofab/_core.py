@@ -27,3 +27,23 @@ def unpack_f32(data: bytes) -> float:
 
 def unpack_f64(data: bytes) -> float:
     return float(_F64.unpack(data)[0])
+
+
+def unpack_f32_array(data: bytes, count: int) -> list[float]:
+    """Decode ``count`` little-endian fp32 values in one ``struct`` call."""
+    return list(struct.unpack(f"<{count}f", data))
+
+
+def unpack_f64_array(data: bytes, count: int) -> list[float]:
+    """Decode ``count`` little-endian fp64 values in one ``struct`` call."""
+    return list(struct.unpack(f"<{count}d", data))
+
+
+def pack_f32_array(values: list[float]) -> bytes:
+    """Encode a list of fp32 values in one ``struct`` call (little-endian)."""
+    return struct.pack(f"<{len(values)}f", *values)
+
+
+def pack_f64_array(values: list[float]) -> bytes:
+    """Encode a list of fp64 values in one ``struct`` call (little-endian)."""
+    return struct.pack(f"<{len(values)}d", *values)

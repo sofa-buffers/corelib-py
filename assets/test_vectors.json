@@ -106,6 +106,7 @@
       "group": "scalar/unsigned",
       "description": "Unsigned varint at field id 0 covering a varint length boundary.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 34359738367 }
       ],
@@ -116,6 +117,7 @@
       "group": "scalar/unsigned",
       "description": "Unsigned varint at field id 0 covering a varint length boundary.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 34359738368 }
       ],
@@ -126,6 +128,7 @@
       "group": "scalar/unsigned",
       "description": "Unsigned varint at field id 0 covering a varint length boundary.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 4398046511103 }
       ],
@@ -136,6 +139,7 @@
       "group": "scalar/unsigned",
       "description": "Unsigned varint at field id 0 covering a varint length boundary.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 4398046511104 }
       ],
@@ -146,6 +150,7 @@
       "group": "scalar/unsigned",
       "description": "Unsigned varint at field id 0 covering a varint length boundary.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 562949953421311 }
       ],
@@ -156,6 +161,7 @@
       "group": "scalar/unsigned",
       "description": "Unsigned varint at field id 0 covering a varint length boundary.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 562949953421312 }
       ],
@@ -166,6 +172,7 @@
       "group": "scalar/unsigned",
       "description": "Unsigned varint at field id 0 covering a varint length boundary.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 72057594037927935 }
       ],
@@ -176,6 +183,7 @@
       "group": "scalar/unsigned",
       "description": "Unsigned varint at field id 0 covering a varint length boundary.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 72057594037927936 }
       ],
@@ -186,6 +194,7 @@
       "group": "scalar/unsigned",
       "description": "Unsigned varint at field id 0 covering a varint length boundary.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 9223372036854775807 }
       ],
@@ -196,6 +205,7 @@
       "group": "scalar/unsigned",
       "description": "Unsigned varint at field id 0 covering a varint length boundary.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 9223372036854775808 }
       ],
@@ -206,36 +216,39 @@
       "group": "scalar/unsigned",
       "description": "Unsigned varint at field id 0 covering a varint length boundary.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 18446744073709551615 }
       ],
       "serialized": { "length": 11, "hex": "00ffffffffffffffffff01" }
     },
     {
-      "name": "id_min",
-      "group": "scalar/id",
-      "description": "Smallest field id (0) with value 0.",
-      "offset": 0,
-      "fields": [
-        { "op": "unsigned", "id": 0, "value": 0 }
-      ],
-      "serialized": { "length": 2, "hex": "0000" }
-    },
-    {
       "name": "id_max",
       "group": "scalar/id",
       "description": "Largest field id (SOFAB_ID_MAX = INT32_MAX) with value 0.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "unsigned", "id": 2147483647, "value": 0 }
       ],
       "serialized": { "length": 6, "hex": "f8ffffff3f00" }
     },
     {
+      "name": "id_two_byte_header",
+      "group": "scalar/id",
+      "description": "Field id 16 — the first id whose (id<<3)|type header needs two varint bytes.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 16, "value": 1 }
+      ],
+      "serialized": { "length": 3, "hex": "800101" }
+    },
+    {
       "name": "signed_min",
       "group": "scalar/signed",
       "description": "INT64_MIN as a zigzag signed varint.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "signed", "id": 0, "value": -9223372036854775808 }
       ],
@@ -246,10 +259,121 @@
       "group": "scalar/signed",
       "description": "INT64_MAX as a zigzag signed varint.",
       "offset": 0,
+      "requires": ["int64"],
       "fields": [
         { "op": "signed", "id": 0, "value": 9223372036854775807 }
       ],
       "serialized": { "length": 11, "hex": "01feffffffffffffffff01" }
+    },
+    {
+      "name": "signed_0",
+      "group": "scalar/signed",
+      "description": "Signed varint covering a zig-zag / varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "signed", "id": 0, "value": 0 }
+      ],
+      "serialized": { "length": 2, "hex": "0100" }
+    },
+    {
+      "name": "signed_minus1",
+      "group": "scalar/signed",
+      "description": "Signed varint covering a zig-zag / varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "signed", "id": 0, "value": -1 }
+      ],
+      "serialized": { "length": 2, "hex": "0101" }
+    },
+    {
+      "name": "signed_1",
+      "group": "scalar/signed",
+      "description": "Signed varint covering a zig-zag / varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "signed", "id": 0, "value": 1 }
+      ],
+      "serialized": { "length": 2, "hex": "0102" }
+    },
+    {
+      "name": "signed_63",
+      "group": "scalar/signed",
+      "description": "Signed varint covering a zig-zag / varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "signed", "id": 0, "value": 63 }
+      ],
+      "serialized": { "length": 2, "hex": "017e" }
+    },
+    {
+      "name": "signed_64",
+      "group": "scalar/signed",
+      "description": "Signed varint covering a zig-zag / varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "signed", "id": 0, "value": 64 }
+      ],
+      "serialized": { "length": 3, "hex": "018001" }
+    },
+    {
+      "name": "signed_minus64",
+      "group": "scalar/signed",
+      "description": "Signed varint covering a zig-zag / varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "signed", "id": 0, "value": -64 }
+      ],
+      "serialized": { "length": 2, "hex": "017f" }
+    },
+    {
+      "name": "signed_minus65",
+      "group": "scalar/signed",
+      "description": "Signed varint covering a zig-zag / varint length boundary.",
+      "offset": 0,
+      "fields": [
+        { "op": "signed", "id": 0, "value": -65 }
+      ],
+      "serialized": { "length": 3, "hex": "018101" }
+    },
+    {
+      "name": "unsigned_u32_max",
+      "group": "scalar/unsigned",
+      "description": "UINT32_MAX — the largest unsigned a 32-bit (no-int64) build can encode.",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 4294967295 }
+      ],
+      "serialized": { "length": 6, "hex": "00ffffffff0f" }
+    },
+    {
+      "name": "signed_i32_min",
+      "group": "scalar/signed",
+      "description": "INT32_MIN — the most-negative signed a 32-bit (no-int64) build can encode.",
+      "offset": 0,
+      "fields": [
+        { "op": "signed", "id": 0, "value": -2147483648 }
+      ],
+      "serialized": { "length": 6, "hex": "01ffffffff0f" }
+    },
+    {
+      "name": "signed_i32_max",
+      "group": "scalar/signed",
+      "description": "INT32_MAX — the largest signed a 32-bit (no-int64) build can encode.",
+      "offset": 0,
+      "fields": [
+        { "op": "signed", "id": 0, "value": 2147483647 }
+      ],
+      "serialized": { "length": 6, "hex": "01feffffff0f" }
+    },
+    {
+      "name": "id_max_32bit",
+      "group": "scalar/id",
+      "description": "Largest field id a 32-bit (no-int64) build can encode (UINT32_MAX >> 3).",
+      "offset": 0,
+      "fields": [
+        { "op": "unsigned", "id": 536870911, "value": 0 }
+      ],
+      "serialized": { "length": 6, "hex": "f8ffffff0f00" }
     },
     {
       "name": "boolean_true",
@@ -262,10 +386,21 @@
       "serialized": { "length": 2, "hex": "0001" }
     },
     {
+      "name": "boolean_false",
+      "group": "scalar/boolean",
+      "description": "Boolean false encoded as unsigned 0.",
+      "offset": 0,
+      "fields": [
+        { "op": "boolean", "id": 0, "value": false }
+      ],
+      "serialized": { "length": 2, "hex": "0000" }
+    },
+    {
       "name": "fp32",
       "group": "scalar/float",
       "description": "32-bit float 3.1415f as a little-endian fixed-length field.",
       "offset": 0,
+      "requires": ["fixlen"],
       "fields": [
         { "op": "fp32", "id": 0, "value": 3.1415 }
       ],
@@ -276,6 +411,7 @@
       "group": "scalar/float",
       "description": "64-bit float (double)3.14159265f as a little-endian fixed-length field.",
       "offset": 0,
+      "requires": ["fixlen", "fp64"],
       "fields": [
         { "op": "fp64", "id": 0, "value": 3.1415927410125732 }
       ],
@@ -286,6 +422,7 @@
       "group": "scalar/string",
       "description": "UTF-8 string field.",
       "offset": 0,
+      "requires": ["fixlen"],
       "fields": [
         { "op": "string", "id": 0, "value": "Hello Couch!" }
       ],
@@ -296,16 +433,29 @@
       "group": "scalar/string",
       "description": "Empty string field.",
       "offset": 0,
+      "requires": ["fixlen"],
       "fields": [
         { "op": "string", "id": 0, "value": "" }
       ],
       "serialized": { "length": 2, "hex": "0202" }
     },
     {
+      "name": "string_16",
+      "group": "scalar/string",
+      "description": "16-byte string — the fixlen length header crosses into two varint bytes.",
+      "offset": 0,
+      "requires": ["fixlen"],
+      "fields": [
+        { "op": "string", "id": 0, "value": "0123456789abcdef" }
+      ],
+      "serialized": { "length": 19, "hex": "02820130313233343536373839616263646566" }
+    },
+    {
       "name": "blob",
       "group": "scalar/blob",
       "description": "Binary blob field.",
       "offset": 0,
+      "requires": ["fixlen"],
       "fields": [
         { "op": "blob", "id": 0, "value_hex": "0102030405" }
       ],
@@ -316,16 +466,58 @@
       "group": "scalar/blob",
       "description": "Empty blob field.",
       "offset": 0,
+      "requires": ["fixlen"],
       "fields": [
         { "op": "blob", "id": 0, "value_hex": "" }
       ],
       "serialized": { "length": 2, "hex": "0203" }
     },
     {
+      "name": "optional_scalars",
+      "group": "skip",
+      "description": "Five scalars; a receiver ignoring optional ids 2 and 4 must still read 1, 3, 5.",
+      "offset": 0,
+      "requires": ["fixlen"],
+      "skip_ids": [2, 4],
+      "fields": [
+        { "op": "unsigned", "id": 1, "value": 100 },
+        { "op": "signed", "id": 2, "value": -200 },
+        { "op": "string", "id": 3, "value": "keep" },
+        { "op": "fp32", "id": 4, "value": 1.5 },
+        { "op": "unsigned", "id": 5, "value": 300 }
+      ],
+      "serialized": { "length": 20, "hex": "0864118f031a226b65657022200000c03f28ac02" }
+    },
+    {
+      "name": "skip_all_wire_types",
+      "group": "skip",
+      "description": "Every wire type as an optional field; a receiver skipping ids 2-9 must still read the id 1 and id 10 anchors.",
+      "offset": 0,
+      "requires": ["fixlen", "array", "sequence", "fp64"],
+      "skip_ids": [2, 3, 4, 5, 6, 7, 8, 9],
+      "fields": [
+        { "op": "unsigned", "id": 1, "value": 100 },
+        { "op": "signed", "id": 2, "value": -200 },
+        { "op": "boolean", "id": 3, "value": true },
+        { "op": "fp32", "id": 4, "value": 1.5 },
+        { "op": "fp64", "id": 5, "value": 2.5 },
+        { "op": "string", "id": 6, "value": "skip me" },
+        { "op": "blob", "id": 7, "value_hex": "010203" },
+        { "op": "array", "id": 8, "element_type": "u32", "values": [10, 20, 30] },
+        { "op": "sequence_begin", "id": 9 },
+        { "op": "unsigned", "id": 0, "value": 1 },
+        { "op": "string", "id": 1, "value": "ignored" },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 10, "value": 300 }
+      ],
+      "serialized": { "length": 58, "hex": "0864118f03180122200000c03f2a410000000000000440323a736b6970206d653a1b01020343030a141e4e00010a3a69676e6f7265640750ac02" }
+    },
+    {
       "name": "array_unsigned_u32",
       "group": "array/integer",
       "description": "Array of unsigned values (u32 input).",
       "offset": 0,
+      "requires": ["array"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "u32", "values": [1, 2, 3, 2147483648, 4294967295] }
       ],
@@ -336,6 +528,7 @@
       "group": "array/integer",
       "description": "Array of signed values (i32 input).",
       "offset": 0,
+      "requires": ["array"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "i32", "values": [-1, -2, -3, -2147483648, 2147483647] }
       ],
@@ -346,6 +539,7 @@
       "group": "array/integer",
       "description": "Array of i8.",
       "offset": 0,
+      "requires": ["array"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "i8", "values": [-1, -2, -3, -128, 127] }
       ],
@@ -356,6 +550,7 @@
       "group": "array/integer",
       "description": "Array of u8.",
       "offset": 0,
+      "requires": ["array"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "u8", "values": [1, 2, 3, 0, 255] }
       ],
@@ -366,6 +561,7 @@
       "group": "array/integer",
       "description": "Array of i16.",
       "offset": 0,
+      "requires": ["array"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "i16", "values": [-1, -2, -3, -32768, 32767] }
       ],
@@ -376,6 +572,7 @@
       "group": "array/integer",
       "description": "Array of u16.",
       "offset": 0,
+      "requires": ["array"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "u16", "values": [1, 2, 3, 0, 65535] }
       ],
@@ -386,6 +583,7 @@
       "group": "array/integer",
       "description": "Array of u64.",
       "offset": 0,
+      "requires": ["array", "int64"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "u64", "values": [1, 2, 3, 0, 18446744073709551615] }
       ],
@@ -396,16 +594,29 @@
       "group": "array/integer",
       "description": "Array of i64.",
       "offset": 0,
+      "requires": ["array", "int64"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "i64", "values": [-1, -2, -3, -9223372036854775808, 9223372036854775807] }
       ],
       "serialized": { "length": 25, "hex": "0405010305ffffffffffffffffff01feffffffffffffffff01" }
     },
     {
+      "name": "array_u8_large",
+      "group": "array/integer",
+      "description": "200-element u8 array — the element count crosses into two varint bytes.",
+      "offset": 0,
+      "requires": ["array"],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "u8", "values": [1, 8, 15, 22, 29, 36, 43, 50, 57, 64, 71, 78, 85, 92, 99, 106, 113, 120, 127, 134, 141, 148, 155, 162, 169, 176, 183, 190, 197, 204, 211, 218, 225, 232, 239, 246, 253, 4, 11, 18, 25, 32, 39, 46, 53, 60, 67, 74, 81, 88, 95, 102, 109, 116, 123, 130, 137, 144, 151, 158, 165, 172, 179, 186, 193, 200, 207, 214, 221, 228, 235, 242, 249, 0, 7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84, 91, 98, 105, 112, 119, 126, 133, 140, 147, 154, 161, 168, 175, 182, 189, 196, 203, 210, 217, 224, 231, 238, 245, 252, 3, 10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80, 87, 94, 101, 108, 115, 122, 129, 136, 143, 150, 157, 164, 171, 178, 185, 192, 199, 206, 213, 220, 227, 234, 241, 248, 255, 6, 13, 20, 27, 34, 41, 48, 55, 62, 69, 76, 83, 90, 97, 104, 111, 118, 125, 132, 139, 146, 153, 160, 167, 174, 181, 188, 195, 202, 209, 216, 223, 230, 237, 244, 251, 2, 9, 16, 23, 30, 37, 44, 51, 58, 65, 72, 79, 86, 93, 100, 107, 114] }
+      ],
+      "serialized": { "length": 294, "hex": "03c80101080f161d242b323940474e555c636a71787f86018d0194019b01a201a901b001b701be01c501cc01d301da01e101e801ef01f601fd01040b121920272e353c434a51585f666d747b82018901900197019e01a501ac01b301ba01c101c801cf01d601dd01e401eb01f201f90100070e151c232a31383f464d545b626970777e85018c0193019a01a101a801af01b601bd01c401cb01d201d901e001e701ee01f501fc01030a11181f262d343b424950575e656c737a810188018f0196019d01a401ab01b201b901c001c701ce01d501dc01e301ea01f101f801ff01060d141b222930373e454c535a61686f767d84018b0192019901a001a701ae01b501bc01c301ca01d101d801df01e601ed01f401fb01020910171e252c333a41484f565d646b72" }
+    },
+    {
       "name": "array_fp32",
       "group": "array/float",
       "description": "Array of fp32.",
       "offset": 0,
+      "requires": ["fixlen", "array"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "fp32", "values": [1, 2, 3, -3.40282347e+38, 3.40282347e+38] }
       ],
@@ -416,6 +627,7 @@
       "group": "array/float",
       "description": "Array of fp64.",
       "offset": 0,
+      "requires": ["fixlen", "array", "fp64"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "fp64", "values": [1, 2, 3, -1.7976931348623157e+308, 1.7976931348623157e+308] }
       ],
@@ -426,6 +638,7 @@
       "group": "array/float",
       "description": "Array of fp32 special values: +0, -0, +inf, -inf (NaN excluded).",
       "offset": 0,
+      "requires": ["fixlen", "array"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "fp32", "values": [0, -0, "inf", "-inf"] }
       ],
@@ -436,16 +649,60 @@
       "group": "array/float",
       "description": "Array of fp64 special values: +0, -0, +inf, -inf (NaN excluded).",
       "offset": 0,
+      "requires": ["fixlen", "array", "fp64"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "fp64", "values": [0, -0, "inf", "-inf"] }
       ],
       "serialized": { "length": 35, "hex": "05044100000000000000000000000000000080000000000000f07f000000000000f0ff" }
     },
     {
+      "name": "empty_sequence",
+      "group": "sequence",
+      "description": "A sequence with no fields.",
+      "offset": 0,
+      "requires": ["sequence"],
+      "fields": [
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "sequence_end" }
+      ],
+      "serialized": { "length": 2, "hex": "0e07" }
+    },
+    {
+      "name": "nested_empty_sequences",
+      "group": "sequence",
+      "description": "A sequence whose only content is an empty sub-sequence.",
+      "offset": 0,
+      "requires": ["sequence"],
+      "fields": [
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "sequence_begin", "id": 2 },
+        { "op": "sequence_end" },
+        { "op": "sequence_end" }
+      ],
+      "serialized": { "length": 4, "hex": "0e160707" }
+    },
+    {
+      "name": "empty_sequence_between_fields",
+      "group": "sequence",
+      "description": "An empty sequence between two scalars; the decoder must resume after it.",
+      "offset": 0,
+      "requires": ["sequence"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 7 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "sequence_end" },
+        { "op": "signed", "id": 2, "value": -7 }
+      ],
+      "serialized": { "length": 6, "hex": "00070e07110d" }
+    },
+    {
       "name": "nested_sequence",
       "group": "sequence",
       "description": "A scalar, a nested sequence, then a scalar.",
       "offset": 0,
+      "requires": ["sequence"],
+      "skip_ids": [1],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 42 },
         { "op": "sequence_begin", "id": 1 },
@@ -461,6 +718,8 @@
       "group": "sequence",
       "description": "A nested sequence containing a signed array.",
       "offset": 0,
+      "requires": ["array", "sequence"],
+      "skip_ids": [3],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 42 },
         { "op": "sequence_begin", "id": 3 },
@@ -476,6 +735,8 @@
       "group": "sequence",
       "description": "Ten levels of nested sequences.",
       "offset": 0,
+      "requires": ["sequence"],
+      "skip_ids": [1],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 42 },
         { "op": "sequence_begin", "id": 1 },
@@ -523,10 +784,40 @@
       "serialized": { "length": 64, "hex": "002a0e002a11530e002a11530e002a11530e002a11530e002a11530e002a11530e002a11530e002a11530e002a11530e002a1153070707070707070707071153" }
     },
     {
+      "name": "nested_sequence_deep_skip",
+      "group": "sequence",
+      "description": "Multi-depth nested sequences skipping a depth-2 scalar (id 5) and a whole depth-3 sub-tree (id 7).",
+      "offset": 0,
+      "requires": ["fixlen", "array", "sequence", "fp64"],
+      "skip_ids": [5, 7],
+      "fields": [
+        { "op": "unsigned", "id": 1, "value": 10 },
+        { "op": "sequence_begin", "id": 2 },
+        { "op": "unsigned", "id": 3, "value": 20 },
+        { "op": "sequence_begin", "id": 4 },
+        { "op": "signed", "id": 5, "value": -30 },
+        { "op": "string", "id": 6, "value": "deep" },
+        { "op": "sequence_begin", "id": 7 },
+        { "op": "array", "id": 8, "element_type": "i32", "values": [-1, -2, -3] },
+        { "op": "sequence_begin", "id": 9 },
+        { "op": "fp64", "id": 10, "value": 1.5 },
+        { "op": "sequence_end" },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 11, "value": 40 },
+        { "op": "sequence_end" },
+        { "op": "signed", "id": 12, "value": -60 },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 13, "value": 70 }
+      ],
+      "serialized": { "length": 41, "hex": "080a16181426293b3222646565703e44030103054e5241000000000000f83f07075828076177076846" }
+    },
+    {
       "name": "full_scale_example",
       "group": "composite",
       "description": "Large message mixing scalars, nested sequences, integer/float arrays and strings.",
       "offset": 0,
+      "requires": ["fixlen", "array", "sequence", "fp64", "int64"],
+      "skip_ids": [1, 100],
       "fields": [
         { "op": "unsigned", "id": 0, "value": 200 },
         { "op": "signed", "id": 1, "value": -100 },
