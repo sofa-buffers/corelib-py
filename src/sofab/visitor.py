@@ -53,13 +53,32 @@ class Visitor:
 
     # --- typed value hooks --------------------------------------------------
 
-    def on_unsigned(self, field_id: int, value: int) -> None: ...
-    def on_signed(self, field_id: int, value: int) -> None: ...
-    def on_float32(self, field_id: int, value: float) -> None: ...
-    def on_float64(self, field_id: int, value: float) -> None: ...
-    def on_string(self, field_id: int, value: str) -> None: ...
-    def on_bytes(self, field_id: int, value: bytes) -> None: ...
-    def on_unsigned_array(self, field_id: int, values: list[int]) -> None: ...
-    def on_signed_array(self, field_id: int, values: list[int]) -> None: ...
-    def on_float32_array(self, field_id: int, values: list[float]) -> None: ...
-    def on_float64_array(self, field_id: int, values: list[float]) -> None: ...
+    def on_unsigned(self, field_id: int, value: int) -> None:
+        """Handle a decoded unsigned-integer field."""
+
+    def on_signed(self, field_id: int, value: int) -> None:
+        """Handle a decoded signed-integer field."""
+
+    def on_float32(self, field_id: int, value: float) -> None:
+        """Handle a decoded 32-bit float field."""
+
+    def on_float64(self, field_id: int, value: float) -> None:
+        """Handle a decoded 64-bit float field."""
+
+    def on_string(self, field_id: int, value: str) -> None:
+        """Handle a decoded UTF-8 string field."""
+
+    def on_bytes(self, field_id: int, value: bytes) -> None:
+        """Handle a decoded raw byte-blob field."""
+
+    def on_unsigned_array(self, field_id: int, values: list[int]) -> None:
+        """Handle a decoded unsigned-integer array field."""
+
+    def on_signed_array(self, field_id: int, values: list[int]) -> None:
+        """Handle a decoded signed-integer array field."""
+
+    def on_float32_array(self, field_id: int, values: list[float]) -> None:
+        """Handle a decoded 32-bit float array field."""
+
+    def on_float64_array(self, field_id: int, values: list[float]) -> None:
+        """Handle a decoded 64-bit float array field."""
