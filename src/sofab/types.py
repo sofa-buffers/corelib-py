@@ -54,7 +54,7 @@ class FixlenSubtype(IntEnum):
     BLOB = 0x3
 
 
-@dataclass(frozen=True)
+@dataclass
 class Field:
     """Describes the field the decoder is currently positioned on.
 
