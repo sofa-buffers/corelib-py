@@ -51,6 +51,11 @@ _FIXLEN = 1
 _VARRAY = 2
 _FARRAY = 3
 
+# Wire-type members indexed by their integer value, so the per-field hot path
+# can recover the enum member by index (``_WT[wtype]``) instead of paying the
+# full ``WireType(wtype)`` coercion (IntEnum.__call__/__new__) on every field.
+_WT = tuple(WireType)
+
 
 class _Reader(Protocol):
     """Read protocol: an object with ``read(n) -> bytes``."""
@@ -261,7 +266,7 @@ class Decoder:
             return self._cur
 
         if wtype == WireType.UNSIGNED or wtype == WireType.SIGNED:
-            self._cur = Field(field_id, WireType(wtype))
+            self._cur = Field(field_id, _WT[wtype])
             self._pending = (_SCALAR, wtype)
             return self._cur
 
@@ -283,7 +288,7 @@ class Decoder:
             count = self._varint()
             if count < 1 or count > ARRAY_MAX:
                 raise SofaDecodeError(f"array count {count} out of range")
-            self._cur = Field(field_id, WireType(wtype), count=count)
+            self._cur = Field(field_id, _WT[wtype], count=count)
             self._pending = (_VARRAY, wtype, count)
             return self._cur
 
