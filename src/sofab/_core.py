@@ -14,18 +14,22 @@ _F64 = struct.Struct("<d")
 
 
 def pack_f32(value: float) -> bytes:
+    """Pack a single fp32 value to 4 little-endian bytes."""
     return _F32.pack(value)
 
 
 def pack_f64(value: float) -> bytes:
+    """Pack a single fp64 value to 8 little-endian bytes."""
     return _F64.pack(value)
 
 
 def unpack_f32(data: bytes) -> float:
+    """Decode a single little-endian fp32 value from 4 bytes."""
     return float(_F32.unpack(data)[0])
 
 
 def unpack_f64(data: bytes) -> float:
+    """Decode a single little-endian fp64 value from 8 bytes."""
     return float(_F64.unpack(data)[0])
 
 

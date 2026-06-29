@@ -64,7 +64,19 @@ class _Reader(Protocol):
 
 
 class Decoder:
+    """Pull-decodes a SofaBuffers stream field by field.
+
+    Call :meth:`next` to advance to each field, then one of the typed read
+    methods (:meth:`unsigned`, :meth:`string`, :meth:`read_float64_array`, …)
+    to consume its value, or :meth:`skip` to discard it. Alternatively hand a
+    :class:`sofab.Visitor` to :meth:`drive` for callback-style decoding.
+    """
+
     def __init__(self, reader: _Reader, *, chunk_size: int = 65536) -> None:
+        """Wrap ``reader`` (any object with ``read(n) -> bytes``).
+
+        ``chunk_size`` is how many bytes each refill pulls from the reader.
+        """
         self._read = reader.read
         self._chunk = chunk_size
         self._buf = b""
@@ -389,12 +401,21 @@ class Decoder:
         return self._varint()
 
     def unsigned(self) -> int:
+        """Consume the current field as an unsigned integer.
+
+        Raises :class:`SofaStateError` if the current field is not unsigned.
+        """
         return self._take_scalar(WireType.UNSIGNED)
 
     def signed(self) -> int:
+        """Consume the current field as a ZigZag-decoded signed integer.
+
+        Raises :class:`SofaStateError` if the current field is not signed.
+        """
         return zigzag_decode(self._take_scalar(WireType.SIGNED))
 
     def bool(self) -> bool:
+        """Consume the current unsigned field as a boolean (non-zero is true)."""
         return self._take_scalar(WireType.UNSIGNED) != 0
 
     def _take_fixlen(self, subtype: FixlenSubtype) -> bytes:
@@ -407,21 +428,39 @@ class Decoder:
         return self._read_exact(pending[2])
 
     def float32(self) -> float:
+        """Consume the current fixlen field as a 32-bit IEEE-754 float.
+
+        Raises :class:`SofaStateError` if the field is not an fp32 fixlen, or
+        :class:`SofaDecodeError` if its payload is not 4 bytes.
+        """
         data = self._take_fixlen(FixlenSubtype.FP32)
         if len(data) != 4:
             raise SofaDecodeError("fp32 payload must be 4 bytes")
         return _core.unpack_f32(data)
 
     def float64(self) -> float:
+        """Consume the current fixlen field as a 64-bit IEEE-754 float.
+
+        Raises :class:`SofaStateError` if the field is not an fp64 fixlen, or
+        :class:`SofaDecodeError` if its payload is not 8 bytes.
+        """
         data = self._take_fixlen(FixlenSubtype.FP64)
         if len(data) != 8:
             raise SofaDecodeError("fp64 payload must be 8 bytes")
         return _core.unpack_f64(data)
 
     def string(self) -> str:
+        """Consume the current fixlen field as a UTF-8 decoded string.
+
+        Raises :class:`SofaStateError` if the field is not a STRING fixlen.
+        """
         return self._take_fixlen(FixlenSubtype.STRING).decode("utf-8")
 
     def bytes(self) -> bytes:
+        """Consume the current fixlen field as a raw byte blob.
+
+        Raises :class:`SofaStateError` if the field is not a BLOB fixlen.
+        """
         return self._take_fixlen(FixlenSubtype.BLOB)
 
     # --- array reads --------------------------------------------------------
@@ -434,10 +473,18 @@ class Decoder:
         return int(pending[2])
 
     def read_unsigned_array(self) -> list[int]:
+        """Consume the current field as a list of unsigned integers.
+
+        Raises :class:`SofaStateError` if the field is not an unsigned array.
+        """
         count = self._take_varray(WireType.ARRAY_UNSIGNED)
         return self._read_varints(count)
 
     def read_signed_array(self) -> list[int]:
+        """Consume the current field as a list of ZigZag-decoded signed integers.
+
+        Raises :class:`SofaStateError` if the field is not a signed array.
+        """
         count = self._take_varray(WireType.ARRAY_SIGNED)
         return [zigzag_decode(v) for v in self._read_varints(count)]
 
@@ -451,11 +498,19 @@ class Decoder:
         return int(pending[2]), int(pending[3])  # count, elem_size
 
     def read_float32_array(self) -> list[float]:
+        """Consume the current field as a list of 32-bit IEEE-754 floats.
+
+        Raises :class:`SofaStateError` if the field is not an fp32 array.
+        """
         count, elem_size = self._take_farray(FixlenSubtype.FP32)
         data = self._read_exact(count * elem_size)
         return _core.unpack_f32_array(data, count)
 
     def read_float64_array(self) -> list[float]:
+        """Consume the current field as a list of 64-bit IEEE-754 floats.
+
+        Raises :class:`SofaStateError` if the field is not an fp64 array.
+        """
         count, elem_size = self._take_farray(FixlenSubtype.FP64)
         data = self._read_exact(count * elem_size)
         return _core.unpack_f64_array(data, count)

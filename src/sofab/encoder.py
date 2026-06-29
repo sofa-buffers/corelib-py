@@ -39,6 +39,13 @@ class Encoder:
     """Encodes SofaBuffers fields to a byte stream."""
 
     def __init__(self, writer: Writer | None = None, *, sticky: bool = False) -> None:
+        """Create a Go-style encoder backed by an internal growable buffer.
+
+        Bytes accumulate in memory; :meth:`flush` drains them to ``writer`` (any
+        object with ``write(bytes)``) if one is given, otherwise read them back
+        with :meth:`getvalue`. Pass ``sticky=True`` to latch the first error
+        instead of raising on every call (inspect it via :attr:`error`).
+        """
         self._writer = writer
         self._buf = bytearray()
         # fixed-buffer mode (unused here):
@@ -59,6 +66,17 @@ class Encoder:
         *,
         sticky: bool = False,
     ) -> Encoder:
+        """Create an encoder that writes into a fixed caller-owned buffer.
+
+        Rust/C/Java-style construction: bytes are written directly into
+        ``buffer``, reserving ``offset`` bytes at the front for a lower-layer
+        header. When the buffer fills, the encoder calls ``flush`` with the
+        bytes written so far; ``flush`` is expected to drain them and (via
+        :meth:`buffer_set`) hand back a fresh buffer so encoding continues. With
+        no ``flush`` sink a full buffer raises :class:`SofaBufferError`. Pass
+        ``sticky=True`` to latch the first error instead of raising per call
+        (inspect it via :attr:`error`).
+        """
         self = cls.__new__(cls)
         self._writer = None
         self._buf = bytearray()
@@ -178,6 +196,11 @@ class Encoder:
     # --- scalars ------------------------------------------------------------
 
     def write_unsigned(self, field_id: int, value: int) -> None:
+        """Write an unsigned integer field as a base-128 varint.
+
+        ``value`` must be in ``0..UNSIGNED_MAX`` (64-bit), else
+        :class:`SofaRangeError`.
+        """
         if not self._begin():
             return
         try:
@@ -189,6 +212,11 @@ class Encoder:
             self._fail(exc)
 
     def write_signed(self, field_id: int, value: int) -> None:
+        """Write a signed integer field, ZigZag-encoded into a varint.
+
+        ``value`` must be in ``SIGNED_MIN..SIGNED_MAX`` (64-bit), else
+        :class:`SofaRangeError`.
+        """
         if not self._begin():
             return
         try:
@@ -200,18 +228,23 @@ class Encoder:
             self._fail(exc)
 
     def write_bool(self, field_id: int, value: bool) -> None:
+        """Write a boolean as an unsigned field (``1``/``0``)."""
         self.write_unsigned(field_id, 1 if value else 0)
 
     def write_float32(self, field_id: int, value: float) -> None:
+        """Write a 32-bit IEEE-754 float as a little-endian fixlen field."""
         self._write_fixlen(field_id, _core.pack_f32(value), FixlenSubtype.FP32)
 
     def write_float64(self, field_id: int, value: float) -> None:
+        """Write a 64-bit IEEE-754 float as a little-endian fixlen field."""
         self._write_fixlen(field_id, _core.pack_f64(value), FixlenSubtype.FP64)
 
     def write_string(self, field_id: int, text: str) -> None:
+        """Write a UTF-8 string as a fixlen field (STRING subtype)."""
         self._write_fixlen(field_id, text.encode("utf-8"), FixlenSubtype.STRING)
 
     def write_bytes(self, field_id: int, data: bytes | bytearray | memoryview) -> None:
+        """Write a raw byte blob as a fixlen field (BLOB subtype)."""
         self._write_fixlen(field_id, bytes(data), FixlenSubtype.BLOB)
 
     def _write_fixlen(self, field_id: int, data: bytes, subtype: FixlenSubtype) -> None:
@@ -227,6 +260,11 @@ class Encoder:
     # --- arrays -------------------------------------------------------------
 
     def write_unsigned_array(self, field_id: int, values: Iterable[int]) -> None:
+        """Write an array of unsigned integers, each as a varint.
+
+        The element count must be ``1..ARRAY_MAX`` and every value in
+        ``0..UNSIGNED_MAX``, else :class:`SofaRangeError`.
+        """
         if not self._begin():
             return
         try:
@@ -241,6 +279,11 @@ class Encoder:
             self._fail(exc)
 
     def write_signed_array(self, field_id: int, values: Iterable[int]) -> None:
+        """Write an array of signed integers, each ZigZag-encoded into a varint.
+
+        The element count must be ``1..ARRAY_MAX`` and every value in
+        ``SIGNED_MIN..SIGNED_MAX``, else :class:`SofaRangeError`.
+        """
         if not self._begin():
             return
         try:
@@ -255,9 +298,17 @@ class Encoder:
             self._fail(exc)
 
     def write_float32_array(self, field_id: int, values: Iterable[float]) -> None:
+        """Write an array of 32-bit floats as a packed little-endian fixlen array.
+
+        The element count must be ``1..ARRAY_MAX``, else :class:`SofaRangeError`.
+        """
         self._write_float_array(field_id, values, FixlenSubtype.FP32, _core.pack_f32_array, 4)
 
     def write_float64_array(self, field_id: int, values: Iterable[float]) -> None:
+        """Write an array of 64-bit floats as a packed little-endian fixlen array.
+
+        The element count must be ``1..ARRAY_MAX``, else :class:`SofaRangeError`.
+        """
         self._write_float_array(field_id, values, FixlenSubtype.FP64, _core.pack_f64_array, 8)
 
     def _write_float_array(
@@ -287,6 +338,10 @@ class Encoder:
     # --- sequences ----------------------------------------------------------
 
     def write_sequence_begin(self, field_id: int) -> None:
+        """Open a nested sequence (sub-message) under ``field_id``.
+
+        Must be balanced by a later :meth:`write_sequence_end`.
+        """
         if not self._begin():
             return
         try:
@@ -296,6 +351,10 @@ class Encoder:
             self._fail(exc)
 
     def write_sequence_end(self) -> None:
+        """Close the innermost open sequence.
+
+        Raises :class:`SofaStateError` if no sequence is currently open.
+        """
         if not self._begin():
             return
         try:
