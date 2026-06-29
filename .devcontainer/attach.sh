@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-docker exec -it sofa-py-dev bash
+docker exec -it python-devcontainer bash
