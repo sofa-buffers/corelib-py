@@ -76,6 +76,46 @@ def test_arrays():
     dec.next(); assert dec.read_float64_array() == [1.0, 2.0, 3.0]
 
 
+def test_zero_count_arrays_roundtrip_to_empty():
+    # §4.7/§4.8: all four array kinds round-trip an empty list.
+    def build(e):
+        e.write_unsigned_array(0, [])
+        e.write_signed_array(1, [])
+        e.write_float32_array(2, [])
+        e.write_float64_array(3, [])
+
+    dec = _roundtrip(build)
+    f = dec.next(); assert f.type == WireType.ARRAY_UNSIGNED and f.count == 0
+    assert dec.read_unsigned_array() == []
+    f = dec.next(); assert f.type == WireType.ARRAY_SIGNED and f.count == 0
+    assert dec.read_signed_array() == []
+    f = dec.next(); assert f.type == WireType.ARRAY_FIXLEN and f.count == 0
+    assert dec.read_float32_array() == []
+    f = dec.next(); assert f.type == WireType.ARRAY_FIXLEN and f.count == 0
+    assert dec.read_float64_array() == []
+    assert dec.next() is None
+
+
+def test_max_depth_nesting_roundtrips():
+    # 255 nested sequences (MAX_DEPTH) must encode and decode cleanly.
+    from sofab import MAX_DEPTH
+
+    def build(e):
+        for _ in range(MAX_DEPTH):
+            e.write_sequence_begin(0)
+        e.write_unsigned(1, 42)
+        for _ in range(MAX_DEPTH):
+            e.write_sequence_end()
+
+    dec = _roundtrip(build)
+    for _ in range(MAX_DEPTH):
+        assert dec.next().type == WireType.SEQUENCE_START
+    f = dec.next(); assert f.id == 1 and dec.unsigned() == 42
+    for _ in range(MAX_DEPTH):
+        assert dec.next().type == WireType.SEQUENCE_END
+    assert dec.next() is None
+
+
 def test_nested_sequences_skip_whole():
     def build(e):
         e.write_unsigned(0, 7)

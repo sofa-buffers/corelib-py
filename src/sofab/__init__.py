@@ -12,7 +12,9 @@ from .encoder import Encoder
 from .types import (
     API_VERSION,
     ARRAY_MAX,
+    FIXLEN_MAX,
     ID_MAX,
+    MAX_DEPTH,
     SIGNED_MAX,
     SIGNED_MIN,
     UNSIGNED_MAX,
@@ -44,6 +46,8 @@ __all__ = [
     "API_VERSION",
     "ID_MAX",
     "ARRAY_MAX",
+    "FIXLEN_MAX",
+    "MAX_DEPTH",
     "UNSIGNED_MAX",
     "SIGNED_MIN",
     "SIGNED_MAX",

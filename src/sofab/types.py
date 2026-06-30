@@ -27,6 +27,9 @@ SIGNED_MAX = (1 << 63) - 1
 FIXLEN_MAX = 0x7FFF_FFFF
 #: Largest array element count (``INT32_MAX``).
 ARRAY_MAX = 0x7FFF_FFFF
+#: Maximum nested-sequence depth. An encoder must not open more than this many
+#: nested sequences; a decoder rejects a message nesting deeper.
+MAX_DEPTH = 255
 
 #: 64-bit mask used by varint/zigzag wrap-around to match the C ``uint64_t``.
 MASK64 = (1 << 64) - 1
