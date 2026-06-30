@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-docker exec -it py-devcontainer bash
+docker exec -it corelib-py-dev bash

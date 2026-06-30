@@ -20,6 +20,7 @@ from ._varint import encode_varint, zigzag_encode
 from .types import (
     ARRAY_MAX,
     ID_MAX,
+    MAX_DEPTH,
     SIGNED_MAX,
     SIGNED_MIN,
     UNSIGNED_MAX,
@@ -262,8 +263,9 @@ class Encoder:
     def write_unsigned_array(self, field_id: int, values: Iterable[int]) -> None:
         """Write an array of unsigned integers, each as a varint.
 
-        The element count must be ``1..ARRAY_MAX`` and every value in
-        ``0..UNSIGNED_MAX``, else :class:`SofaRangeError`.
+        The element count must be ``0..ARRAY_MAX`` and every value in
+        ``0..UNSIGNED_MAX``, else :class:`SofaRangeError`. A zero-count array is
+        a valid, fully-specified empty array on the wire (``[header][count=0]``).
         """
         if not self._begin():
             return
@@ -281,8 +283,9 @@ class Encoder:
     def write_signed_array(self, field_id: int, values: Iterable[int]) -> None:
         """Write an array of signed integers, each ZigZag-encoded into a varint.
 
-        The element count must be ``1..ARRAY_MAX`` and every value in
-        ``SIGNED_MIN..SIGNED_MAX``, else :class:`SofaRangeError`.
+        The element count must be ``0..ARRAY_MAX`` and every value in
+        ``SIGNED_MIN..SIGNED_MAX``, else :class:`SofaRangeError`. A zero-count
+        array is a valid, fully-specified empty array (``[header][count=0]``).
         """
         if not self._begin():
             return
@@ -300,14 +303,18 @@ class Encoder:
     def write_float32_array(self, field_id: int, values: Iterable[float]) -> None:
         """Write an array of 32-bit floats as a packed little-endian fixlen array.
 
-        The element count must be ``1..ARRAY_MAX``, else :class:`SofaRangeError`.
+        The element count must be ``0..ARRAY_MAX``, else :class:`SofaRangeError`.
+        A zero-count array emits only ``[header][count=0]`` — no ``fixlen_word``
+        and no payload (§4.8).
         """
         self._write_float_array(field_id, values, FixlenSubtype.FP32, _core.pack_f32_array, 4)
 
     def write_float64_array(self, field_id: int, values: Iterable[float]) -> None:
         """Write an array of 64-bit floats as a packed little-endian fixlen array.
 
-        The element count must be ``1..ARRAY_MAX``, else :class:`SofaRangeError`.
+        The element count must be ``0..ARRAY_MAX``, else :class:`SofaRangeError`.
+        A zero-count array emits only ``[header][count=0]`` — no ``fixlen_word``
+        and no payload (§4.8).
         """
         self._write_float_array(field_id, values, FixlenSubtype.FP64, _core.pack_f64_array, 8)
 
@@ -324,14 +331,18 @@ class Encoder:
         try:
             seq = [float(v) for v in values]
             self._array_header(field_id, WireType.ARRAY_FIXLEN, len(seq))
+            if not seq:
+                # §4.8: a zero-count fixlen array carries no fixlen_word and no
+                # payload — the field is exactly [header][count=0].
+                return
             self._emit_varint((elem_size << 3) | subtype)
             self._put(pack_array(seq))  # one struct.pack for the whole array
         except SofaError as exc:
             self._fail(exc)
 
     def _array_header(self, field_id: int, wtype: WireType, count: int) -> None:
-        if count < 1 or count > ARRAY_MAX:
-            raise SofaRangeError(f"array count {count} out of range 1..{ARRAY_MAX}")
+        if count < 0 or count > ARRAY_MAX:
+            raise SofaRangeError(f"array count {count} out of range 0..{ARRAY_MAX}")
         self._header(field_id, wtype)
         self._emit_varint(count)
 
@@ -340,11 +351,15 @@ class Encoder:
     def write_sequence_begin(self, field_id: int) -> None:
         """Open a nested sequence (sub-message) under ``field_id``.
 
-        Must be balanced by a later :meth:`write_sequence_end`.
+        Must be balanced by a later :meth:`write_sequence_end`. Refuses to open
+        a sequence nested deeper than :data:`sofab.MAX_DEPTH` (255), raising
+        :class:`SofaRangeError`.
         """
         if not self._begin():
             return
         try:
+            if self._depth >= MAX_DEPTH:
+                raise SofaRangeError(f"nesting exceeds MAX_DEPTH={MAX_DEPTH}")
             self._header(field_id, WireType.SEQUENCE_START)
             self._depth += 1
         except SofaError as exc:

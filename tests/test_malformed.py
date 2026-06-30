@@ -63,8 +63,50 @@ def test_array_count_limit_overflow():
         _decode_fully(data)
 
 
-def test_array_count_zero():
-    data = [0x04, 0x00, 0x53]
+def test_array_count_zero_is_valid():
+    # §4.7/§4.8: a zero-count array is a valid, fully-specified empty array —
+    # exactly [header][count=0], nothing after. The previous behaviour (reject
+    # count==0) was a defect under the updated spec.
+    # Unsigned array (0x03), signed array (0x04): [header][0x00] then next field.
+    for header in (0x03, 0x04):
+        dec = Decoder(reader([header, 0x00]))
+        f = dec.next()
+        assert f is not None and f.count == 0
+        # No fixlen_word / payload may be consumed; the stream is now at EOF.
+        assert dec.next() is None
+    # Fixlen array (0x05): [header][0x00] with NO fixlen_word and NO payload.
+    dec = Decoder(reader([0x05, 0x00]))
+    f = dec.next()
+    assert f is not None and f.count == 0
+    assert dec.next() is None
+
+
+def test_array_fixlen_count_zero_consumes_no_fixlen_word():
+    # The bytes after [0x05, 0x00] must be parsed as the NEXT field, proving the
+    # decoder did not read a fixlen_word for the empty fixlen array.
+    # 0x50 = (10 << 3) | UNSIGNED, 0x07 = value 7.
+    dec = Decoder(reader([0x05, 0x00, 0x50, 0x07]))
+    f = dec.next()
+    assert f is not None and f.count == 0
+    assert dec.read_float32_array() == []  # empty fixlen array reads as []
+    nxt = dec.next()
+    assert nxt is not None and nxt.id == 10 and dec.unsigned() == 7
+
+
+def test_string_invalid_utf8_raises_decode_error():
+    # fixlen STRING (subtype 0x2) of length 2 with invalid UTF-8 bytes.
+    # length_header = (2 << 3) | 0x2 = 0x12; payload 0xFF 0xFE is not valid UTF-8.
+    data = [0x02, 0x12, 0xFF, 0xFE]
+    dec = Decoder(reader(data))
+    dec.next()
+    with pytest.raises(SofaDecodeError):
+        dec.string()
+
+
+def test_decode_nesting_beyond_max_depth_rejected():
+    # 256 consecutive sequence-start bytes (0x06) must be rejected once depth
+    # would exceed MAX_DEPTH (255), with SofaDecodeError.
+    data = [0x06] * 256
     with pytest.raises(SofaDecodeError):
         _decode_fully(data)
 
@@ -112,10 +154,26 @@ def test_encode_unsigned_out_of_range():
         enc.write_unsigned(0, 1 << 64)
 
 
-def test_encode_empty_array_rejected():
+def test_encode_empty_array_is_valid():
+    # §4.7/§4.8: zero-count arrays are valid. Each emits exactly [header][0x00]
+    # (the fixlen ones with NO fixlen_word and NO payload).
     enc = Encoder()
+    enc.write_unsigned_array(0, [])
+    enc.write_signed_array(0, [])
+    enc.write_float32_array(0, [])
+    enc.write_float64_array(0, [])
+    # headers: u-array (0x03), s-array (0x04), fixlen-array (0x05), fixlen (0x05)
+    assert enc.getvalue() == bytes([0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x05, 0x00])
+
+
+def test_encode_nesting_beyond_max_depth_rejected():
+    from sofab import MAX_DEPTH
+
+    enc = Encoder()
+    for i in range(MAX_DEPTH):  # 255 nested sequences are allowed
+        enc.write_sequence_begin(i % 100)
     with pytest.raises(SofaRangeError):
-        enc.write_unsigned_array(0, [])
+        enc.write_sequence_begin(0)  # the 256th must be refused
 
 
 def test_sequence_end_without_begin():

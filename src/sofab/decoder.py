@@ -35,6 +35,7 @@ from .types import (
     FIXLEN_MAX,
     ID_MAX,
     MASK64,
+    MAX_DEPTH,
     Field,
     FixlenSubtype,
     SofaDecodeError,
@@ -273,6 +274,8 @@ class Decoder:
             raise SofaDecodeError(f"id {field_id} out of range")
 
         if wtype == WireType.SEQUENCE_START:
+            if self._depth >= MAX_DEPTH:
+                raise SofaDecodeError(f"nesting exceeds MAX_DEPTH={MAX_DEPTH}")
             self._depth += 1
             self._cur = Field(field_id, WireType.SEQUENCE_START)
             return self._cur
@@ -298,7 +301,7 @@ class Decoder:
 
         if wtype == WireType.ARRAY_UNSIGNED or wtype == WireType.ARRAY_SIGNED:
             count = self._varint()
-            if count < 1 or count > ARRAY_MAX:
+            if count < 0 or count > ARRAY_MAX:
                 raise SofaDecodeError(f"array count {count} out of range")
             self._cur = Field(field_id, _WT[wtype], count=count)
             self._pending = (_VARRAY, wtype, count)
@@ -306,8 +309,14 @@ class Decoder:
 
         # wtype == ARRAY_FIXLEN
         count = self._varint()
-        if count < 1 or count > ARRAY_MAX:
+        if count < 0 or count > ARRAY_MAX:
             raise SofaDecodeError(f"array count {count} out of range")
+        if count == 0:
+            # §4.8: a zero-count fixlen array carries no fixlen_word and no
+            # payload — do not read further. The subtype is unknown / absent.
+            self._cur = Field(field_id, WireType.ARRAY_FIXLEN, count=0, size=0)
+            self._pending = (_FARRAY, None, 0, 0)
+            return self._cur
         elem_header = self._varint()
         elem_size = elem_header >> 3
         subtype = elem_header & 0x07
@@ -452,9 +461,14 @@ class Decoder:
     def string(self) -> str:
         """Consume the current fixlen field as a UTF-8 decoded string.
 
-        Raises :class:`SofaStateError` if the field is not a STRING fixlen.
+        Raises :class:`SofaStateError` if the field is not a STRING fixlen, or
+        :class:`SofaDecodeError` if the payload is not valid UTF-8.
         """
-        return self._take_fixlen(FixlenSubtype.STRING).decode("utf-8")
+        raw = self._take_fixlen(FixlenSubtype.STRING)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SofaDecodeError("invalid UTF-8 in string field") from exc
 
     def bytes(self) -> bytes:
         """Consume the current fixlen field as a raw byte blob.
@@ -492,10 +506,13 @@ class Decoder:
         pending = self._pending
         if pending is None or pending[0] != _FARRAY:
             raise SofaStateError("current field is not a fixlen array")
-        if pending[1] != subtype:
+        count = int(pending[2])
+        # A zero-count fixlen array carries no subtype on the wire (§4.8), so any
+        # typed read accepts it and yields an empty list.
+        if count != 0 and pending[1] != subtype:
             raise SofaStateError("fixlen-array subtype does not match the requested read")
         self._pending = None
-        return int(pending[2]), int(pending[3])  # count, elem_size
+        return count, int(pending[3])  # count, elem_size
 
     def read_float32_array(self) -> list[float]:
         """Consume the current field as a list of 32-bit IEEE-754 floats.

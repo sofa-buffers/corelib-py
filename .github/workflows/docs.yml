@@ -28,11 +28,13 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install package and pdoc
-        run: python -m pip install -e . pdoc
+      - name: Install package and Sphinx
+        run: python -m pip install -e . sphinx
 
-      - name: Build API docs
-        run: pdoc -o site sofab
+      - name: Build API docs (Sphinx)
+        run: |
+          sphinx-apidoc -o docs -f -e src/sofab
+          sphinx-build -b html docs site
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
