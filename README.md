@@ -273,8 +273,8 @@ language-agnostic vectors copied verbatim from the `documentation` repo:
 
 Coverage is measured on every CI run on `main` and reported by the **coverage**
 badge above (updated automatically via the `badges` branch). API documentation
-is built with `pdoc` and published to GitHub Pages on every push to `main` (the
-**docs** badge links to it).
+is built with **Sphinx** (`sphinx-apidoc` + the HTML builder) and published to
+GitHub Pages on every push to `main` (the **docs** badge links to it).
 
 ## Benchmarks
 
