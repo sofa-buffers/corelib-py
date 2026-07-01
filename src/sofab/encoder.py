@@ -304,8 +304,9 @@ class Encoder:
         """Write an array of 32-bit floats as a packed little-endian fixlen array.
 
         The element count must be ``0..ARRAY_MAX``, else :class:`SofaRangeError`.
-        A zero-count array emits only ``[header][count=0]`` — no ``fixlen_word``
-        and no payload (§4.8).
+        A zero-count array emits ``[header][count=0][fixlen_word]`` — the
+        ``fixlen_word`` is always present (so empty fp32/fp64 arrays stay
+        distinguishable) but there is no payload (§4.8).
         """
         self._write_float_array(field_id, values, FixlenSubtype.FP32, _core.pack_f32_array, 4)
 
@@ -313,8 +314,9 @@ class Encoder:
         """Write an array of 64-bit floats as a packed little-endian fixlen array.
 
         The element count must be ``0..ARRAY_MAX``, else :class:`SofaRangeError`.
-        A zero-count array emits only ``[header][count=0]`` — no ``fixlen_word``
-        and no payload (§4.8).
+        A zero-count array emits ``[header][count=0][fixlen_word]`` — the
+        ``fixlen_word`` is always present (so empty fp32/fp64 arrays stay
+        distinguishable) but there is no payload (§4.8).
         """
         self._write_float_array(field_id, values, FixlenSubtype.FP64, _core.pack_f64_array, 8)
 
@@ -331,10 +333,10 @@ class Encoder:
         try:
             seq = [float(v) for v in values]
             self._array_header(field_id, WireType.ARRAY_FIXLEN, len(seq))
-            if not seq:
-                # §4.8: a zero-count fixlen array carries no fixlen_word and no
-                # payload — the field is exactly [header][count=0].
-                return
+            # §4.8: a fixlen array ALWAYS carries its fixlen_word (the shared
+            # element subtype/width), even when empty, so an empty fp32 and fp64
+            # array stay distinguishable on the wire. The payload loop then runs
+            # zero times for a zero-count array.
             self._emit_varint((elem_size << 3) | subtype)
             self._put(pack_array(seq))  # one struct.pack for the whole array
         except SofaError as exc:
