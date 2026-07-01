@@ -311,12 +311,9 @@ class Decoder:
         count = self._varint()
         if count < 0 or count > ARRAY_MAX:
             raise SofaDecodeError(f"array count {count} out of range")
-        if count == 0:
-            # §4.8: a zero-count fixlen array carries no fixlen_word and no
-            # payload — do not read further. The subtype is unknown / absent.
-            self._cur = Field(field_id, WireType.ARRAY_FIXLEN, count=0, size=0)
-            self._pending = (_FARRAY, None, 0, 0)
-            return self._cur
+        # §4.8: a fixlen array ALWAYS carries its fixlen_word (the shared element
+        # subtype/width), even when empty — so read it unconditionally to recover
+        # the true subtype. A zero-count array simply has no payload after it.
         elem_header = self._varint()
         elem_size = elem_header >> 3
         subtype = elem_header & 0x07
@@ -506,13 +503,12 @@ class Decoder:
         pending = self._pending
         if pending is None or pending[0] != _FARRAY:
             raise SofaStateError("current field is not a fixlen array")
-        count = int(pending[2])
-        # A zero-count fixlen array carries no subtype on the wire (§4.8), so any
-        # typed read accepts it and yields an empty list.
-        if count != 0 and pending[1] != subtype:
+        # §4.8: a fixlen array always carries its fixlen_word, so the subtype is
+        # known even for a zero-count array — check it like any other read.
+        if pending[1] != subtype:
             raise SofaStateError("fixlen-array subtype does not match the requested read")
         self._pending = None
-        return count, int(pending[3])  # count, elem_size
+        return int(pending[2]), int(pending[3])  # count, elem_size
 
     def read_float32_array(self) -> list[float]:
         """Consume the current field as a list of 32-bit IEEE-754 floats.

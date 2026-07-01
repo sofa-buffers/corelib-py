@@ -9,6 +9,7 @@ from vectors import reader
 from sofab import (
     Decoder,
     Encoder,
+    FixlenSubtype,
     SofaBufferError,
     SofaDecodeError,
     SofaRangeError,
@@ -64,30 +65,31 @@ def test_array_count_limit_overflow():
 
 
 def test_array_count_zero_is_valid():
-    # §4.7/§4.8: a zero-count array is a valid, fully-specified empty array —
-    # exactly [header][count=0], nothing after. The previous behaviour (reject
-    # count==0) was a defect under the updated spec.
-    # Unsigned array (0x03), signed array (0x04): [header][0x00] then next field.
+    # §4.7/§4.8: a zero-count array is a valid, fully-specified empty array. The
+    # previous behaviour (reject count==0) was a defect under the updated spec.
+    # Unsigned array (0x03), signed array (0x04): [header][0x00] then next field —
+    # integer arrays never carry a fixlen_word.
     for header in (0x03, 0x04):
         dec = Decoder(reader([header, 0x00]))
         f = dec.next()
         assert f is not None and f.count == 0
         # No fixlen_word / payload may be consumed; the stream is now at EOF.
         assert dec.next() is None
-    # Fixlen array (0x05): [header][0x00] with NO fixlen_word and NO payload.
-    dec = Decoder(reader([0x05, 0x00]))
+    # Fixlen array (0x05): [header][0x00][fixlen_word] — the fixlen_word is always
+    # present (§4.8), here 0x20 = (4<<3)|fp32, but there is no payload.
+    dec = Decoder(reader([0x05, 0x00, 0x20]))
     f = dec.next()
-    assert f is not None and f.count == 0
+    assert f is not None and f.count == 0 and f.subtype == FixlenSubtype.FP32
     assert dec.next() is None
 
 
-def test_array_fixlen_count_zero_consumes_no_fixlen_word():
-    # The bytes after [0x05, 0x00] must be parsed as the NEXT field, proving the
-    # decoder did not read a fixlen_word for the empty fixlen array.
-    # 0x50 = (10 << 3) | UNSIGNED, 0x07 = value 7.
-    dec = Decoder(reader([0x05, 0x00, 0x50, 0x07]))
+def test_array_fixlen_count_zero_reads_the_fixlen_word():
+    # §4.8: an empty fixlen array still carries its fixlen_word, so the bytes
+    # after [0x05, 0x00, <fixlen_word>] must be parsed as the NEXT field.
+    # 0x20 = (4<<3)|fp32 fixlen_word; 0x50 = (10 << 3) | UNSIGNED, 0x07 = value 7.
+    dec = Decoder(reader([0x05, 0x00, 0x20, 0x50, 0x07]))
     f = dec.next()
-    assert f is not None and f.count == 0
+    assert f is not None and f.count == 0 and f.subtype == FixlenSubtype.FP32
     assert dec.read_float32_array() == []  # empty fixlen array reads as []
     nxt = dec.next()
     assert nxt is not None and nxt.id == 10 and dec.unsigned() == 7
@@ -155,15 +157,19 @@ def test_encode_unsigned_out_of_range():
 
 
 def test_encode_empty_array_is_valid():
-    # §4.7/§4.8: zero-count arrays are valid. Each emits exactly [header][0x00]
-    # (the fixlen ones with NO fixlen_word and NO payload).
+    # §4.7/§4.8: zero-count arrays are valid. Integer arrays emit [header][0x00];
+    # fixlen arrays emit [header][0x00][fixlen_word] (always present, no payload)
+    # so an empty fp32 and fp64 array stay distinguishable on the wire.
     enc = Encoder()
     enc.write_unsigned_array(0, [])
     enc.write_signed_array(0, [])
     enc.write_float32_array(0, [])
     enc.write_float64_array(0, [])
-    # headers: u-array (0x03), s-array (0x04), fixlen-array (0x05), fixlen (0x05)
-    assert enc.getvalue() == bytes([0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x05, 0x00])
+    # u-array (0x03,0x00), s-array (0x04,0x00), fp32-array (0x05,0x00,0x20),
+    # fp64-array (0x05,0x00,0x41): 0x20=(4<<3)|fp32, 0x41=(8<<3)|fp64.
+    assert enc.getvalue() == bytes(
+        [0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x20, 0x05, 0x00, 0x41]
+    )
 
 
 def test_encode_nesting_beyond_max_depth_rejected():
