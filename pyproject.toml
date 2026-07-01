@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "sofabuffers"
+name = "sofa-buffers-corelib"
 version = "0.1.0"
 description = "Pure-Python runtime for the SofaBuffers binary wire format"
 readme = "README.md"
