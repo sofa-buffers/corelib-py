@@ -37,18 +37,21 @@ from .visitor import Visitor
 
 # --- implementation selection -----------------------------------------------
 #
-# ``Encoder`` / ``Decoder`` come from the compiled native accelerator
-# (``sofab._speedups``, built by Cython) when it is available and produce the
-# exact same bytes as the pure-Python classes. If the extension was never built
-# (no compiler / unsupported platform) or ``SOFAB_PUREPYTHON=1`` is set, the
-# pure-Python implementations are used instead. Both are byte-for-byte
-# compatible and validated by the same shared conformance vectors, so callers
-# and generated code never need to care which one is active.
+# ``Encoder`` / ``Decoder`` / ``Field`` come from the compiled native
+# accelerator (``sofab._speedups``, built by Cython) when it is available and
+# produce the exact same bytes / values as the pure-Python classes. If the
+# extension was never built (no compiler / unsupported platform) or
+# ``SOFAB_PUREPYTHON=1`` is set, the pure-Python implementations are used
+# instead. Both are byte-for-byte compatible and validated by the same shared
+# conformance vectors, so callers and generated code never need to care which
+# one is active. ``Field`` is re-exported from the active engine so that
+# ``isinstance(decoder.next(), sofab.Field)`` holds in both modes.
 if TYPE_CHECKING:
     # For static analysis the pure-Python classes are the reference definitions;
     # the native accelerator mirrors their public API exactly.
     from .decoder import Decoder as Decoder
     from .encoder import Encoder as Encoder
+    from .types import Field as Field
 
     #: Which implementation ``Encoder``/``Decoder`` resolve to: ``"native"`` when
     #: the compiled ``sofab._speedups`` extension is in use, else ``"python"``.
@@ -60,7 +63,7 @@ elif _os.environ.get("SOFAB_PUREPYTHON") == "1":
     IMPL = "python"
 else:
     try:
-        from ._speedups import Decoder, Encoder
+        from ._speedups import Decoder, Encoder, Field  # Field shadows types.Field
 
         IMPL = "native"
     except ImportError:
