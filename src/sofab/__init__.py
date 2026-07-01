@@ -61,7 +61,8 @@ elif _os.environ.get("SOFAB_PUREPYTHON") == "1":
     from .encoder import Encoder
 
     IMPL = "python"
-else:
+else:  # pragma: no cover - native branch: exercised only when the compiled
+    #                        extension is present; coverage runs force pure Python.
     try:
         from ._speedups import Decoder, Encoder, Field  # Field shadows types.Field
 

@@ -123,7 +123,9 @@ class Encoder:
         while pos < n:
             if self._cursor >= cap:
                 self._drain()
-                if self._cursor >= cap:
+                # Defensive: _drain either raises (no sink) or resets the cursor
+                # to 0, so a still-full buffer here is unreachable in practice.
+                if self._cursor >= cap:  # pragma: no cover
                     raise SofaBufferError("encoder buffer full")
             take = min(cap - self._cursor, n - pos)
             mv[self._cursor : self._cursor + take] = data[pos : pos + take]
@@ -343,7 +345,9 @@ class Encoder:
             self._fail(exc)
 
     def _array_header(self, field_id: int, wtype: WireType, count: int) -> None:
-        if count < 0 or count > ARRAY_MAX:
+        # Defensive: count is always len() of a materialized list, so it is
+        # non-negative and can't exceed ARRAY_MAX without exhausting memory first.
+        if count < 0 or count > ARRAY_MAX:  # pragma: no cover
             raise SofaRangeError(f"array count {count} out of range 0..{ARRAY_MAX}")
         self._header(field_id, wtype)
         self._emit_varint(count)
