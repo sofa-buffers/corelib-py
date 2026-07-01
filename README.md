@@ -30,11 +30,13 @@ unit tests here validate against the shared, language-agnostic conformance suite
 byte-for-byte interoperability with the C, C++, Rust, Go and Java
 implementations.
 
-Distribution: `sofabuffers` · import package `sofab`. Requires Python 3.9+.
+Distribution: `sofa-buffers-corelib` · import package `sofab`. Requires Python 3.9+.
 
 ```bash
-pip install sofabuffers
+pip install sofa-buffers-corelib
 ```
+
+The PyPI distribution name is `sofa-buffers-corelib`; import it as `import sofab`.
 
 ## Why this design
 
