@@ -742,25 +742,25 @@
     {
       "name": "array_fp32_empty",
       "group": "array/float",
-      "description": "Zero-count fixlen array — [hdr][count=0], no fixlen_word, no payload (§4.8).",
+      "description": "Zero-count fixlen array — [hdr][count=0][fixlen_word], no payload; the fixlen_word is always present so fp32/fp64 stay distinguishable (§4.8).",
       "offset": 0,
       "requires": ["fixlen", "array"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "fp32", "values": [] }
       ],
-      "serialized": { "length": 2, "hex": "0500" },
+      "serialized": { "length": 3, "hex": "050020" },
       "serialized_sparse": { "length": 0, "hex": "" }
     },
     {
       "name": "array_fp64_empty",
       "group": "array/float",
-      "description": "Zero-count fixlen array (fp64) — [hdr][count=0], no fixlen_word, no payload (§4.8).",
+      "description": "Zero-count fixlen array (fp64) — [hdr][count=0][fixlen_word], no payload; the fixlen_word keeps it distinct from an empty fp32 array (§4.8).",
       "offset": 0,
       "requires": ["fixlen", "array", "fp64"],
       "fields": [
         { "op": "array", "id": 0, "element_type": "fp64", "values": [] }
       ],
-      "serialized": { "length": 2, "hex": "0500" },
+      "serialized": { "length": 3, "hex": "050041" },
       "serialized_sparse": { "length": 0, "hex": "" }
     },
     {
