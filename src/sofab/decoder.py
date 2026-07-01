@@ -351,7 +351,9 @@ class Decoder:
         if self._cur is not None and self._cur.type == WireType.SEQUENCE_START:
             target = self._depth - 1
             while self._depth > target:
-                if self.next() is None:
+                # Defensive: at EOF with an open sequence, next() itself raises
+                # "truncated: unbalanced sequence", so it never returns None here.
+                if self.next() is None:  # pragma: no cover
                     raise SofaDecodeError("truncated sequence")
             return
         if self._pending is not None:
