@@ -10,6 +10,10 @@ ENV PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# build-essential provides the C toolchain used to compile the optional native
+# accelerator (src/sofab/_speedups.pyx → C via Cython, pulled in as a PEP 517
+# build dependency). Without it the package still installs — it just falls back
+# to the pure-Python engine — but the devcontainer builds the fast path.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \

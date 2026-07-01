@@ -36,7 +36,7 @@ import io
 import sys
 import time
 
-from sofab import Decoder, Encoder, WireType
+from sofab import IMPL, Decoder, Encoder, WireType
 
 N = 1000
 GOLDEN = 0x9E3779B97F4A7C15
@@ -152,7 +152,7 @@ def run_timed() -> None:
     dec_u64 = measure(lambda: decode_u64_array(u64), ba)
     dec_typ = measure(lambda: decode_typical(typ), bt)
 
-    print("=== SofaBuffers Python throughput (CPU time, MB/s) ===")
+    print(f"=== SofaBuffers Python throughput (CPU time, MB/s) [engine: {IMPL}] ===")
     print(f"{'Workload':<26} {'MB/s':>12}")
     print(f"{'--------':<26} {'----':>12}")
     print(f"{'encode: u64 array (1000)':<26} {enc_u64:>12.2f}")
@@ -267,7 +267,7 @@ def run_perf() -> None:
     msg = encode_perf_msg()
     nbytes = len(msg)
 
-    print("=== SofaBuffers Python per-op cost (cycles/op + throughput MB/s) ===")
+    print(f"=== SofaBuffers Python per-op cost (cycles/op + throughput MB/s) [engine: {IMPL}] ===")
 
     it, ns, mb = measure_perop(encode_perf_msg, nbytes)
     perf_report("serialize (stream API)", it, ns, mb, nbytes)

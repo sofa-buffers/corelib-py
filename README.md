@@ -15,13 +15,22 @@
 
 [GitHub repository](https://github.com/sofa-buffers/corelib-py)
 
-A **streaming**, **pure-Python**, **dependency-free** implementation of the
-SofaBuffers (*Sofab*) serialization format — a compact, TLV-like binary format.
-It is the **runtime stream core** (equivalent to the C `corelib`'s `istream` /
-`ostream`), meant to be driven by **generated code**: a schema-driven code
-generator emits one class per message plus `marshal` / `unmarshal` methods that
-call the primitives here, the same way protobuf's generated Python code calls its
-runtime.
+A **streaming**, **dependency-free** implementation of the SofaBuffers (*Sofab*)
+serialization format — a compact, TLV-like binary format. It is the **runtime
+stream core** (equivalent to the C `corelib`'s `istream` / `ostream`), meant to
+be driven by **generated code**: a schema-driven code generator emits one class
+per message plus `marshal` / `unmarshal` methods that call the primitives here,
+the same way protobuf's generated Python code calls its runtime.
+
+**Fast where it can be, portable everywhere.** The hot path (varint / zigzag /
+buffer management) is implemented as an optional compiled **native accelerator**
+(Cython → C, `sofab._speedups`) that is loaded automatically when present, with a
+**pure-Python fallback** used verbatim when it is not. The two are byte-for-byte
+interchangeable and validated by the same conformance vectors, so the library
+runs *anywhere CPython runs* — with or without a C compiler — and is measurably
+**faster than protobuf's Python runtime** on encode and on array-heavy decode
+(see [Benchmarks](#benchmarks)). Same public API in both modes; generated code
+never has to care which is active. See [Architecture](#architecture--native-core-pure-python-fallback).
 
 The wire format is specified, language-neutrally, in the
 [SofaBuffers documentation](https://github.com/sofa-buffers/documentation). The
@@ -44,13 +53,67 @@ The PyPI distribution name is `sofa-buffers-corelib`; import it as `import sofab
 |------|-----|
 | Streaming **out** | [`Encoder`] writes to any binary stream (file, socket, `BytesIO`), so a message can exceed RAM and stream straight to the wire. `Encoder.over_buffer` drains a small caller buffer through a flush sink when it fills. |
 | Streaming **in** | [`Decoder`] is a pull parser over any `read(n)` reader; `next()` returns one field header at a time, never materializing the whole message. Large string / blob / array payloads are read in bulk. |
-| Pure Python, no dependencies | Standard library only (`struct`, `io`). No third-party modules, no build step — a single universal wheel that runs on CPython and PyPy. |
-| Accelerator-ready | The varint / zigzag / IEEE-754 hot path lives behind `_varint` / `_core`, so a native backend (mypyc / Cython, or PyO3 over `corelib-rs`) can be dropped in later **without any public API change**. |
+| Native speed, zero runtime deps | The varint / buffer hot path ships as an optional compiled Cython accelerator (`sofab._speedups`); when it can't be built it falls back to pure standard-library Python (`struct`, `io`). No *runtime* third-party dependencies either way — see [Architecture](#architecture--native-core-pure-python-fallback). |
+| Runs everywhere | If there is no C compiler and no prebuilt wheel, `pip` still installs a working pure-Python-only build (`py3-none-any`). The native and pure paths are byte-for-byte identical, so falling back never changes behaviour — only speed. |
 | Sticky errors | The encoder can record the first failure and turn later writes into no-ops (`Encoder(sticky=True)`), so generated `marshal` code can issue a run of writes and check `enc.error` once. |
 | Reserve-offset | `Encoder.over_buffer(buf, offset=…)` leaves room at the front of the buffer for a lower-layer protocol header (saves a copy). |
 | Typed | Fully type-annotated and ships a `py.typed` marker (PEP 561); clean under `mypy --strict`. |
 | Forward/backward compatible | Unknown fields are consumed with `skip()` — old readers tolerate new fields, new readers tolerate missing ones. |
 | 64-bit value type | Matches the C default configuration, so varint lengths and bytes are identical across languages. |
+
+## Architecture — native core, pure-Python fallback
+
+The library is one public API with two interchangeable engines behind it,
+selected once at import time. This mirrors how protobuf ships a C/upb backend
+with a pure-Python fallback — but here the native core is a small, purpose-built
+Cython translation of the *same* pointer-advance algorithm the
+[`corelib-cpp`](https://github.com/sofa-buffers/corelib-cpp) implementation uses
+(one contiguous buffer, an advancing cursor, bulk `memcpy`, no per-byte Python
+calls), **not** a binding to the footprint-optimized bare-metal C core.
+
+```
+                    import sofab
+                         │
+          ┌──────────────┴───────────────┐
+   sofab._speedups (native)      pure-Python fallback
+   Cython → C extension          encoder.py / decoder.py
+   • cursor over a C buffer      • cursor over a bytes/bytearray
+   • varint/zigzag in C          • same algorithm in Python
+   • cdef Field, C-typed hot     • dataclass Field, struct-based
+     loops, one memcpy/write       float packing
+          └──────────────┬───────────────┘
+             byte-for-byte identical output
+        (validated by assets/test_vectors.json
+         + tests/test_native_parity.py, both engines)
+```
+
+**What runs in native C vs. Python**
+
+| Layer | Native (`_speedups.pyx` → C) | Pure Python |
+|-------|------------------------------|-------------|
+| `Encoder` / `Decoder` classes, full public API | ✅ compiled `cdef class` | ✅ `encoder.py` / `decoder.py` |
+| Varint + ZigZag encode/decode | C, over a raw `unsigned char*` | Python, inline cursor over `bytes` |
+| Field-header / array / fixlen framing | C | Python |
+| IEEE-754 float pack/unpack | C (endian-independent bit ops) | `struct` |
+| `Field` descriptor | `cdef class Field` (cheap C alloc) | `@dataclass Field` |
+| Wire-format constants, enums, error classes | shared `types.py` (imported by both) | shared `types.py` |
+| `Visitor` base + `drive()` dispatch | `drive()` compiled; `Visitor` is `types`/`visitor.py` | `visitor.py` |
+
+Everything *semantic* — the wire constants, the `WireType` / `FixlenSubtype`
+enums, the exception classes — lives in the pure-Python `types.py` and is
+imported by **both** engines, so a `SofaRangeError` raised by the native encoder
+is the *same class* the pure one raises.
+
+**Which engine am I running?** `sofab.IMPL` is `"native"` or `"python"`:
+
+```python
+import sofab
+print(sofab.IMPL)        # "native" when the compiled extension is loaded
+```
+
+Force the pure-Python path (for debugging or A/B checks) with the environment
+variable `SOFAB_PUREPYTHON=1`. Build a native-free distribution with
+`SOFAB_DISABLE_NATIVE=1 python -m build`.
 
 ## Usage
 
@@ -241,7 +304,8 @@ caller's encode buffer; it is a write target, not a value handed back to you.
 | `ostream.c` | `encoder.py` ([`Encoder`]) | ported |
 | `istream.c` | `decoder.py` ([`Decoder`]) | ported (pull-parser model instead of bind-target callbacks) |
 | `object.c` (descriptor transcoder) | — | not ported. The idiomatic Python equivalent is generated message classes from a schema-driven generator; the streaming core above already covers serialize / deserialize. |
-| — | `_varint.py` / `_core.py` | varint / zigzag + IEEE-754 helpers, isolated as the hot path so a native accelerator can replace them without an API change. |
+| — | `_varint.py` / `_core.py` | varint / zigzag + IEEE-754 helpers behind stable signatures — the pure-Python hot path. |
+| `corelib-cpp` `sofab.hpp` (pointer-advance OStream/IStream) | `_speedups.pyx` → C (`sofab._speedups`) | the native accelerator: a Cython `Encoder`/`Decoder` compiling the same pointer-advance hot loops to C. Optional; auto-loaded, byte-identical to the pure path. |
 
 ## Feature flags / build options
 
@@ -257,11 +321,27 @@ default configuration so the wire image and varint lengths are identical.
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install -e . pytest ruff mypy
-pytest                       # vectors + roundtrip + streaming + malformed
+pip install -e . pytest ruff mypy   # compiles the native accelerator if a C compiler is present
+pytest                       # vectors + roundtrip + streaming + malformed + native↔pure parity
 ruff check src/sofab tests   # lint
 mypy --strict src/sofab      # type-check
 ```
+
+Building the native accelerator needs only a C compiler; **Cython** is pulled in
+automatically as a [PEP 517](https://peps.python.org/pep-0517/) build-time
+dependency (declared in `pyproject.toml`), never at runtime. If the compile
+fails or no compiler is available, the install silently falls back to
+pure-Python (the extension is marked *optional*). To validate both engines
+locally:
+
+```bash
+pytest                       # runs against whichever engine is active (native if built)
+SOFAB_PUREPYTHON=1 pytest    # force the pure-Python engine
+```
+
+`tests/test_native_parity.py` asserts the native and pure engines produce
+byte-identical output and cross-decode each other; it is skipped automatically
+when the extension is not built.
 
 Tests are split by concern; the conformance suite validates against the shared,
 language-agnostic vectors copied verbatim from the `documentation` repo:
@@ -288,6 +368,39 @@ directly. Two complementary views:
 python bench/perfbench.py time            # throughput on this machine, MB/s (MB = 1e6)
 python bench/perfbench.py encode_typical  # one workload, for the Callgrind harness
 ```
+
+### Native vs. pure Python vs. protobuf
+
+`bench/compare_protobuf.py` runs the four workloads against the native
+accelerator, the pure-Python fallback, and — for an external yardstick —
+`protobuf`'s Python runtime (upb C backend) on an equivalent message, with
+**full materialization** on both sides so it is apples-to-apples with the
+SofaBuffers pull API:
+
+```bash
+pip install protobuf                      # optional; the column is dropped if absent
+python bench/compare_protobuf.py          # best-of-5 MB/s table
+```
+
+Representative result (throughput MB/s, higher is better; one x86-64 host,
+CPython 3.12 — absolute numbers vary by machine, the *ratios* are the point):
+
+| Workload | sofab **native** | sofab pure | protobuf (upb) | native vs protobuf |
+|----------|-----------------:|-----------:|---------------:|:------------------:|
+| encode: u64 array (1000) | **≈300** | ≈9 | ≈190 | **≈1.6× faster** |
+| encode: typical message  | **≈14**  | ≈4.5 | ≈10 | **≈1.5× faster** |
+| decode: u64 array (1000) | **≈285** | ≈6.7 | ≈180 | **≈1.6× faster** |
+| decode: typical message  | ≈7.3     | ≈2.0 | ≈8.6 | ≈0.85× (see note) |
+
+The native accelerator is **~15–45× faster than the pure-Python fallback** and
+beats protobuf's Python runtime on encode and on array-heavy decode. The one
+workload where protobuf edges ahead is decoding a *tiny* (36-byte) mixed message:
+SofaBuffers' streaming **pull** API crosses the Python↔C boundary twice per field
+(`next()` then a typed read), whereas protobuf parses the whole message in a
+single C call into a message object. That is an inherent pull-vs-parse-tree
+trade-off, it only shows on very small messages, and the pull API is what lets
+SofaBuffers decode a stream larger than RAM. For any message with arrays or a
+non-trivial payload, the native accelerator wins comfortably.
 
 The `time` mode reports throughput measured against **process CPU time** (not
 wall-clock), so it reflects the cost of the library rather than scheduling

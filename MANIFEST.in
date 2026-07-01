@@ -1,0 +1,7 @@
+# Ensure the native accelerator source ships in the sdist so it can be built
+# from source (Cython, declared in pyproject build-requires, compiles the .pyx).
+include setup.py
+include pyproject.toml
+include README.md PERFORMANCE.md LICENSE
+recursive-include src *.pyx *.pxd py.typed
+recursive-include assets *.json
