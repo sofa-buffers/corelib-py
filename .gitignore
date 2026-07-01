@@ -6,6 +6,12 @@ __pycache__/
 build/
 dist/
 
+# native accelerator build artifacts (Cython-generated C + compiled extension);
+# regenerated from src/sofab/_speedups.pyx by the build (Cython is a build-time
+# dependency declared in pyproject.toml).
+src/sofab/_speedups.c
+*.so
+
 # virtualenvs
 .venv/
 venv/
