@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
+# Define the container image name
+IMAGE_NAME="sofab-py-devcontainer"
+
 # Resolve this script's directory so it works regardless of the caller's cwd.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
 CLAUDE_CONFIG_DIR="$SCRIPT_DIR/.claude-config"
 mkdir -p "$CLAUDE_CONFIG_DIR"
+
+# Derive container name from parent folder, e.g. sofab-<project-folder>
+PROJECT_NAME="$(basename "$(dirname "$SCRIPT_DIR")")"
+CONTAINER_NAME="sofab-${PROJECT_NAME}"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 env_args=()
 if [[ -f "$ENV_FILE" ]]; then
@@ -14,9 +22,36 @@ else
   echo "warning: $ENV_FILE not found — copy .devcontainer/.env.example to .devcontainer/.env to load secrets." >&2
 fi
 
-docker run -it --rm --name corelib-py-dev \
+# Build image if missing
+if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+  echo "Image '$IMAGE_NAME' not found — building from $SCRIPT_DIR"
+  docker build -t "$IMAGE_NAME" "$SCRIPT_DIR"
+fi
+
+# If the container exists and is already running, attach to it.
+if docker ps --filter "name=^/${CONTAINER_NAME}$" --filter "status=running" --format '{{.ID}}' | grep -q .; then
+  echo "Attaching to running container '$CONTAINER_NAME'..."
+  docker exec -it "$CONTAINER_NAME" bash
+  exit 0
+fi
+
+# If the container exists but is stopped, start it and attach.
+if docker ps -a --filter "name=^/${CONTAINER_NAME}$" --format '{{.ID}}' | grep -q .; then
+  echo "Starting existing container '$CONTAINER_NAME'..."
+  docker start "$CONTAINER_NAME"
+  echo "Attaching to container '$CONTAINER_NAME'..."
+  docker exec -it "$CONTAINER_NAME" bash
+  exit 0
+fi
+
+# Otherwise run a new container with an explicit shell entrypoint.
+echo "Running new container '$CONTAINER_NAME'..."
+docker run -it --rm --name "$CONTAINER_NAME" \
   "${env_args[@]}" \
   -e CLAUDE_CONFIG_DIR=/root/.claude \
-  -v "$(pwd)":/workspace \
+  -v "$PROJECT_ROOT":/workspace \
   -v "$CLAUDE_CONFIG_DIR":/root/.claude \
-  py-devcontainer
+  --workdir /workspace \
+  "$IMAGE_NAME" \
+  bash
+
