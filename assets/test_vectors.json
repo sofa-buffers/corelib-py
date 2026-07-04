@@ -927,6 +927,68 @@
       "serialized_sparse": { "length": 41, "hex": "080a16181426293b3222646565703e44030103054e5241000000000000f83f07075828076177076846" }
     },
     {
+      "name": "array_string_gap",
+      "group": "array/string",
+      "description": "Array of string with a default (empty) element in the middle: sparse omits id 1, leaving a gap the decoder restores.",
+      "offset": 0,
+      "requires": ["fixlen", "sequence"],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "string", "id": 0, "value": "a" },
+        { "op": "string", "id": 1, "value": "" },
+        { "op": "string", "id": 2, "value": "c" },
+        { "op": "sequence_end" }
+      ],
+      "serialized": { "length": 10, "hex": "06020a610a02120a6307" },
+      "serialized_sparse": { "length": 8, "hex": "06020a61120a6307" }
+    },
+    {
+      "name": "array_string_trailing_default",
+      "group": "array/string",
+      "description": "Array of string with a trailing default element: sparse drops it, so [\"a\",\"\"] encodes exactly like [\"a\"].",
+      "offset": 0,
+      "requires": ["fixlen", "sequence"],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "string", "id": 0, "value": "a" },
+        { "op": "string", "id": 1, "value": "" },
+        { "op": "sequence_end" }
+      ],
+      "serialized": { "length": 7, "hex": "06020a610a0207" },
+      "serialized_sparse": { "length": 5, "hex": "06020a6107" }
+    },
+    {
+      "name": "array_string_all_default",
+      "group": "array/string",
+      "description": "Array of only default (empty) string elements: every element drops, so it encodes as the empty wrapper sequence.",
+      "offset": 0,
+      "requires": ["fixlen", "sequence"],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "string", "id": 0, "value": "" },
+        { "op": "string", "id": 1, "value": "" },
+        { "op": "sequence_end" }
+      ],
+      "serialized": { "length": 6, "hex": "0602020a0207" },
+      "serialized_sparse": { "length": 2, "hex": "0607" }
+    },
+    {
+      "name": "array_string_leading_default",
+      "group": "array/string",
+      "description": "Array of string with leading and trailing default elements: the leading one leaves an id gap, the trailing one collapses.",
+      "offset": 0,
+      "requires": ["fixlen", "sequence"],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "string", "id": 0, "value": "" },
+        { "op": "string", "id": 1, "value": "x" },
+        { "op": "string", "id": 2, "value": "" },
+        { "op": "sequence_end" }
+      ],
+      "serialized": { "length": 9, "hex": "0602020a0a78120207" },
+      "serialized_sparse": { "length": 5, "hex": "060a0a7807" }
+    },
+    {
       "name": "full_scale_example",
       "group": "composite",
       "description": "Large message mixing scalars, nested sequences, integer/float arrays and strings.",
