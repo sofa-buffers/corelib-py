@@ -100,6 +100,10 @@ cdef uint64_t _ID_MAX = <uint64_t>0x7FFFFFFF
 cdef uint64_t _ARRAY_MAX = <uint64_t>0x7FFFFFFF
 cdef uint64_t _FIXLEN_MAX = <uint64_t>0x7FFFFFFF
 cdef int _MAX_DEPTH = 255
+# Largest value representable in a Py_ssize_t — a fixlen-array payload larger
+# than this cannot be satisfied by any real buffer, so it is treated as a
+# truncated (unsatisfiable) read rather than being cast to a negative size.
+cdef uint64_t _SSIZE_MAX = <uint64_t>0x7FFFFFFFFFFFFFFFULL
 
 # Wire types (low 3 bits of a field header).
 cdef int _WT_UNSIGNED = 0
@@ -867,6 +871,34 @@ cdef class Decoder:
 
     # --- skipping -----------------------------------------------------------
 
+    cdef Py_ssize_t _farray_nbytes(self, uint64_t count, uint64_t elem_size) except -1:
+        # On-wire payload size of a fixlen array = count * elem_size. Both are
+        # attacker-controlled; the product can overflow uint64 or exceed
+        # Py_ssize_t, and casting a wrapped/oversized value straight to a signed
+        # size is undefined and can drive the cursor negative. Any size that
+        # cannot fit a real buffer is unsatisfiable, so surface it as a truncated
+        # payload — the same rejection the pure path reaches when _read_exact
+        # runs the reader dry.
+        cdef uint64_t total = count * elem_size
+        if elem_size != 0 and total // elem_size != count:
+            raise SofaDecodeError("truncated payload")
+        if total > _SSIZE_MAX:
+            raise SofaDecodeError("truncated payload")
+        return <Py_ssize_t>total
+
+    cdef bytes _read_farray_payload(self, uint64_t count, uint64_t elem_size, uint64_t width):
+        # Read a fixlen array's on-wire payload and verify its element width
+        # matches the subtype (4 for fp32, 8 for fp64) before any fixed-width
+        # unpack. The returned buffer is guaranteed to be exactly count*width
+        # bytes, so an unpack loop reading width bytes per element stays in
+        # bounds. A width mismatch is a malformed fixlen_word -> SofaDecodeError
+        # (an empty array, count == 0, carries no payload and so cannot mismatch,
+        # matching the pure path).
+        cdef bytes data = self._read_exact(self._farray_nbytes(count, elem_size))
+        if <uint64_t>PyBytes_GET_SIZE(data) != count * width:
+            raise SofaDecodeError("fixlen-array element width does not match its subtype")
+        return data
+
     cdef int _skip_pending(self) except -1:
         cdef int kind = self._pk
         self._pk = _PEND_NONE
@@ -877,7 +909,7 @@ cdef class Decoder:
         elif kind == _PEND_VARRAY:
             self._skip_varints(<Py_ssize_t>self._pend_count)
         else:  # _PEND_FARRAY
-            self._read_exact(<Py_ssize_t>(self._pend_count * self._pend_size))
+            self._read_exact(self._farray_nbytes(self._pend_count, self._pend_size))
         return 0
 
     def skip(self):
@@ -973,7 +1005,13 @@ cdef class Decoder:
     def read_float32_array(self):
         cdef uint64_t count, elem_size
         count, elem_size = self._take_farray(_ST_FP32)
-        cdef bytes data = self._read_exact(<Py_ssize_t>(count * elem_size))
+        # Consume the payload the fixlen_word claims (count * elem_size bytes),
+        # then require it to be exactly count*4 — i.e. the element width must be
+        # 4 for an fp32 array. Without this an elem_size != 4 (e.g. 0) leaves the
+        # buffer shorter than the count*4 bytes the fixed-width unpack loop reads,
+        # a heap over-read (SIGSEGV under boundscheck=False). The pure path is
+        # implicitly guarded by struct.unpack demanding an exact-size buffer.
+        cdef bytes data = self._read_farray_payload(count, elem_size, 4)
         cdef const unsigned char* p = <const unsigned char*>PyBytes_AS_STRING(data)
         cdef list out = PyList_New(<Py_ssize_t>count)
         cdef Py_ssize_t i
@@ -987,7 +1025,9 @@ cdef class Decoder:
     def read_float64_array(self):
         cdef uint64_t count, elem_size
         count, elem_size = self._take_farray(_ST_FP64)
-        cdef bytes data = self._read_exact(<Py_ssize_t>(count * elem_size))
+        # See read_float32_array: the element width must be 8 for an fp64 array,
+        # or the count*8-byte unpack loop over-reads a shorter buffer.
+        cdef bytes data = self._read_farray_payload(count, elem_size, 8)
         cdef const unsigned char* p = <const unsigned char*>PyBytes_AS_STRING(data)
         cdef list out = PyList_New(<Py_ssize_t>count)
         cdef Py_ssize_t i
