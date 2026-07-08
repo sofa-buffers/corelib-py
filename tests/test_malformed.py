@@ -121,6 +121,66 @@ def test_array_fixlen_invalid_subtype():
         _decode_fully(data)
 
 
+def test_array_fixlen_element_width_mismatch_underflow():
+    # Regression (corelib-py#28): fp32 fixlen array whose fixlen_word declares a
+    # 0-byte element width but a non-zero count. The payload is shorter than the
+    # count*4 bytes an fp32 unpack reads; the native engine used to trust the
+    # count and read off the end of the buffer (SIGSEGV). Both engines must
+    # reject it as malformed.
+    # 0x05 = (0<<3)|ARRAY_FIXLEN, 0x01 = count 1, 0x00 = fixlen_word (0<<3)|fp32.
+    dec = Decoder(reader([0x05, 0x01, 0x00]))
+    f = dec.next()
+    assert f is not None and f.subtype == FixlenSubtype.FP32
+    with pytest.raises(SofaDecodeError):
+        dec.read_float32_array()
+
+
+def test_array_fixlen_element_width_mismatch_overflow():
+    # fp32 array claiming an 8-byte element width (fp64's width): enough bytes
+    # are present, but count*8 != count*4, so it is still a malformed fixlen_word.
+    # 0x40 = (8<<3)|fp32; eight payload bytes follow the count-1 element.
+    data = [0x05, 0x01, 0x40, 0, 0, 0x80, 0x3F, 0, 0, 0, 0]
+    dec = Decoder(reader(data))
+    dec.next()
+    with pytest.raises(SofaDecodeError):
+        dec.read_float32_array()
+
+
+def test_array_fixlen_fp64_width_mismatch():
+    # Same defect on the fp64 path: subtype fp64 (1) with a 4-byte element width.
+    # 0x05 = ARRAY_FIXLEN, 0x01 = count 1, 0x21 = (4<<3)|fp64; four payload bytes.
+    data = [0x05, 0x01, 0x21, 0, 0, 0, 0]
+    dec = Decoder(reader(data))
+    dec.next()
+    with pytest.raises(SofaDecodeError):
+        dec.read_float64_array()
+
+
+def _uvarint(n: int) -> list[int]:
+    out = []
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return out
+
+
+def test_array_fixlen_payload_size_overflow_rejected_when_skipped():
+    # A fixlen array whose count * element_width overflows the payload-size
+    # arithmetic must reject as truncated (an unsatisfiable read), not wrap to a
+    # small/negative size and drive the cursor off the buffer. Exercises the
+    # skip path (which consumes the payload without reading it).
+    # count = ARRAY_MAX, element width ~2^61 (fixlen_word low 3 bits 0 => fp32).
+    count = 0x7FFFFFFF
+    elem_word = 0xFFFFFFFFFFFFFFF8  # (elem_size << 3) | fp32, elem_size ~2^61
+    data = [0x05] + _uvarint(count) + _uvarint(elem_word)
+    with pytest.raises(SofaDecodeError):
+        _decode_fully(data)
+
+
 def test_nested_sequence_extra_end():
     data = [0x00, 0x2A, 0x0E, 0x00, 0x2A, 0x11, 0x53, 0x0E, 0x00, 0x2A, 0x11, 0x53,
             0x0E, 0x00, 0x2A, 0x11, 0x53, 0x0E, 0x00, 0x2A, 0x11, 0x53, 0x0E, 0x00,
