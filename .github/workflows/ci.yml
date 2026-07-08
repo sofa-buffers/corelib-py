@@ -24,7 +24,7 @@ jobs:
         # Oldest supported (matches pyproject requires-python) plus current releases.
         python: ['3.9', '3.10', '3.11', '3.12', '3.13']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
@@ -50,7 +50,7 @@ jobs:
     permissions:
       contents: write # to publish the generated badge to the `badges` branch
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v5
