@@ -1,0 +1,47 @@
+name: callgrind-gate
+
+# CPU-independent performance gate. Measures Callgrind instructions/op for this
+# PR and for its base branch in the same job (same toolchain, so no drift), then
+# fails if any workload moved more than 2% in either direction. See
+# bench/callgrind_gate.sh and BENCH_SPEC.md.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: callgrind-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Measure head (this PR)
+        run: |
+          python -m pip install -e .
+          bash bench/callgrind_gate.sh measure | tee /tmp/head.txt
+
+      - name: Measure base (${{ github.event.pull_request.base.sha }})
+        run: |
+          cp bench/callgrind_gate.sh /tmp/callgrind_gate.sh
+          git worktree add --force /tmp/base "${{ github.event.pull_request.base.sha }}"
+          cd /tmp/base
+          python -m pip install -e .
+          bash /tmp/callgrind_gate.sh measure | tee /tmp/base.txt
+
+      - name: Gate — Ir/op within +/-2% vs base (CPU-independent)
+        run: bash bench/callgrind_gate.sh compare /tmp/base.txt /tmp/head.txt 2.0
