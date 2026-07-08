@@ -26,6 +26,7 @@ Typical use::
 
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING, Any, Protocol
 
 from . import _core
@@ -331,6 +332,20 @@ class Decoder:
 
     # --- skipping -----------------------------------------------------------
 
+    def _farray_nbytes(self, count: int, elem_size: int) -> int:
+        """On-wire payload size of a fixlen array (``count * elem_size``).
+
+        ``elem_size`` is unbounded on the wire, so the product can exceed any
+        addressable size. A payload that cannot fit a ``Py_ssize_t`` can never be
+        satisfied by a real buffer, so surface it as a truncated read rather than
+        letting a downstream ``read(n)`` raise a raw ``OverflowError`` (which
+        would leak an implementation detail and diverge from the native engine).
+        """
+        total = count * elem_size
+        if total > sys.maxsize:
+            raise SofaDecodeError("truncated payload")
+        return total
+
     def _skip_pending(self) -> None:
         pending = self._pending
         assert pending is not None
@@ -343,7 +358,7 @@ class Decoder:
         elif kind == _VARRAY:
             self._skip_varints(pending[2])
         else:  # _FARRAY
-            self._read_exact(pending[2] * pending[3])
+            self._read_exact(self._farray_nbytes(pending[2], pending[3]))
 
     def skip(self) -> None:
         """Skip the current field's value, or an entire (nested) sequence if the
@@ -518,7 +533,13 @@ class Decoder:
         Raises :class:`SofaStateError` if the field is not an fp32 array.
         """
         count, elem_size = self._take_farray(FixlenSubtype.FP32)
-        data = self._read_exact(count * elem_size)
+        data = self._read_exact(self._farray_nbytes(count, elem_size))
+        # The fixlen_word must declare a 4-byte element width for fp32; reject a
+        # mismatch as malformed instead of letting struct.unpack raise a raw
+        # struct.error (which would leak an implementation detail and diverge
+        # from the native engine, which raises SofaDecodeError here).
+        if len(data) != count * 4:
+            raise SofaDecodeError("fixlen-array element width does not match its subtype")
         return _core.unpack_f32_array(data, count)
 
     def read_float64_array(self) -> list[float]:
@@ -527,5 +548,8 @@ class Decoder:
         Raises :class:`SofaStateError` if the field is not an fp64 array.
         """
         count, elem_size = self._take_farray(FixlenSubtype.FP64)
-        data = self._read_exact(count * elem_size)
+        data = self._read_exact(self._farray_nbytes(count, elem_size))
+        # fp64 elements are 8 bytes wide; see read_float32_array.
+        if len(data) != count * 8:
+            raise SofaDecodeError("fixlen-array element width does not match its subtype")
         return _core.unpack_f64_array(data, count)
