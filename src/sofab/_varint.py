@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from .types import MASK64, SofaDecodeError
+from .types import MASK64, SofaDecodeError, SofaIncompleteError
 
 
 def zigzag_encode(v: int) -> int:
@@ -45,8 +45,10 @@ def decode_varint(read_byte: Callable[[], int | None], first: int | None = None)
 
     ``read_byte`` returns the next byte as an ``int`` or ``None`` at EOF. Pass
     ``first`` to supply an already-read leading byte. Raises
-    :class:`SofaDecodeError` on truncation or >64-bit overflow, mirroring the C
-    decoder (overflow once the shift reaches 64 bits with continuation set).
+    :class:`SofaIncompleteError` when the bytes end mid-varint (truncation, §7
+    INCOMPLETE) and :class:`SofaDecodeError` on a >64-bit overflow (§7 INVALID),
+    mirroring the C decoder (overflow once the shift reaches 64 bits with
+    continuation set).
     """
     value = 0
     shift = 0
@@ -54,7 +56,7 @@ def decode_varint(read_byte: Callable[[], int | None], first: int | None = None)
         byte = first if first is not None else read_byte()
         first = None
         if byte is None:
-            raise SofaDecodeError("truncated varint")
+            raise SofaIncompleteError("truncated varint")
         value |= (byte & 0x7F) << shift
         shift += 7
         if not (byte & 0x80):

@@ -82,8 +82,29 @@ class SofaError(Exception):
 
 
 class SofaDecodeError(SofaError):
-    """Malformed input: truncated/overflowing varint, bad fixlen subtype,
-    out-of-range count/length, or an unbalanced sequence end."""
+    """Malformed input — invalid *regardless* of what bytes might follow: an
+    overflowing (>64-bit) varint, a bad fixlen subtype, an out-of-range
+    id/count/length, invalid UTF-8, nesting past ``MAX_DEPTH``, or a dangling
+    sequence end (``MESSAGE_SPEC`` §7 INVALID).
+
+    This is deliberately **not** raised for truncation — bytes that simply end
+    inside a field are :class:`SofaIncompleteError` (§7 INCOMPLETE), a distinct
+    non-error outcome that is not a subclass of this class, so
+    ``except SofaDecodeError`` does not catch it.
+    """
+
+
+class SofaIncompleteError(SofaError):
+    """Truncated input — the bytes end *inside* a field (``MESSAGE_SPEC`` §7
+    INCOMPLETE): an unterminated varint, a fixlen/array payload shorter than its
+    declared length, an array element that runs off the end, or a nested
+    sequence that is never closed.
+
+    This is **not** malformed: more bytes could complete the message, and the
+    caller owns end-of-input. It is a sibling of :class:`SofaDecodeError` under
+    :class:`SofaError`, *not* a subclass of it, so callers can tell "need more
+    bytes" apart from "these bytes are garbage".
+    """
 
 
 class SofaRangeError(SofaError):

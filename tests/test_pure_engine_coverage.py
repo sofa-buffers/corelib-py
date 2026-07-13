@@ -29,6 +29,7 @@ from sofab.types import (
     FixlenSubtype,
     SofaBufferError,
     SofaDecodeError,
+    SofaIncompleteError,
     SofaRangeError,
     SofaStateError,
     WireType,
@@ -233,7 +234,7 @@ def test_decode_unbalanced_sequence_end_raises():
 
 def test_decode_truncated_unbalanced_sequence_raises():
     data = _hdr(1, WireType.SEQUENCE_START)  # opens, never closes, EOF
-    with pytest.raises(SofaDecodeError):
+    with pytest.raises(SofaIncompleteError):  # §7 INCOMPLETE: sequence never closed
         _decode_all(data)
 
 
@@ -241,19 +242,19 @@ def test_skip_truncated_sequence_raises():
     dec = Decoder(io.BytesIO(_hdr(1, WireType.SEQUENCE_START)))
     f = dec.next()
     assert f.type == WireType.SEQUENCE_START
-    with pytest.raises(SofaDecodeError):
+    with pytest.raises(SofaIncompleteError):
         dec.skip()  # sub-tree never terminates → truncated sequence
 
 
 def test_decode_truncated_scalar_varint_raises():
     data = _hdr(1, WireType.UNSIGNED) + b"\x80"  # value varint never terminates
-    with pytest.raises(SofaDecodeError):
+    with pytest.raises(SofaIncompleteError):
         _decode_all(data)
 
 
 def test_decode_truncated_array_element_raises():
     data = _hdr(1, WireType.ARRAY_UNSIGNED) + _varint(1) + b"\x80"  # 1 elem, truncated
-    with pytest.raises(SofaDecodeError):
+    with pytest.raises(SofaIncompleteError):
         _decode_all(data)
 
 
@@ -354,7 +355,7 @@ def test_read_array_truncated_element_raises():
     data = _hdr(1, WireType.ARRAY_UNSIGNED) + _varint(2) + _varint(5) + b"\x80"
     dec = Decoder(io.BytesIO(data))
     dec.next()
-    with pytest.raises(SofaDecodeError):
+    with pytest.raises(SofaIncompleteError):
         dec.read_unsigned_array()
 
 
@@ -371,15 +372,15 @@ def test_read_signed_array_truncated_across_refill_raises():
     data = _hdr(1, WireType.ARRAY_SIGNED) + _varint(1) + b"\x80"
     dec = Decoder(ChunkReader(data, chunk=1))
     dec.next()
-    with pytest.raises(SofaDecodeError):
+    with pytest.raises(SofaIncompleteError):
         dec.read_signed_array()
 
 
 def test_fixlen_length_word_truncated_raises():
     """A FIXLEN header with a truncated length word (a second varint that runs
-    off the end) is a decode error."""
+    off the end) is INCOMPLETE (§7) — the bytes end inside the field."""
     data = _hdr(1, WireType.FIXLEN) + b"\x80"  # length word never terminates
-    with pytest.raises(SofaDecodeError):
+    with pytest.raises(SofaIncompleteError):
         _decode_all(data)
 
 
@@ -387,7 +388,7 @@ def test_fixlen_missing_length_word_raises():
     """A FIXLEN header with *no* length word at all — the follow-up varint hits
     EOF on its very first byte (the _varint start-of-buffer refill path)."""
     data = _hdr(1, WireType.FIXLEN)  # header only, nothing after
-    with pytest.raises(SofaDecodeError):
+    with pytest.raises(SofaIncompleteError):
         _decode_all(data)
 
 
@@ -397,7 +398,7 @@ def test_read_array_missing_element_at_boundary_raises():
     data = _hdr(1, WireType.ARRAY_UNSIGNED) + _varint(2) + _varint(5)
     dec = Decoder(io.BytesIO(data))
     dec.next()
-    with pytest.raises(SofaDecodeError):
+    with pytest.raises(SofaIncompleteError):
         dec.read_unsigned_array()
 
 
