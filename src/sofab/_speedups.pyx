@@ -40,6 +40,7 @@ from .types import (
     SofaDecodeError,
     SofaError,
     SofaIncompleteError,
+    SofaLimitError,
     SofaRangeError,
     SofaStateError,
     WireType,
@@ -587,6 +588,11 @@ cdef class Decoder:
 
     cdef object _read
     cdef int _chunk
+    # Receiver-configured decode limits (None = no limit); kept as Python objects
+    # so the comparison stays exact for a caller-supplied int of any magnitude.
+    cdef object _max_array_count
+    cdef object _max_string_len
+    cdef object _max_blob_len
     cdef bytes _buf                 # owns the bytes the pointer indexes into
     cdef const unsigned char* _p
     cdef Py_ssize_t _n
@@ -600,9 +606,13 @@ cdef class Decoder:
     cdef uint64_t _pend_count
     cdef uint64_t _pend_size
 
-    def __cinit__(self, reader, *, int chunk_size=65536):
+    def __cinit__(self, reader, *, int chunk_size=65536,
+                  max_array_count=None, max_string_len=None, max_blob_len=None):
         self._read = reader.read
         self._chunk = chunk_size
+        self._max_array_count = max_array_count
+        self._max_string_len = max_string_len
+        self._max_blob_len = max_blob_len
         self._buf = b""
         self._p = <const unsigned char*>PyBytes_AS_STRING(self._buf)
         self._n = 0
@@ -705,7 +715,16 @@ cdef class Decoder:
         return bytes(acc[:n])
 
     cdef list _read_varints(self, Py_ssize_t count):
-        cdef list out = PyList_New(count)
+        # Build the result incrementally rather than pre-sizing to the wire count.
+        # ``count`` is attacker-controlled and capped only at ARRAY_MAX (2^31), so
+        # PyList_New(count) would try to allocate ~16 GB of NULL slots for a tiny
+        # hostile message claiming count = 2^31 before a single element byte is
+        # read (amplification DoS, issue #31). Appending grows the list only as
+        # elements are actually decoded, so a truncated oversize claim runs the
+        # reader dry and raises SofaIncompleteError promptly. (When a caller sets
+        # max_array_count the count is already bounded in next(); this keeps the
+        # unconfigured default safe too.)
+        cdef list out = []
         cdef Py_ssize_t i = 0
         cdef Py_ssize_t pos = self._pos
         cdef const unsigned char* p = self._p
@@ -713,7 +732,6 @@ cdef class Decoder:
         cdef unsigned char b
         cdef uint64_t result
         cdef int shift
-        cdef object item
         while i < count:
             if pos >= n:
                 self._pos = pos
@@ -725,9 +743,7 @@ cdef class Decoder:
             b = p[pos]
             pos += 1
             if b < 0x80:
-                item = PyLong_FromUnsignedLongLong(b)
-                Py_INCREF(item)
-                PyList_SET_ITEM(out, i, item)
+                out.append(PyLong_FromUnsignedLongLong(b))
                 i += 1
                 continue
             result = b & 0x7F
@@ -748,9 +764,7 @@ cdef class Decoder:
                 shift += 7
                 if shift >= 64:
                     raise SofaDecodeError("varint overflow")
-            item = PyLong_FromUnsignedLongLong(result)
-            Py_INCREF(item)
-            PyList_SET_ITEM(out, i, item)
+            out.append(PyLong_FromUnsignedLongLong(result))
             i += 1
         self._pos = pos
         return out
@@ -832,6 +846,16 @@ cdef class Decoder:
                 raise SofaDecodeError("invalid fixlen subtype %d" % subtype)
             if length > _FIXLEN_MAX:
                 raise SofaDecodeError("fixlen length out of range")
+            # Receiver-configured limits (policy, not malformation): reject an
+            # oversize string/blob here — before its payload is read or buffered.
+            if subtype == _ST_STRING and self._max_string_len is not None \
+                    and PyLong_FromUnsignedLongLong(length) > self._max_string_len:
+                raise SofaLimitError("string length %d exceeds max_string_len %s"
+                                     % (PyLong_FromUnsignedLongLong(length), self._max_string_len))
+            if subtype == _ST_BLOB and self._max_blob_len is not None \
+                    and PyLong_FromUnsignedLongLong(length) > self._max_blob_len:
+                raise SofaLimitError("blob length %d exceeds max_blob_len %s"
+                                     % (PyLong_FromUnsignedLongLong(length), self._max_blob_len))
             self._cur = _mkfield(field_id, _WT[_WT_FIXLEN],
                                  PyLong_FromUnsignedLongLong(length), _ZERO, _ST[subtype])
             self._pk = _PEND_FIXLEN
@@ -843,6 +867,10 @@ cdef class Decoder:
             count = self._varint()
             if count > _ARRAY_MAX:
                 raise SofaDecodeError("array count %d out of range" % PyLong_FromUnsignedLongLong(count))
+            if self._max_array_count is not None \
+                    and PyLong_FromUnsignedLongLong(count) > self._max_array_count:
+                raise SofaLimitError("array count %d exceeds max_array_count %s"
+                                     % (PyLong_FromUnsignedLongLong(count), self._max_array_count))
             self._cur = _mkfield(field_id, _WT[wtype], _ZERO,
                                  PyLong_FromUnsignedLongLong(count), _NONE)
             self._pk = _PEND_VARRAY
@@ -854,6 +882,10 @@ cdef class Decoder:
         count = self._varint()
         if count > _ARRAY_MAX:
             raise SofaDecodeError("array count %d out of range" % PyLong_FromUnsignedLongLong(count))
+        if self._max_array_count is not None \
+                and PyLong_FromUnsignedLongLong(count) > self._max_array_count:
+            raise SofaLimitError("array count %d exceeds max_array_count %s"
+                                 % (PyLong_FromUnsignedLongLong(count), self._max_array_count))
         # §4.8: a fixlen array ALWAYS carries its fixlen_word — read it
         # unconditionally to recover the true subtype/width.
         elem_header = self._varint()

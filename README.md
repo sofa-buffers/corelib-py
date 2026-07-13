@@ -175,6 +175,26 @@ wire = Point(x=3, y=4).encode()
 got = Point.decode(wire)             # got.x == 3, got.y == 4
 ```
 
+## Decode limits
+
+Array counts and string/blob lengths are optional on the wire, so by default the
+decoder allocates whatever a message declares. Untrusted input can abuse that, so
+`Decoder` takes optional **receiver-side** caps that reject an oversize field at
+header-decode time — *before* any allocation or payload buffering:
+
+```python
+dec = Decoder(reader, max_array_count=65536, max_string_len=1 << 20, max_blob_len=1 << 20)
+```
+
+A field whose declared count/length exceeds its cap raises `SofaLimitError`. That
+is a *policy* rejection, distinct from malformed input: it is a sibling of
+`SofaDecodeError` under `SofaError`, **not** a subclass, so `except
+SofaDecodeError` does not catch it. Each limit defaults to `None` (no cap —
+today's behaviour); the values are meant to be supplied by generated code, not
+guessed by the runtime. Independent of any limit, the decoder never pre-allocates
+from an untrusted array count — a truncated oversize claim fails promptly as
+`SofaIncompleteError` rather than attempting a huge allocation.
+
 ## Memory handling
 
 The key point for Python: **the library allocates results for you — the caller

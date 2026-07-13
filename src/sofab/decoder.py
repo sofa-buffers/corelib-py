@@ -41,6 +41,7 @@ from .types import (
     FixlenSubtype,
     SofaDecodeError,
     SofaIncompleteError,
+    SofaLimitError,
     SofaStateError,
     WireType,
 )
@@ -75,13 +76,34 @@ class Decoder:
     :class:`sofab.Visitor` to :meth:`drive` for callback-style decoding.
     """
 
-    def __init__(self, reader: _Reader, *, chunk_size: int = 65536) -> None:
+    def __init__(
+        self,
+        reader: _Reader,
+        *,
+        chunk_size: int = 65536,
+        max_array_count: int | None = None,
+        max_string_len: int | None = None,
+        max_blob_len: int | None = None,
+    ) -> None:
         """Wrap ``reader`` (any object with ``read(n) -> bytes``).
 
         ``chunk_size`` is how many bytes each refill pulls from the reader.
+
+        ``max_array_count`` / ``max_string_len`` / ``max_blob_len`` are optional
+        **receiver-side** decode limits: a field whose wire-declared array count
+        or fixlen string/blob length exceeds the configured cap is rejected with
+        :class:`SofaLimitError` at header-decode time — *before* any allocation
+        or payload buffering, so a hostile claim fails even if the payload never
+        arrives. ``None`` (the default) means "no limit" — today's behaviour. The
+        limits are policy, not schema: the generator bakes the configured values
+        into generated code and passes them here; this runtime only enforces them
+        and never invents a default cap of its own.
         """
         self._read = reader.read
         self._chunk = chunk_size
+        self._max_array_count = max_array_count
+        self._max_string_len = max_string_len
+        self._max_blob_len = max_blob_len
         self._buf = b""
         self._pos = 0
         self._depth = 0
@@ -178,8 +200,19 @@ class Decoder:
     def _read_varints(self, count: int) -> list[int]:
         """Decode ``count`` consecutive varints in one tight loop that advances
         the cursor over the buffer — the whole varint codec is inlined here (no
-        per-element call) and refills only when it runs off the end."""
-        out = [0] * count
+        per-element call) and refills only when it runs off the end.
+
+        The result is built incrementally with ``append`` rather than pre-sized
+        to ``count``: ``count`` comes straight off the wire and is capped only at
+        ``ARRAY_MAX`` (INT32_MAX), so pre-sizing (``[0] * count``) would let a
+        tiny hostile message claiming ``count = 2**31`` force a ~16 GB list
+        allocation before a single element byte is read (amplification DoS,
+        issue #31). Growing as elements are actually decoded bounds the
+        allocation by the payload really present — a truncated oversize claim
+        runs the reader dry and raises :class:`SofaIncompleteError` promptly. The
+        float path already reads its payload first (``read_float32_array``); this
+        brings the varint path in line."""
+        out: list[int] = []
         buf = self._buf
         pos = self._pos
         n = len(buf)
@@ -195,7 +228,7 @@ class Decoder:
             b = buf[pos]
             pos += 1
             if b < 0x80:  # one-byte element
-                out[i] = b
+                out.append(b)
                 i += 1
                 continue
             result = b & 0x7F
@@ -216,7 +249,7 @@ class Decoder:
                 shift += 7
                 if shift >= 64:
                     raise SofaDecodeError("varint overflow")
-            out[i] = result & MASK64
+            out.append(result & MASK64)
             i += 1
         self._pos = pos
         return out
@@ -295,6 +328,24 @@ class Decoder:
                 raise SofaDecodeError(f"invalid fixlen subtype {subtype}")
             if length > FIXLEN_MAX:
                 raise SofaDecodeError("fixlen length out of range")
+            # Receiver-configured limits (policy, not malformation): reject an
+            # oversize string/blob here — before its payload is read or buffered.
+            if (
+                subtype == FixlenSubtype.STRING
+                and self._max_string_len is not None
+                and length > self._max_string_len
+            ):
+                raise SofaLimitError(
+                    f"string length {length} exceeds max_string_len {self._max_string_len}"
+                )
+            if (
+                subtype == FixlenSubtype.BLOB
+                and self._max_blob_len is not None
+                and length > self._max_blob_len
+            ):
+                raise SofaLimitError(
+                    f"blob length {length} exceeds max_blob_len {self._max_blob_len}"
+                )
             self._cur = Field(
                 field_id, WireType.FIXLEN, size=length, subtype=FixlenSubtype(subtype)
             )
@@ -305,6 +356,10 @@ class Decoder:
             count = self._varint()
             if count < 0 or count > ARRAY_MAX:
                 raise SofaDecodeError(f"array count {count} out of range")
+            if self._max_array_count is not None and count > self._max_array_count:
+                raise SofaLimitError(
+                    f"array count {count} exceeds max_array_count {self._max_array_count}"
+                )
             self._cur = Field(field_id, _WT[wtype], count=count)
             self._pending = (_VARRAY, wtype, count)
             return self._cur
@@ -313,6 +368,10 @@ class Decoder:
         count = self._varint()
         if count < 0 or count > ARRAY_MAX:
             raise SofaDecodeError(f"array count {count} out of range")
+        if self._max_array_count is not None and count > self._max_array_count:
+            raise SofaLimitError(
+                f"array count {count} exceeds max_array_count {self._max_array_count}"
+            )
         # §4.8: a fixlen array ALWAYS carries its fixlen_word (the shared element
         # subtype/width), even when empty — so read it unconditionally to recover
         # the true subtype. A zero-count array simply has no payload after it.
