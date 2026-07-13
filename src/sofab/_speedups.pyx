@@ -39,6 +39,7 @@ from .types import (
     SofaBufferError,
     SofaDecodeError,
     SofaError,
+    SofaIncompleteError,
     SofaRangeError,
     SofaStateError,
     WireType,
@@ -648,7 +649,7 @@ cdef class Decoder:
         cdef int shift
         if pos >= n:
             if not self._need(1):
-                raise SofaDecodeError("truncated varint")
+                raise SofaIncompleteError("truncated varint")
             p = self._p
             pos = self._pos
             n = self._n
@@ -663,7 +664,7 @@ cdef class Decoder:
             if pos >= n:
                 self._pos = pos
                 if not self._need(1):
-                    raise SofaDecodeError("truncated varint")
+                    raise SofaIncompleteError("truncated varint")
                 p = self._p
                 pos = self._pos
                 n = self._n
@@ -696,7 +697,7 @@ cdef class Decoder:
                 want = <int>(n - <Py_ssize_t>len(acc))
             data = self._read(want)
             if not data:
-                raise SofaDecodeError("truncated payload")
+                raise SofaIncompleteError("truncated payload")
             acc += data
         if <Py_ssize_t>len(acc) > n:
             self._rebind(bytes(acc[n:]))
@@ -717,7 +718,7 @@ cdef class Decoder:
             if pos >= n:
                 self._pos = pos
                 if not self._need(1):
-                    raise SofaDecodeError("truncated varint")
+                    raise SofaIncompleteError("truncated varint")
                 p = self._p
                 pos = self._pos
                 n = self._n
@@ -735,7 +736,7 @@ cdef class Decoder:
                 if pos >= n:
                     self._pos = pos
                     if not self._need(1):
-                        raise SofaDecodeError("truncated varint")
+                        raise SofaIncompleteError("truncated varint")
                     p = self._p
                     pos = self._pos
                     n = self._n
@@ -792,7 +793,7 @@ cdef class Decoder:
 
         if not self._need(1):
             if self._depth != 0:
-                raise SofaDecodeError("truncated: unbalanced sequence")
+                raise SofaIncompleteError("truncated: unbalanced sequence")
             return None
 
         header = self._varint()
@@ -881,9 +882,9 @@ cdef class Decoder:
         # runs the reader dry.
         cdef uint64_t total = count * elem_size
         if elem_size != 0 and total // elem_size != count:
-            raise SofaDecodeError("truncated payload")
+            raise SofaIncompleteError("truncated payload")
         if total > _SSIZE_MAX:
-            raise SofaDecodeError("truncated payload")
+            raise SofaIncompleteError("truncated payload")
         return <Py_ssize_t>total
 
     cdef bytes _read_farray_payload(self, uint64_t count, uint64_t elem_size, uint64_t width):
@@ -918,7 +919,7 @@ cdef class Decoder:
             target = self._depth - 1
             while self._depth > target:
                 if self.next() is None:
-                    raise SofaDecodeError("truncated sequence")
+                    raise SofaIncompleteError("truncated sequence")
             return
         if self._pk != _PEND_NONE:
             self._skip_pending()

@@ -40,6 +40,7 @@ from .types import (
     Field,
     FixlenSubtype,
     SofaDecodeError,
+    SofaIncompleteError,
     SofaStateError,
     WireType,
 )
@@ -122,7 +123,7 @@ class Decoder:
         pos = self._pos
         if pos >= len(buf):
             if not self._need(1):
-                raise SofaDecodeError("truncated varint")
+                raise SofaIncompleteError("truncated varint")
             buf = self._buf
             pos = self._pos
         b = buf[pos]
@@ -137,7 +138,7 @@ class Decoder:
             if pos >= n:
                 self._pos = pos
                 if not self._need(1):
-                    raise SofaDecodeError("truncated varint")
+                    raise SofaIncompleteError("truncated varint")
                 buf = self._buf
                 pos = self._pos
                 n = len(buf)
@@ -168,7 +169,7 @@ class Decoder:
         while len(out) < n:
             data = read(max(chunk, n - len(out)))
             if not data:
-                raise SofaDecodeError("truncated payload")
+                raise SofaIncompleteError("truncated payload")
             out += data
         if len(out) > n:  # keep the overshoot for the next read
             self._buf = bytes(out[n:])
@@ -187,7 +188,7 @@ class Decoder:
             if pos >= n:
                 self._pos = pos
                 if not self._need(1):
-                    raise SofaDecodeError("truncated varint")
+                    raise SofaIncompleteError("truncated varint")
                 buf = self._buf
                 pos = self._pos
                 n = len(buf)
@@ -203,7 +204,7 @@ class Decoder:
                 if pos >= n:
                     self._pos = pos
                     if not self._need(1):
-                        raise SofaDecodeError("truncated varint")
+                        raise SofaIncompleteError("truncated varint")
                     buf = self._buf
                     pos = self._pos
                     n = len(buf)
@@ -257,7 +258,7 @@ class Decoder:
 
         if not self._need(1):
             if self._depth != 0:
-                raise SofaDecodeError("truncated: unbalanced sequence")
+                raise SofaIncompleteError("truncated: unbalanced sequence")
             return None
 
         header = self._varint()
@@ -343,7 +344,7 @@ class Decoder:
         """
         total = count * elem_size
         if total > sys.maxsize:
-            raise SofaDecodeError("truncated payload")
+            raise SofaIncompleteError("truncated payload")
         return total
 
     def _skip_pending(self) -> None:
@@ -369,7 +370,7 @@ class Decoder:
                 # Defensive: at EOF with an open sequence, next() itself raises
                 # "truncated: unbalanced sequence", so it never returns None here.
                 if self.next() is None:  # pragma: no cover
-                    raise SofaDecodeError("truncated sequence")
+                    raise SofaIncompleteError("truncated sequence")
             return
         if self._pending is not None:
             self._skip_pending()

@@ -12,6 +12,7 @@ from sofab import (
     FixlenSubtype,
     SofaBufferError,
     SofaDecodeError,
+    SofaIncompleteError,
     SofaRangeError,
     SofaStateError,
 )
@@ -170,14 +171,15 @@ def _uvarint(n: int) -> list[int]:
 
 def test_array_fixlen_payload_size_overflow_rejected_when_skipped():
     # A fixlen array whose count * element_width overflows the payload-size
-    # arithmetic must reject as truncated (an unsatisfiable read), not wrap to a
-    # small/negative size and drive the cursor off the buffer. Exercises the
+    # arithmetic is an unsatisfiable read — the payload is (far) shorter than its
+    # declared length, so it is INCOMPLETE (§7), not malformed: it must not wrap
+    # to a small/negative size and drive the cursor off the buffer. Exercises the
     # skip path (which consumes the payload without reading it).
     # count = ARRAY_MAX, element width ~2^61 (fixlen_word low 3 bits 0 => fp32).
     count = 0x7FFFFFFF
     elem_word = 0xFFFFFFFFFFFFFFF8  # (elem_size << 3) | fp32, elem_size ~2^61
     data = [0x05] + _uvarint(count) + _uvarint(elem_word)
-    with pytest.raises(SofaDecodeError):
+    with pytest.raises(SofaIncompleteError):
         _decode_fully(data)
 
 
@@ -193,12 +195,39 @@ def test_nested_sequence_extra_end():
 
 
 def test_truncated_payload():
-    # fixlen string claims 12 bytes but only 2 follow
+    # fixlen string claims 12 bytes but only 2 follow — the bytes end inside the
+    # field, so this is INCOMPLETE (§7), not malformed.
     data = [0x02, 0x62, 0x48, 0x65]
     dec = Decoder(reader(data))
     dec.next()
-    with pytest.raises(SofaDecodeError):
+    with pytest.raises(SofaIncompleteError):
         dec.string()
+
+
+# --- three-valued outcome: INCOMPLETE vs INVALID (MESSAGE_SPEC §7) -----------
+
+
+def test_lone_continuation_byte_is_incomplete_not_malformed():
+    # A single dangling 0x80 (continuation bit set, no terminating byte) is the
+    # canonical INCOMPLETE case: the bytes end inside a varint, more could follow.
+    # It must be neither COMPLETE (next() returning a field / None) nor INVALID.
+    dec = Decoder(reader([0x80]))
+    with pytest.raises(SofaIncompleteError) as exc:
+        dec.next()
+    # INCOMPLETE is a *sibling* of the malformed error, never a subclass, so a
+    # caller doing `except SofaDecodeError` does not mistake "need more bytes"
+    # for "these bytes are garbage".
+    assert not isinstance(exc.value, SofaDecodeError)
+
+
+def test_varint_over_64_bits_stays_malformed():
+    # A varint whose continuation runs past 64 bits is INVALID regardless of what
+    # follows — it stays SofaDecodeError, and is NOT reclassified as incomplete.
+    # 10 x 0xFF then 0x7F: the shift reaches 64 with the continuation bit set.
+    data = [0x00] + [0xFF] * 10 + [0x7F]
+    with pytest.raises(SofaDecodeError) as exc:
+        _decode_fully(data)
+    assert not isinstance(exc.value, SofaIncompleteError)
 
 
 # --- encoder-side errors ----------------------------------------------------

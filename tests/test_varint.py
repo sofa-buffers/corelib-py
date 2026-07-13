@@ -6,7 +6,7 @@ import pytest
 
 from sofab import zigzag_decode, zigzag_encode
 from sofab._varint import decode_varint, encode_varint
-from sofab.types import SofaDecodeError
+from sofab.types import SofaDecodeError, SofaIncompleteError
 
 
 def _reader(data: bytes):
@@ -47,9 +47,13 @@ def test_zigzag_known_mapping():
     assert [zigzag_encode(v) for v in (0, -1, 1, -2, 2)] == [0, 1, 2, 3, 4]
 
 
-def test_decode_truncated_raises():
-    with pytest.raises(SofaDecodeError):
+def test_decode_truncated_is_incomplete():
+    # Bytes ending mid-varint (continuation set, no terminator) is INCOMPLETE
+    # (§7), NOT malformed — SofaIncompleteError is not a SofaDecodeError, so
+    # `except SofaDecodeError` must not catch it.
+    with pytest.raises(SofaIncompleteError) as exc:
         decode_varint(_reader(bytes([0x80, 0x80])))  # never terminates
+    assert not isinstance(exc.value, SofaDecodeError)
 
 
 def test_decode_overflow_raises():
