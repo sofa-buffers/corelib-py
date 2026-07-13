@@ -107,6 +107,20 @@ class SofaIncompleteError(SofaError):
     """
 
 
+class SofaLimitError(SofaError):
+    """A wire-declared array count or fixlen (string/blob) length exceeded a
+    **receiver-configured** decode limit (``Decoder(max_array_count=…,
+    max_string_len=…, max_blob_len=…)``).
+
+    This is a *policy* rejection, not wire malformation: the bytes are perfectly
+    well-formed and would decode fine with the limit unset — the receiver simply
+    declined to allocate for them. It is therefore a sibling of
+    :class:`SofaDecodeError` under :class:`SofaError`, **not** a subclass of it,
+    so ``except SofaDecodeError`` does not catch it and differential fuzzing does
+    not see a limit rejection as a conformance divergence from another engine.
+    """
+
+
 class SofaRangeError(SofaError):
     """A value (or id/count) is outside the permitted range on encode."""
 

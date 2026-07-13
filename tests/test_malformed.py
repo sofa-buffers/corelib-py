@@ -12,7 +12,9 @@ from sofab import (
     FixlenSubtype,
     SofaBufferError,
     SofaDecodeError,
+    SofaError,
     SofaIncompleteError,
+    SofaLimitError,
     SofaRangeError,
     SofaStateError,
 )
@@ -228,6 +230,179 @@ def test_varint_over_64_bits_stays_malformed():
     with pytest.raises(SofaDecodeError) as exc:
         _decode_fully(data)
     assert not isinstance(exc.value, SofaIncompleteError)
+
+
+# --- decode resource limits (issue #31) -------------------------------------
+#
+# Part A: unconditional hardening — the untrusted wire count must never drive an
+# eager allocation. Part B: opt-in receiver-side limits raising SofaLimitError.
+
+
+def test_unsigned_array_huge_count_does_not_preallocate():
+    # issue #31 Part A: a tiny message claiming a 2^31-element unsigned array but
+    # carrying a single payload byte must fail as truncated (INCOMPLETE) promptly
+    # — WITHOUT pre-allocating a ~16 GB list from the untrusted count. If the
+    # decoder still did `[0] * count` this would OOM/hang instead of raising.
+    # 0x03 = (0<<3)|ARRAY_UNSIGNED, then count = 0x7FFFFFFF, then one lone byte.
+    data = [0x03] + _uvarint(0x7FFFFFFF) + [0x01]
+    dec = Decoder(reader(data))
+    f = dec.next()
+    assert f is not None and f.count == 0x7FFFFFFF
+    with pytest.raises(SofaIncompleteError):
+        dec.read_unsigned_array()
+
+
+def test_signed_array_huge_count_does_not_preallocate():
+    # Same hardening on the signed-array path (0x04 = (0<<3)|ARRAY_SIGNED).
+    data = [0x04] + _uvarint(0x7FFFFFFF) + [0x01]
+    dec = Decoder(reader(data))
+    f = dec.next()
+    assert f is not None and f.count == 0x7FFFFFFF
+    with pytest.raises(SofaIncompleteError):
+        dec.read_signed_array()
+
+
+def test_max_array_count_rejects_oversize_before_alloc():
+    # Part B acceptance: with max_array_count=65536 an otherwise-valid message
+    # carrying a 65537-element dynamic array raises SofaLimitError at header time
+    # (next()) — before read_unsigned_array is ever called. The identical bytes
+    # decode unchanged with the limit unset.
+    enc = Encoder()
+    enc.write_unsigned_array(7, list(range(65537)))
+    data = enc.getvalue()
+
+    dec = Decoder(reader(data), max_array_count=65536)
+    with pytest.raises(SofaLimitError):
+        dec.next()
+
+    dec2 = Decoder(reader(data))
+    f = dec2.next()
+    assert f is not None and f.count == 65537
+    assert dec2.read_unsigned_array() == list(range(65537))
+
+
+def test_max_array_count_fires_before_any_payload():
+    # The cap is enforced on the count varint alone: a header claiming 100
+    # elements with NO payload following still raises SofaLimitError (not the
+    # truncation that reading the absent elements would give), proving the check
+    # runs before allocation/buffering.
+    data = [0x03] + _uvarint(100)  # ARRAY_UNSIGNED, count 100, no elements
+    dec = Decoder(reader(data), max_array_count=10)
+    with pytest.raises(SofaLimitError):
+        dec.next()
+
+
+def test_max_array_count_boundary_is_inclusive():
+    # count == max_array_count is allowed; count == max + 1 is rejected.
+    ok = Encoder()
+    ok.write_unsigned_array(0, list(range(8)))
+    dec = Decoder(reader(ok.getvalue()), max_array_count=8)
+    f = dec.next()
+    assert f is not None and f.count == 8
+    assert dec.read_unsigned_array() == list(range(8))
+
+    over = Encoder()
+    over.write_unsigned_array(0, list(range(9)))
+    dec = Decoder(reader(over.getvalue()), max_array_count=8)
+    with pytest.raises(SofaLimitError):
+        dec.next()
+
+
+def test_max_array_count_applies_to_all_array_kinds():
+    # The count cap governs every array wire type — signed and fixlen (float)
+    # arrays as well as unsigned.
+    for write in (
+        lambda e: e.write_signed_array(1, list(range(6))),
+        lambda e: e.write_float32_array(1, [1.0] * 6),
+        lambda e: e.write_float64_array(1, [1.0] * 6),
+    ):
+        enc = Encoder()
+        write(enc)
+        dec = Decoder(reader(enc.getvalue()), max_array_count=5)
+        with pytest.raises(SofaLimitError):
+            dec.next()
+
+
+def test_max_string_len_fires_before_payload():
+    # A fixlen STRING header claiming length 100 with NO payload bytes is
+    # rejected by max_string_len at next(), before the payload is read/buffered.
+    # 0x02 = (0<<3)|FIXLEN; length_header = (100 << 3) | 0x2 (STRING).
+    data = [0x02] + _uvarint((100 << 3) | 0x2)
+    dec = Decoder(reader(data), max_string_len=10)
+    with pytest.raises(SofaLimitError):
+        dec.next()
+
+
+def test_max_string_len_valid_message_roundtrips_without_limit():
+    enc = Encoder()
+    enc.write_string(3, "x" * 100)
+    data = enc.getvalue()
+
+    dec = Decoder(reader(data), max_string_len=64)
+    with pytest.raises(SofaLimitError):
+        dec.next()
+
+    dec2 = Decoder(reader(data))
+    dec2.next()
+    assert dec2.string() == "x" * 100
+
+    within = Encoder()
+    within.write_string(3, "y" * 64)  # exactly at the limit: allowed
+    dec3 = Decoder(reader(within.getvalue()), max_string_len=64)
+    dec3.next()
+    assert dec3.string() == "y" * 64
+
+
+def test_max_blob_len_rejects_oversize():
+    enc = Encoder()
+    enc.write_bytes(1, b"\x00" * 100)
+    data = enc.getvalue()
+
+    dec = Decoder(reader(data), max_blob_len=16)
+    with pytest.raises(SofaLimitError):
+        dec.next()
+
+    dec2 = Decoder(reader(data))
+    dec2.next()
+    assert dec2.bytes() == b"\x00" * 100
+
+
+def test_limits_are_independent_per_kind():
+    # Each limit governs only its own field kind: a blob is not bound by
+    # max_string_len, nor a string by max_blob_len.
+    blob = Encoder()
+    blob.write_bytes(1, b"z" * 100)
+    dec = Decoder(reader(blob.getvalue()), max_string_len=1)
+    dec.next()
+    assert dec.bytes() == b"z" * 100
+
+    text = Encoder()
+    text.write_string(1, "z" * 100)
+    dec = Decoder(reader(text.getvalue()), max_blob_len=1)
+    dec.next()
+    assert dec.string() == "z" * 100
+
+
+def test_limit_error_is_not_a_decode_or_incomplete_error():
+    # Part B acceptance: a limit rejection is policy, not wire malformation, so a
+    # handler that catches only the invalid-message class must not swallow it.
+    enc = Encoder()
+    enc.write_unsigned_array(0, list(range(4)))
+    data = enc.getvalue()
+
+    dec = Decoder(reader(data), max_array_count=2)
+    with pytest.raises(SofaLimitError) as exc:
+        dec.next()
+    assert isinstance(exc.value, SofaError)
+    assert not isinstance(exc.value, SofaDecodeError)
+    assert not isinstance(exc.value, SofaIncompleteError)
+
+    # `except SofaDecodeError` genuinely does not intercept it.
+    with pytest.raises(SofaLimitError):
+        try:
+            Decoder(reader(data), max_array_count=2).next()
+        except SofaDecodeError:  # pragma: no cover - must not be taken
+            pytest.fail("SofaLimitError must not be caught as SofaDecodeError")
 
 
 # --- encoder-side errors ----------------------------------------------------
