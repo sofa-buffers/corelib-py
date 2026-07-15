@@ -265,20 +265,20 @@ def test_decode_array_element_overflow_raises():
 
 
 def test_decode_fp32_wrong_payload_length_raises():
-    # FIXLEN / FP32 subtype but length 3 (not 4)
+    # FIXLEN / FP32 subtype but length 3 (not 4). The wrong width is rejected as
+    # INVALID at header time (see corelib-py#38), so next() itself raises —
+    # before the payload is read — rather than the value reader.
     data = _hdr(1, WireType.FIXLEN) + _varint((3 << 3) | FixlenSubtype.FP32) + b"\x00\x00\x00"
     dec = Decoder(io.BytesIO(data))
-    dec.next()
     with pytest.raises(SofaDecodeError):
-        dec.float32()
+        dec.next()
 
 
 def test_decode_fp64_wrong_payload_length_raises():
     data = _hdr(1, WireType.FIXLEN) + _varint((4 << 3) | FixlenSubtype.FP64) + b"\x00\x00\x00\x00"
     dec = Decoder(io.BytesIO(data))
-    dec.next()
     with pytest.raises(SofaDecodeError):
-        dec.float64()
+        dec.next()
 
 
 # --------------- Decoder — wrong-type read → SofaStateError ------------------
