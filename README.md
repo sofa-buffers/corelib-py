@@ -31,7 +31,7 @@ runs, with or without a C compiler.
 
 ### Requirements
 
-Python 3.9 or newer (CPython or PyPy); CI runs 3.9–3.13. The optional native
+Python 3.9 or newer (CPython or PyPy); CI runs 3.9–3.14. The optional native
 accelerator additionally needs a C compiler and Cython, both build-time only.
 
 ### Dependencies
