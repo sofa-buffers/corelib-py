@@ -2,6 +2,6 @@
 # from source (Cython, declared in pyproject build-requires, compiles the .pyx).
 include setup.py
 include pyproject.toml
-include README.md PERFORMANCE.md LICENSE
+include README.md LICENSE
 recursive-include src *.pyx *.pxd py.typed
 recursive-include assets *.json
