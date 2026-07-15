@@ -328,6 +328,17 @@ class Decoder:
                 raise SofaDecodeError(f"invalid fixlen subtype {subtype}")
             if length > FIXLEN_MAX:
                 raise SofaDecodeError("fixlen length out of range")
+            # A wrong-width fp field is malformed regardless of what bytes
+            # follow, so this INVALID verdict must be reached at header time —
+            # before any payload read — so it takes precedence over the
+            # INCOMPLETE a truncated payload would otherwise raise (§7). Mirrors
+            # the eager element-width check on the fixlen-array path below. Do
+            # not eager-check STRING/BLOB: those are variable-length, so a
+            # truncated string/blob is legitimately INCOMPLETE.
+            if subtype == FixlenSubtype.FP32 and length != 4:
+                raise SofaDecodeError("fp32 fixlen length must be 4")
+            if subtype == FixlenSubtype.FP64 and length != 8:
+                raise SofaDecodeError("fp64 fixlen length must be 8")
             # Receiver-configured limits (policy, not malformation): reject an
             # oversize string/blob here — before its payload is read or buffered.
             if (
@@ -517,7 +528,7 @@ class Decoder:
         :class:`SofaDecodeError` if its payload is not 4 bytes.
         """
         data = self._take_fixlen(FixlenSubtype.FP32)
-        if len(data) != 4:
+        if len(data) != 4:  # pragma: no cover - header validates width eagerly (see next())
             raise SofaDecodeError("fp32 payload must be 4 bytes")
         return _core.unpack_f32(data)
 
@@ -528,7 +539,7 @@ class Decoder:
         :class:`SofaDecodeError` if its payload is not 8 bytes.
         """
         data = self._take_fixlen(FixlenSubtype.FP64)
-        if len(data) != 8:
+        if len(data) != 8:  # pragma: no cover - header validates width eagerly (see next())
             raise SofaDecodeError("fp64 payload must be 8 bytes")
         return _core.unpack_f64(data)
 

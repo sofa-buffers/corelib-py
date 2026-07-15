@@ -185,6 +185,74 @@ def test_array_fixlen_payload_size_overflow_rejected_when_skipped():
         _decode_fully(data)
 
 
+# --- scalar fixlen fp width: INVALID takes precedence over INCOMPLETE (§7) ---
+#
+# A fixlen fp32/fp64 whose declared length is not the type's fixed width (4/8)
+# is malformed regardless of what bytes follow, so INVALID must win over the
+# INCOMPLETE a truncated payload would otherwise raise (corelib-py#38). The
+# width is validated eagerly at header-decode time, mirroring the fixlen-array
+# path (test_array_fixlen_*_width_mismatch above), so the verdict is reached
+# before any payload read — hence these expect the raise from ``next()`` itself.
+#
+# Exercise every available engine so the pure and native decoders stay in
+# lockstep (they returned INCOMPLETE together before the fix). ``Decoder``
+# imported from ``sofab`` resolves to the native class when it is compiled in,
+# so name the pure engine explicitly rather than relying on the public alias.
+from sofab.decoder import Decoder as _PyDecoder  # noqa: E402
+
+_DECODERS = [_PyDecoder]
+try:  # the native accelerator, when compiled in, must behave identically
+    from sofab import _speedups as _sp
+
+    _DECODERS.append(_sp.Decoder)
+except ImportError:  # pragma: no cover - pure-Python-only install
+    pass
+
+
+def _decode_one(decoder_cls, data):
+    """next() then consume the single fixlen field, surfacing its verdict."""
+    dec = decoder_cls(reader(data))
+    f = dec.next()
+    assert f is not None
+    if f.subtype == FixlenSubtype.FP32:
+        dec.float32()
+    else:
+        dec.float64()
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_fixlen_fp64_wrong_width_truncated_is_invalid_not_incomplete(decoder_cls):
+    # 0x02 = (0<<3)|FIXLEN, 0x59 = (11<<3)|fp64 → length 11 ≠ 8; zero payload
+    # bytes present. Wrong-width *and* truncated: INVALID must take precedence.
+    with pytest.raises(SofaDecodeError) as exc:
+        _decode_one(decoder_cls, [0x02, 0x59])
+    assert not isinstance(exc.value, SofaIncompleteError)
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_fixlen_fp32_wrong_width_truncated_is_invalid_not_incomplete(decoder_cls):
+    # 0x38 = (7<<3)|fp32 → length 7 ≠ 4; zero payload bytes present.
+    with pytest.raises(SofaDecodeError) as exc:
+        _decode_one(decoder_cls, [0x02, 0x38])
+    assert not isinstance(exc.value, SofaIncompleteError)
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_fixlen_fp64_wrong_width_full_payload_stays_invalid(decoder_cls):
+    # Control: wrong width but all 11 declared bytes present → still INVALID.
+    with pytest.raises(SofaDecodeError) as exc:
+        _decode_one(decoder_cls, [0x02, 0x59] + [0] * 11)
+    assert not isinstance(exc.value, SofaIncompleteError)
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_fixlen_fp64_correct_width_truncated_stays_incomplete(decoder_cls):
+    # Control: correct width (0x41 = (8<<3)|fp64 → length 8) but only 3 of the 8
+    # payload bytes present → genuinely INCOMPLETE, must NOT be reclassified.
+    with pytest.raises(SofaIncompleteError):
+        _decode_one(decoder_cls, [0x02, 0x41, 0, 0, 0])
+
+
 def test_nested_sequence_extra_end():
     data = [0x00, 0x2A, 0x0E, 0x00, 0x2A, 0x11, 0x53, 0x0E, 0x00, 0x2A, 0x11, 0x53,
             0x0E, 0x00, 0x2A, 0x11, 0x53, 0x0E, 0x00, 0x2A, 0x11, 0x53, 0x0E, 0x00,

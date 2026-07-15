@@ -846,6 +846,16 @@ cdef class Decoder:
                 raise SofaDecodeError("invalid fixlen subtype %d" % subtype)
             if length > _FIXLEN_MAX:
                 raise SofaDecodeError("fixlen length out of range")
+            # A wrong-width fp field is malformed regardless of what bytes
+            # follow, so raise this INVALID verdict at header time — before any
+            # payload read — so it takes precedence over the INCOMPLETE a
+            # truncated payload would otherwise raise (§7). Keeps this engine
+            # byte-for-byte identical to the pure decoder. STRING/BLOB are
+            # variable-length, so a truncated one is legitimately INCOMPLETE.
+            if subtype == _ST_FP32 and length != 4:
+                raise SofaDecodeError("fp32 fixlen length must be 4")
+            if subtype == _ST_FP64 and length != 8:
+                raise SofaDecodeError("fp64 fixlen length must be 8")
             # Receiver-configured limits (policy, not malformation): reject an
             # oversize string/blob here — before its payload is read or buffered.
             if subtype == _ST_STRING and self._max_string_len is not None \
