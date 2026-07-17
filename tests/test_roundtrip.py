@@ -62,6 +62,34 @@ def test_string_and_bytes_unicode():
     dec.next(); assert dec.bytes() == bytes(range(256))
 
 
+def test_fixlen_len_peeks_wire_byte_length_without_consuming():
+    # fixlen_len() reports a string/blob field's exact wire byte length (from the
+    # length header) without advancing, so a following string()/bytes() still reads
+    # the same field. It is the value a schema maxlen bounds against — no re-encode
+    # of the decoded str needed to measure it (generator #155).
+    s = "héllo ✓ 日本"  # 17 UTF-8 bytes across 1-, 2- and 3-byte code points
+    blob = bytes(range(200))
+    dec = _roundtrip(lambda e: (e.write_string(0, s), e.write_bytes(1, blob)))
+
+    dec.next()
+    assert dec.fixlen_len() == len(s.encode("utf-8"))  # byte length, not char count
+    assert dec.fixlen_len() == len(s.encode("utf-8"))  # idempotent: a pure peek, no consume
+    assert dec.string() == s                            # field still readable after peeking
+
+    dec.next()
+    assert dec.fixlen_len() == len(blob)                # works for blobs too
+    assert dec.bytes() == blob
+
+
+def test_fixlen_len_on_non_fixlen_field_raises():
+    from sofab import SofaStateError
+
+    dec = _roundtrip(lambda e: e.write_unsigned(0, 42))
+    dec.next()  # a scalar (unsigned) field is not a fixlen value
+    with pytest.raises(SofaStateError):
+        dec.fixlen_len()
+
+
 def test_arrays():
     def build(e):
         e.write_unsigned_array(0, [0, 1, UNSIGNED_MAX])
