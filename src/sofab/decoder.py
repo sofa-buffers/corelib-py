@@ -579,7 +579,7 @@ class Decoder:
         pending = self._pending
         if pending is None or pending[0] != _FIXLEN:
             raise SofaStateError("current field is not a fixlen value")
-        return pending[2]
+        return int(pending[2])
 
     def string(self) -> str:
         """Consume the current fixlen field as a UTF-8 decoded string.
