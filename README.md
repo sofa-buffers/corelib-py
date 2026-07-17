@@ -204,7 +204,10 @@ never provides a value buffer.**
   `read(n)` source and never handed out, so there is **no zero-copy aliasing**:
   `string()` returns a fresh `str`, `bytes()` independent `bytes`, scalars a
   fresh `int`/`float`, and arrays a new `list` — every result stays valid after
-  the decoder advances.
+  the decoder advances. `fixlen_len()` peeks the current string/blob field's
+  exact wire byte length **without** consuming it, so a caller can bound the
+  field against a schema `maxlen` before reading — no re-encoding a decoded
+  `str` just to measure it.
 * **Encode.** Two ownership models. The default `Encoder()` / `Encoder(writer)`
   owns a growable `bytearray` — `getvalue()` hands back a copy, or `flush()`
   drains to the writer. `Encoder.over_buffer` is caller-owned and bounded: you

@@ -562,6 +562,25 @@ class Decoder:
             raise SofaDecodeError("fp64 payload must be 8 bytes")
         return _core.unpack_f64(data)
 
+    def fixlen_len(self) -> int:
+        """Return the current fixlen field's payload byte length without consuming it.
+
+        The length is read straight from the field's length header, so this is a
+        pure peek: it does not advance the decoder and a following
+        :meth:`string`/:meth:`bytes`/:meth:`float32`/:meth:`float64` still reads
+        the same field. It lets a caller bound a string or blob against its schema
+        ``maxlen`` using the exact wire byte length the decoder already parsed —
+        checked before allocation, and without re-encoding a decoded ``str`` just
+        to measure it (the string field is UTF-8 on the wire, so the payload byte
+        length is the length ``maxlen`` bounds).
+
+        Raises :class:`SofaStateError` if the current field is not a fixlen value.
+        """
+        pending = self._pending
+        if pending is None or pending[0] != _FIXLEN:
+            raise SofaStateError("current field is not a fixlen value")
+        return int(pending[2])
+
     def string(self) -> str:
         """Consume the current fixlen field as a UTF-8 decoded string.
 

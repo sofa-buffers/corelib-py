@@ -1029,6 +1029,16 @@ cdef class Decoder:
             raise SofaDecodeError("fp64 payload must be 8 bytes")
         return _unpack_f64(<const unsigned char*>PyBytes_AS_STRING(data))
 
+    def fixlen_len(self):
+        # Peek the current fixlen field's payload byte length (from its length
+        # header) without consuming it — a following string()/bytes()/float* read
+        # still takes the same field. Lets a caller bound a string/blob against its
+        # schema maxlen on the exact wire byte length, before allocation and without
+        # re-encoding a decoded str. Mirrors Decoder.fixlen_len in the pure engine.
+        if self._pk != _PEND_FIXLEN:
+            raise SofaStateError("current field is not a fixlen value")
+        return self._pend_size
+
     def string(self):
         cdef bytes raw = self._take_fixlen(_ST_STRING)
         try:
