@@ -391,6 +391,17 @@ class Decoder:
         subtype = elem_header & 0x07
         if subtype > FixlenSubtype.FP64:
             raise SofaDecodeError(f"invalid fixlen-array subtype {subtype}")
+        # §4.8/§5.2: a fixlen array carries fp32 (element size 4) or fp64
+        # (element size 8) — any other width is malformed. This INVALID verdict
+        # must be reached at header time, before any payload read, so it takes
+        # precedence over the INCOMPLETE a truncated payload would raise (§7).
+        # Mirrors the eager element-width check on the scalar fixlen path above.
+        # subtype is already narrowed to fp32/fp64, so these exact-width checks
+        # bound elem_size completely — no separate FIXLEN_MAX check is needed.
+        if subtype == FixlenSubtype.FP32 and elem_size != 4:
+            raise SofaDecodeError("fp32 fixlen-array element size must be 4")
+        if subtype == FixlenSubtype.FP64 and elem_size != 8:
+            raise SofaDecodeError("fp64 fixlen-array element size must be 8")
         self._cur = Field(
             field_id,
             WireType.ARRAY_FIXLEN,

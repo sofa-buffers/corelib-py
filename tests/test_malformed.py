@@ -125,28 +125,26 @@ def test_array_fixlen_invalid_subtype():
 
 
 def test_array_fixlen_element_width_mismatch_underflow():
-    # Regression (corelib-py#28): fp32 fixlen array whose fixlen_word declares a
-    # 0-byte element width but a non-zero count. The payload is shorter than the
-    # count*4 bytes an fp32 unpack reads; the native engine used to trust the
-    # count and read off the end of the buffer (SIGSEGV). Both engines must
-    # reject it as malformed.
+    # Regression (corelib-py#28 / #41): fp32 fixlen array whose fixlen_word
+    # declares a 0-byte element width. §4.8/§5.2: fp32 elements are exactly 4
+    # bytes, so a 0-width fixlen_word is malformed at header time, before any
+    # payload is read (the native engine used to trust the count and read off
+    # the end of the buffer — SIGSEGV). Both engines must reject it at next().
     # 0x05 = (0<<3)|ARRAY_FIXLEN, 0x01 = count 1, 0x00 = fixlen_word (0<<3)|fp32.
     dec = Decoder(reader([0x05, 0x01, 0x00]))
-    f = dec.next()
-    assert f is not None and f.subtype == FixlenSubtype.FP32
     with pytest.raises(SofaDecodeError):
-        dec.read_float32_array()
+        dec.next()
 
 
 def test_array_fixlen_element_width_mismatch_overflow():
-    # fp32 array claiming an 8-byte element width (fp64's width): enough bytes
-    # are present, but count*8 != count*4, so it is still a malformed fixlen_word.
+    # fp32 array claiming an 8-byte element width (fp64's width): even with the
+    # payload present, count*8 != count*4, so the fixlen_word is malformed and
+    # rejected eagerly at header time.
     # 0x40 = (8<<3)|fp32; eight payload bytes follow the count-1 element.
     data = [0x05, 0x01, 0x40, 0, 0, 0x80, 0x3F, 0, 0, 0, 0]
     dec = Decoder(reader(data))
-    dec.next()
     with pytest.raises(SofaDecodeError):
-        dec.read_float32_array()
+        dec.next()
 
 
 def test_array_fixlen_fp64_width_mismatch():
@@ -154,9 +152,8 @@ def test_array_fixlen_fp64_width_mismatch():
     # 0x05 = ARRAY_FIXLEN, 0x01 = count 1, 0x21 = (4<<3)|fp64; four payload bytes.
     data = [0x05, 0x01, 0x21, 0, 0, 0, 0]
     dec = Decoder(reader(data))
-    dec.next()
     with pytest.raises(SofaDecodeError):
-        dec.read_float64_array()
+        dec.next()
 
 
 def _uvarint(n: int) -> list[int]:
@@ -171,18 +168,19 @@ def _uvarint(n: int) -> list[int]:
             return out
 
 
-def test_array_fixlen_payload_size_overflow_rejected_when_skipped():
-    # A fixlen array whose count * element_width overflows the payload-size
-    # arithmetic is an unsatisfiable read — the payload is (far) shorter than its
-    # declared length, so it is INCOMPLETE (§7), not malformed: it must not wrap
-    # to a small/negative size and drive the cursor off the buffer. Exercises the
-    # skip path (which consumes the payload without reading it).
+def test_array_fixlen_giant_element_width_rejected_at_header():
+    # A fixlen array whose fixlen_word declares a gigantic element width is a
+    # wrong-width fp32 (§4.8: fp32 elements are exactly 4 bytes), so §5.2 makes
+    # it INVALID at header time — the eager width check rejects it before the
+    # count * element_width payload-size arithmetic is ever reached, so it can
+    # never wrap to a small/negative size and drive the cursor off the buffer.
     # count = ARRAY_MAX, element width ~2^61 (fixlen_word low 3 bits 0 => fp32).
     count = 0x7FFFFFFF
     elem_word = 0xFFFFFFFFFFFFFFF8  # (elem_size << 3) | fp32, elem_size ~2^61
     data = [0x05] + _uvarint(count) + _uvarint(elem_word)
-    with pytest.raises(SofaIncompleteError):
+    with pytest.raises(SofaDecodeError) as exc:
         _decode_fully(data)
+    assert not isinstance(exc.value, SofaIncompleteError)
 
 
 # --- scalar fixlen fp width: INVALID takes precedence over INCOMPLETE (§7) ---
@@ -251,6 +249,37 @@ def test_fixlen_fp64_correct_width_truncated_stays_incomplete(decoder_cls):
     # payload bytes present → genuinely INCOMPLETE, must NOT be reclassified.
     with pytest.raises(SofaIncompleteError):
         _decode_one(decoder_cls, [0x02, 0x41, 0, 0, 0])
+
+
+# --- fixlen-array fp width: INVALID takes precedence over INCOMPLETE (§7) -----
+#
+# The array analogue of the scalar checks above (#41 / Crucible F-0014). A
+# fixlen-array fixlen_word whose element width is not the subtype's fixed width
+# (fp32→4, fp64→8) is malformed regardless of what payload follows, so the
+# element width is validated eagerly at header time — the raise comes from
+# next() itself, before any payload read.
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_array_fixlen_fp32_zero_width_truncated_is_invalid_not_incomplete(decoder_cls):
+    # F-0014 reproducer: 0x75 = field id 14, wtype ARRAY_FIXLEN; 0x60 = count 96;
+    # 0x00 = fixlen_word (size 0, fp32) — fp32 must be 4; 0x0d 0x0d = truncated
+    # payload. Wrong width *and* truncated: INVALID must win over INCOMPLETE.
+    dec = decoder_cls(reader([0x75, 0x60, 0x00, 0x0D, 0x0D]))
+    with pytest.raises(SofaDecodeError) as exc:
+        dec.next()
+    assert not isinstance(exc.value, SofaIncompleteError)
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_array_fixlen_correct_width_truncated_stays_incomplete(decoder_cls):
+    # Control: correct fp32 width (0x20 = (4<<3)|fp32) with count 1 but zero
+    # payload bytes → genuinely INCOMPLETE, must NOT be reclassified.
+    dec = decoder_cls(reader([0x05, 0x01, 0x20]))
+    f = dec.next()
+    assert f is not None and f.subtype == FixlenSubtype.FP32
+    with pytest.raises(SofaIncompleteError):
+        dec.read_float32_array()
 
 
 def test_nested_sequence_extra_end():
