@@ -60,3 +60,31 @@ def test_decode_overflow_raises():
     # 10 continuation bytes -> shift reaches 64 with continuation set
     with pytest.raises(SofaDecodeError):
         decode_varint(_reader(bytes([0xFF] * 10 + [0x01])))
+
+
+def test_decode_max_u64_is_accepted():
+    # Control (issue #43): the valid 10-byte maximum whose 10th byte carries
+    # only bit 63 (0x01) still decodes to 2^64-1 — the overlong guard must not
+    # reject it.
+    data = bytes([0xFF] * 9 + [0x01])
+    assert decode_varint(_reader(data)) == (1 << 64) - 1
+
+
+@pytest.mark.parametrize(
+    "tenth",
+    [
+        0x02,  # the 65th bit set
+        0x7F,  # bits 64..69 set
+        0x03,  # bit 63 (valid) plus the 65th bit
+    ],
+)
+def test_decode_overlong_10th_byte_high_bits_rejected(tenth):
+    # Regression (issue #43, Crucible F-0016): a 10-byte varint whose 10th byte
+    # sets any bit above bit 63 is an overlong (>64-bit) varint and must be
+    # rejected as INVALID — never silently narrowed by `& MASK64` on return.
+    data = bytes([0xFF] * 9 + [tenth])
+    with pytest.raises(SofaDecodeError):
+        decode_varint(_reader(data))
+    # And an outright too-long (11th continuation byte) varint is also INVALID.
+    with pytest.raises(SofaDecodeError):
+        decode_varint(_reader(bytes([0xFF] * 10 + [0x7F])))

@@ -574,3 +574,44 @@ def test_sticky_mode_records_first_error_and_noops():
     assert enc.error is not None
     assert isinstance(enc.error, SofaRangeError)
     assert enc.getvalue() == b""
+
+
+# --- overlong (>64-bit) varint: INVALID, not silently truncated (§4.1/§6.3) --
+#
+# Regression for issue #43 / Crucible F-0016: a varint whose payload bits spill
+# past bit 63 (a 10th byte with any bit above bit 63, or an 11th continuation
+# byte) is malformed and must be rejected, not narrowed by `& MASK64`. Two
+# distinct malformed inputs must not collapse to distinct wrong values on the
+# shared wire. Both engines must agree, so parametrize over _DECODERS.
+#
+# Reproducer from the issue: a u64 field (id 6) — header 0x30 = (6 << 3) |
+# UNSIGNED — carrying the overlong varint.
+
+_OVERLONG_U64 = [
+    [0x30, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02],  # 65th bit
+    [0x30, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F],  # bits 64..69
+    [0x30, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01],  # 11-byte
+]
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+@pytest.mark.parametrize("data", _OVERLONG_U64)
+def test_overlong_varint_rejected_as_invalid(decoder_cls, data):
+    dec = decoder_cls(reader(data))
+    f = dec.next()
+    assert f is not None and f.id == 6
+    with pytest.raises(SofaDecodeError) as exc:
+        dec.unsigned()
+    # INVALID, never INCOMPLETE — the bytes are garbage, not "need more".
+    assert not isinstance(exc.value, SofaIncompleteError)
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_max_u64_control_still_decodes(decoder_cls):
+    # Control: the valid 10-byte maximum (10th byte 0x01 = only bit 63) must
+    # still decode to 2^64-1 — the overlong guard must not reject it.
+    data = [0x30, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]
+    dec = decoder_cls(reader(data))
+    f = dec.next()
+    assert f is not None and f.id == 6
+    assert dec.unsigned() == (1 << 64) - 1

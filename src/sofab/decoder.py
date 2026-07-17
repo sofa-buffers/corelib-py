@@ -166,13 +166,21 @@ class Decoder:
                 n = len(buf)
             b = buf[pos]
             pos += 1
+            # Reject an overlong (>64-bit) varint before OR-ing: if this byte's
+            # 7 payload bits would spill past bit 63 they are unrepresentable in
+            # u64 and must be INVALID, not silently masked away on return
+            # (§4.1/§6.3, issue #43). ``room`` is the bits left below 64; only
+            # when fewer than 7 remain can a payload bit overflow.
+            room = 64 - shift
+            if room < 7 and (b & 0x7F) >> room:
+                raise SofaDecodeError("overlong varint")
             result |= (b & 0x7F) << shift
             if b < 0x80:
                 self._pos = pos
                 return result & MASK64
             shift += 7
             if shift >= 64:
-                raise SofaDecodeError("varint overflow")
+                raise SofaDecodeError("overlong varint")
 
     def _read_exact(self, n: int) -> bytes:
         """Return the next ``n`` bytes. Fast path is a single buffer slice; the

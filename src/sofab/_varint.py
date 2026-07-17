@@ -57,9 +57,16 @@ def decode_varint(read_byte: Callable[[], int | None], first: int | None = None)
         first = None
         if byte is None:
             raise SofaIncompleteError("truncated varint")
+        # Reject an overlong (>64-bit) varint before OR-ing: if this byte's 7
+        # payload bits would spill past bit 63 they are unrepresentable in u64
+        # and must be INVALID, not silently masked away on return (§4.1/§6.3,
+        # issue #43). ``room`` is the bits left below 64.
+        room = 64 - shift
+        if room < 7 and (byte & 0x7F) >> room:
+            raise SofaDecodeError("overlong varint")
         value |= (byte & 0x7F) << shift
         shift += 7
         if not (byte & 0x80):
             return value & MASK64
         if shift >= 64:
-            raise SofaDecodeError("varint overflow")
+            raise SofaDecodeError("overlong varint")
