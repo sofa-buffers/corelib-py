@@ -657,6 +657,7 @@ cdef class Decoder:
         cdef unsigned char b
         cdef uint64_t result
         cdef int shift
+        cdef int room
         if pos >= n:
             if not self._need(1):
                 raise SofaIncompleteError("truncated varint")
@@ -680,13 +681,21 @@ cdef class Decoder:
                 n = self._n
             b = p[pos]
             pos += 1
+            # Reject an overlong (>64-bit) varint before OR-ing: if this byte's
+            # 7 payload bits would spill past bit 63 they would be truncated by
+            # the uint64_t and must instead be INVALID (§4.1/§6.3, issue #43).
+            # ``room`` (bits left below 64) is always >= 1 here, so the shift is
+            # well-defined C (a `>> (64 - shift)` with shift 7 is UB for int).
+            room = 64 - shift
+            if room < 7 and (b & 0x7F) >> room:
+                raise SofaDecodeError("overlong varint")
             result |= (<uint64_t>(b & 0x7F)) << shift
             if b < 0x80:
                 self._pos = pos
                 return result
             shift += 7
             if shift >= 64:
-                raise SofaDecodeError("varint overflow")
+                raise SofaDecodeError("overlong varint")
 
     cdef bytes _read_exact(self, Py_ssize_t n):
         cdef Py_ssize_t pos = self._pos
@@ -732,6 +741,7 @@ cdef class Decoder:
         cdef unsigned char b
         cdef uint64_t result
         cdef int shift
+        cdef int room
         while i < count:
             if pos >= n:
                 self._pos = pos
@@ -758,12 +768,17 @@ cdef class Decoder:
                     n = self._n
                 b = p[pos]
                 pos += 1
+                # Reject an overlong (>64-bit) varint before OR-ing (see
+                # ``_varint`` above; §4.1/§6.3, issue #43).
+                room = 64 - shift
+                if room < 7 and (b & 0x7F) >> room:
+                    raise SofaDecodeError("overlong varint")
                 result |= (<uint64_t>(b & 0x7F)) << shift
                 if b < 0x80:
                     break
                 shift += 7
                 if shift >= 64:
-                    raise SofaDecodeError("varint overflow")
+                    raise SofaDecodeError("overlong varint")
             out.append(PyLong_FromUnsignedLongLong(result))
             i += 1
         self._pos = pos
