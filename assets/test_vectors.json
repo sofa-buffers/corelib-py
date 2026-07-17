@@ -9,7 +9,8 @@
     "integers": "decimal JSON number literals (full u64/i64 range)",
     "floats": "finite values as JSON numbers; +/-infinity as the strings 'inf'/'-inf'",
     "blob.value_hex": "lowercase hex of the blob payload",
-    "array.element_type": "input element width/type fed to the encoder (u8..u64, i8..i64, fp32, fp64)"
+    "array.element_type": "input element width/type fed to the encoder (u8..u64, i8..i64, fp32, fp64)",
+    "invalid_utf8": "NEGATIVE vectors: a `string` field (id 0) whose bytes are not valid UTF-8. A strict (SOFAB_STRICT_UTF8) build MUST decode serialized_hex to the INVALID outcome and refuse to encode string_hex with the invalid-argument error. Backward-compatible: consumers that only read 'vectors' ignore this key. See test_vectors_README.md."
   },
   "vectors": [
     {
@@ -1034,6 +1035,129 @@
       ],
       "serialized": { "length": 436, "hex": "00c80109c70110d0860319bfb8022080bcc1960b29ffa7d6b9073080c0caf384a30239ffbfcaf384a302560220c3f548400a41f1d4c853fb210940126a48656c6c6f2c20576f726c64211a23deadbeef07a606030500408001bf01ff010c05ff017f007efe01130500808001808002ffff02ffff031c05ffff03ffff0100feff01feff0323050080808080048080808008ffffffff0bffffffff0f2c05ffffffff0fffffffff0700feffffff07feffffff0f33050080808080808080804080808080808080808001ffffffffffffffffbf01ffffffffffffffffff013c05fdffffffffffffffff01ffffffffffffffff7f00feffffffffffffff7ffeffffffffffffffff01560505200000803f0000004000004040ffff7fffffff7f7f0d0541000000000000f03f00000000000000400000000000000840ffffffffffffefffffffffffffffef7f0707c60c026a48656c6c6f2c20536f666162210a021252313233343536373839301a72c3a4c3b6c3bcc384c396c39cc39f22ba03546869735f69735f615f766572795f6c6f6e675f746573745f737472696e675f776974685f21402324255e262a28295f2b2d3d5b5d7b7d07" },
       "serialized_sparse": { "length": 434, "hex": "00c80109c70110d0860319bfb8022080bcc1960b29ffa7d6b9073080c0caf384a30239ffbfcaf384a302560220c3f548400a41f1d4c853fb210940126a48656c6c6f2c20576f726c64211a23deadbeef07a606030500408001bf01ff010c05ff017f007efe01130500808001808002ffff02ffff031c05ffff03ffff0100feff01feff0323050080808080048080808008ffffffff0bffffffff0f2c05ffffffff0fffffffff0700feffffff07feffffff0f33050080808080808080804080808080808080808001ffffffffffffffffbf01ffffffffffffffffff013c05fdffffffffffffffff01ffffffffffffffff7f00feffffffffffffff7ffeffffffffffffffff01560505200000803f0000004000004040ffff7fffffff7f7f0d0541000000000000f03f00000000000000400000000000000840ffffffffffffefffffffffffffffef7f0707c60c026a48656c6c6f2c20536f666162211252313233343536373839301a72c3a4c3b6c3bcc384c396c39cc39f22ba03546869735f69735f615f766572795f6c6f6e675f746573745f737472696e675f776974685f21402324255e262a28295f2b2d3d5b5d7b7d07" }
+    }
+  ],
+  "invalid_utf8": [
+    {
+      "name": "utf8_overlong_c0_80",
+      "group": "invalid/utf8",
+      "description": "Overlong 2-byte NUL (C0 80, Java \"Modified UTF-8\"): U+0000 must be a single 00 byte.",
+      "requires": ["fixlen"],
+      "id": 0,
+      "string_hex": "c080",
+      "serialized_hex": "0212c080",
+      "decode_outcome": "invalid",
+      "encode_outcome": "invalid_argument"
+    },
+    {
+      "name": "utf8_overlong_c1",
+      "group": "invalid/utf8",
+      "description": "Overlong 2-byte sequence C1 BF (would decode to U+007F, which is 1-byte ASCII).",
+      "requires": ["fixlen"],
+      "id": 0,
+      "string_hex": "c1bf",
+      "serialized_hex": "0212c1bf",
+      "decode_outcome": "invalid",
+      "encode_outcome": "invalid_argument"
+    },
+    {
+      "name": "utf8_overlong_3byte",
+      "group": "invalid/utf8",
+      "description": "Overlong 3-byte sequence E0 80 80 (would decode to U+0000).",
+      "requires": ["fixlen"],
+      "id": 0,
+      "string_hex": "e08080",
+      "serialized_hex": "021ae08080",
+      "decode_outcome": "invalid",
+      "encode_outcome": "invalid_argument"
+    },
+    {
+      "name": "utf8_overlong_4byte",
+      "group": "invalid/utf8",
+      "description": "Overlong 4-byte sequence F0 80 80 80 (would decode to U+0000).",
+      "requires": ["fixlen"],
+      "id": 0,
+      "string_hex": "f0808080",
+      "serialized_hex": "0222f0808080",
+      "decode_outcome": "invalid",
+      "encode_outcome": "invalid_argument"
+    },
+    {
+      "name": "utf8_surrogate_d800",
+      "group": "invalid/utf8",
+      "description": "Lone UTF-16 surrogate code point U+D800 (ED A0 80): never valid in UTF-8.",
+      "requires": ["fixlen"],
+      "id": 0,
+      "string_hex": "eda080",
+      "serialized_hex": "021aeda080",
+      "decode_outcome": "invalid",
+      "encode_outcome": "invalid_argument"
+    },
+    {
+      "name": "utf8_surrogate_dfff",
+      "group": "invalid/utf8",
+      "description": "Lone UTF-16 surrogate code point U+DFFF (ED BF BF): never valid in UTF-8.",
+      "requires": ["fixlen"],
+      "id": 0,
+      "string_hex": "edbfbf",
+      "serialized_hex": "021aedbfbf",
+      "decode_outcome": "invalid",
+      "encode_outcome": "invalid_argument"
+    },
+    {
+      "name": "utf8_out_of_range",
+      "group": "invalid/utf8",
+      "description": "Code point above U+10FFFF (F4 90 80 80 = U+110000): out of the Unicode range.",
+      "requires": ["fixlen"],
+      "id": 0,
+      "string_hex": "f4908080",
+      "serialized_hex": "0222f4908080",
+      "decode_outcome": "invalid",
+      "encode_outcome": "invalid_argument"
+    },
+    {
+      "name": "utf8_bare_continuation",
+      "group": "invalid/utf8",
+      "description": "Bare continuation byte 0x80 with no lead byte.",
+      "requires": ["fixlen"],
+      "id": 0,
+      "string_hex": "80",
+      "serialized_hex": "020a80",
+      "decode_outcome": "invalid",
+      "encode_outcome": "invalid_argument"
+    },
+    {
+      "name": "utf8_lone_ff",
+      "group": "invalid/utf8",
+      "description": "0xFF: never a valid UTF-8 byte in any position.",
+      "requires": ["fixlen"],
+      "id": 0,
+      "string_hex": "ff",
+      "serialized_hex": "020aff",
+      "decode_outcome": "invalid",
+      "encode_outcome": "invalid_argument"
+    },
+    {
+      "name": "utf8_truncated_2byte",
+      "group": "invalid/utf8",
+      "description": "2-byte lead C2 with no continuation byte (truncated at end-of-payload -> INVALID).",
+      "requires": ["fixlen"],
+      "id": 0,
+      "string_hex": "c2",
+      "serialized_hex": "020ac2",
+      "decode_outcome": "invalid",
+      "encode_outcome": "invalid_argument"
+    },
+    {
+      "name": "utf8_truncated_3byte",
+      "group": "invalid/utf8",
+      "description": "3-byte lead E2 82 missing its final continuation byte (truncated at end-of-payload).",
+      "requires": ["fixlen"],
+      "id": 0,
+      "string_hex": "e282",
+      "serialized_hex": "0212e282",
+      "decode_outcome": "invalid",
+      "encode_outcome": "invalid_argument"
     }
   ]
 }

@@ -378,7 +378,19 @@ cdef class Encoder:
         self._write_fixlen_raw(field_id, buf, 8, _ST_FP64)
 
     def write_string(self, object field_id, str text):
-        cdef bytes data = text.encode("utf-8")
+        # Strict UTF-8: no errors= argument, so a lone/unpaired surrogate raises
+        # UnicodeEncodeError, which we map to SofaRangeError — the encode-side
+        # InvalidArgument outcome (CORELIB_PLAN §6.4 / MESSAGE_SPEC §8). Python
+        # str is a Unicode type, hence always strict; SOFAB_STRICT_UTF8 is a
+        # no-op and omitted. Mirrors the pure-Python Encoder.write_string.
+        if not self._begin():
+            return
+        cdef bytes data
+        try:
+            data = text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            self._fail(SofaRangeError("string field is not valid UTF-8: %s" % exc))
+            return
         self._write_fixlen_bytes(field_id, data, _ST_STRING)
 
     def write_bytes(self, object field_id, object data):
