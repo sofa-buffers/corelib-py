@@ -243,8 +243,26 @@ class Encoder:
         self._write_fixlen(field_id, _core.pack_f64(value), FixlenSubtype.FP64)
 
     def write_string(self, field_id: int, text: str) -> None:
-        """Write a UTF-8 string as a fixlen field (STRING subtype)."""
-        self._write_fixlen(field_id, text.encode("utf-8"), FixlenSubtype.STRING)
+        r"""Write a UTF-8 string as a fixlen field (STRING subtype).
+
+        Encoding is strict UTF-8 (``str.encode("utf-8")`` with no ``errors=``).
+        Python ``str`` is a Unicode string type, so per CORELIB_PLAN §6.4 it is
+        **always strict**: ``SOFAB_STRICT_UTF8`` is a no-op for it and is
+        omitted entirely (documented as always-ON). A ``str`` that cannot be
+        encoded as valid UTF-8 — a lone/unpaired surrogate such as ``'\ud800'``
+        — is refused with :class:`SofaRangeError` (the encode-side
+        ``InvalidArgument`` outcome, MESSAGE_SPEC §8 producer-side MUST NOT),
+        never silently replaced. Embedded ``U+0000`` is valid UTF-8 and
+        round-trips unchanged.
+        """
+        if not self._begin():
+            return
+        try:
+            data = text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            self._fail(SofaRangeError(f"string field is not valid UTF-8: {exc}"))
+            return
+        self._write_fixlen(field_id, data, FixlenSubtype.STRING)
 
     def write_bytes(self, field_id: int, data: bytes | bytearray | memoryview) -> None:
         """Write a raw byte blob as a fixlen field (BLOB subtype)."""

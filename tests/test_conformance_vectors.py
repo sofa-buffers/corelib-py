@@ -28,12 +28,22 @@ from pathlib import Path
 import pytest
 from vectors import ChunkReader
 
-from sofab import Decoder, Encoder, FixlenSubtype, WireType
+from sofab import Decoder, Encoder, FixlenSubtype, SofaDecodeError, SofaRangeError, WireType
 
 VECTORS_PATH = Path(__file__).resolve().parents[1] / "assets" / "test_vectors.json"
 _DATA = json.loads(VECTORS_PATH.read_text())
 VECTORS = _DATA["vectors"]
 _IDS = [v["name"] for v in VECTORS]
+
+# Shared negative UTF-8 vectors (issue #85 / MESSAGE_SPEC §8, CORELIB_PLAN §6.4).
+# The `invalid_utf8` array is copied verbatim from corelib-c-cpp (the ground
+# truth) and tracks corelib-c-cpp#97. Each entry carries `string_hex` (the raw
+# invalid payload, for the encode-reject direction) and `serialized_hex` (a whole
+# wire message whose string field must decode → INVALID). Python `str` is a
+# Unicode string type, so per §6.4 it is ALWAYS strict — SOFAB_STRICT_UTF8 is a
+# no-op and omitted; there is no OFF mode to gate on here.
+INVALID_UTF8 = _DATA.get("invalid_utf8", [])
+_UTF8_IDS = [e["name"] for e in INVALID_UTF8]
 
 _UNSIGNED_ELEMS = {"u8", "u16", "u32", "u64"}
 _SIGNED_ELEMS = {"i8", "i16", "i32", "i64"}
@@ -323,3 +333,73 @@ def test_vector_chunked_skip_ids(vec):
     data = bytes.fromhex(vec["serialized"]["hex"])
     skip = vec["skip_ids"]
     assert _decode_stream(data, chunk=1, skip_ids=skip) == _expected_stream(vec["fields"], skip)
+
+
+# --- strict UTF-8 negative vectors (issue #85) -------------------------------
+#
+# Every `invalid_utf8` entry declares two symmetric strict outcomes (§6.4):
+#   * decode: its `serialized_hex` — a whole wire message carrying the bad
+#     string field — must decode to INVALID (SofaDecodeError) once the string is
+#     actually read. INVALID, not a length/limit error and not INCOMPLETE, even
+#     for the payload-internal truncation cases (the wire frame is complete; the
+#     UTF-8 sequence inside it is not).
+#   * encode: writing the entry's raw `string_hex` bytes as a string field must
+#     be refused with InvalidArgument (SofaRangeError). Python `str` cannot hold
+#     non-UTF-8 bytes, so we reconstruct the offending value with
+#     `surrogateescape` (each bad byte → a lone surrogate); the strict encoder
+#     (`str.encode("utf-8")`, no errors=) then rejects it — exactly the value a
+#     byte-container port would hand to encode, mapped into Python's model.
+
+
+def test_invalid_utf8_suite_present():
+    # The copied vectors carry the negative UTF-8 group (tracks corelib-c-cpp#97).
+    assert len(INVALID_UTF8) >= 11
+    for e in INVALID_UTF8:
+        assert e["decode_outcome"] == "invalid"
+        assert e["encode_outcome"] == "invalid_argument"
+        assert e["group"] == "invalid/utf8"
+
+
+def _decode_reading_strings(data: bytes, *, chunk: int | None = None):
+    """Decode `data`, materializing every STRING field (so UTF-8 validation runs)
+    and skipping everything else. Raises SofaDecodeError on an invalid string."""
+    src = ChunkReader(data, chunk) if chunk is not None else io.BytesIO(data)
+    dec = Decoder(src)
+    while (fld := dec.next()) is not None:
+        if fld.type == WireType.FIXLEN and fld.subtype == FixlenSubtype.STRING:
+            dec.string()
+        else:
+            dec.skip()
+
+
+@pytest.mark.parametrize("vec", INVALID_UTF8, ids=_UTF8_IDS)
+def test_invalid_utf8_decode_is_invalid(vec):
+    data = bytes.fromhex(vec["serialized_hex"])
+    with pytest.raises(SofaDecodeError):
+        _decode_reading_strings(data)
+
+
+@pytest.mark.parametrize("vec", INVALID_UTF8, ids=_UTF8_IDS)
+def test_invalid_utf8_decode_is_invalid_chunked(vec):
+    # INVALID must win over INCOMPLETE even fed one byte at a time.
+    data = bytes.fromhex(vec["serialized_hex"])
+    with pytest.raises(SofaDecodeError):
+        _decode_reading_strings(data, chunk=1)
+
+
+@pytest.mark.parametrize("vec", INVALID_UTF8, ids=_UTF8_IDS)
+def test_invalid_utf8_encode_is_invalid_argument(vec):
+    bad = bytes.fromhex(vec["string_hex"]).decode("utf-8", "surrogateescape")
+    enc = Encoder()
+    with pytest.raises(SofaRangeError):
+        enc.write_string(0, bad)
+
+
+@pytest.mark.parametrize("vec", INVALID_UTF8, ids=_UTF8_IDS)
+def test_invalid_utf8_skipped_field_not_validated(vec):
+    # Skipped fields are never UTF-8-validated (§6.4): the same message decodes
+    # cleanly when its string field is skip()-ped rather than read.
+    data = bytes.fromhex(vec["serialized_hex"])
+    dec = Decoder(io.BytesIO(data))
+    while dec.next() is not None:
+        dec.skip()  # never raises: no string is materialized
