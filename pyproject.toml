@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sofa-buffers-corelib"
-version = "0.1.0"
+version = "0.8.0"
 description = "SofaBuffers binary wire-format runtime — pure Python with an optional native (Cython) accelerator"
 readme = "README.md"
 requires-python = ">=3.9"
