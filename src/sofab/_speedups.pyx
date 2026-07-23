@@ -552,9 +552,26 @@ cdef class Encoder:
 # --- float pack/unpack (always little-endian, endian-independent) ------------
 
 cdef inline void _pack_f32(double value, unsigned char* out) noexcept nogil:
-    cdef float f = <float>value
+    cdef float f
     cdef uint32_t bits
-    memcpy(&bits, &f, 4)
+    cdef uint64_t dbits
+    # A hardware fp64->fp32 narrowing quiets a signaling NaN (sets the mantissa
+    # is-quiet bit), which §4.6 forbids: every float payload, NaN included, must
+    # round-trip bit-for-bit. For a NaN, narrow the raw bits by hand so the sign,
+    # payload, and signaling bit survive; non-NaN values narrow exactly via cast.
+    if value != value:  # NaN — only a NaN is unequal to itself
+        memcpy(&dbits, &value, 8)
+        # Top 23 mantissa bits of the fp64 (>> 29) become the fp32 mantissa,
+        # keeping sign (bit 63->31) and the is-quiet bit (bit 51->22).
+        bits = (<uint32_t>(dbits >> 63) << 31) | <uint32_t>0x7F800000 | \
+               <uint32_t>((dbits >> 29) & <uint64_t>0x007FFFFF)
+        if (bits & <uint32_t>0x007FFFFF) == 0:
+            # Payload lived only in the dropped low bits; keep it a (quiet) NaN
+            # rather than letting it collapse to inf.
+            bits |= <uint32_t>0x00400000
+    else:
+        f = <float>value
+        memcpy(&bits, &f, 4)
     out[0] = <unsigned char>(bits & 0xFF)
     out[1] = <unsigned char>((bits >> 8) & 0xFF)
     out[2] = <unsigned char>((bits >> 16) & 0xFF)
@@ -571,6 +588,19 @@ cdef inline double _unpack_f32(const unsigned char* p) noexcept nogil:
     cdef uint32_t bits = (<uint32_t>p[0]) | (<uint32_t>p[1] << 8) | \
                          (<uint32_t>p[2] << 16) | (<uint32_t>p[3] << 24)
     cdef float f
+    cdef uint64_t dbits
+    cdef double d
+    # A hardware fp32->fp64 widening quiets a signaling NaN; §4.6 forbids any
+    # normalization. For a NaN, widen the raw bits by hand: the 23-bit fp32
+    # mantissa (top bit = is-quiet) maps to the top 23 bits of the fp64 mantissa
+    # (<< 29), so the signaling bit and payload survive the trip through a
+    # Python float. Non-NaN values widen exactly via the cast below.
+    if (bits & <uint32_t>0x7F800000) == <uint32_t>0x7F800000 and \
+       (bits & <uint32_t>0x007FFFFF):
+        dbits = (<uint64_t>(bits >> 31) << 63) | (<uint64_t>0x7FF << 52) | \
+                (<uint64_t>(bits & <uint32_t>0x007FFFFF) << 29)
+        memcpy(&d, &dbits, 8)
+        return d
     memcpy(&f, &bits, 4)
     return <double>f
 
