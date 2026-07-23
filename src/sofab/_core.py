@@ -38,7 +38,7 @@ def _unpack_f32_bits(bits: int) -> float:
         # (top bit = is-quiet) maps to the top 23 bits of the 52-bit fp64
         # mantissa (<< 29), so the signaling bit and payload survive.
         dbits = ((bits >> 31) << 63) | (0x7FF << 52) | ((bits & _F32_MANT) << 29)
-        return _F64.unpack(_U64.pack(dbits))[0]
+        return float(_F64.unpack(_U64.pack(dbits))[0])
     return float(_F32.unpack(_U32.pack(bits))[0])
 
 
@@ -49,7 +49,7 @@ def _pack_f32_bits(value: float) -> int:
     other value goes through ``struct``.
     """
     if value != value:  # NaN — only a NaN is unequal to itself
-        dbits = _U64.unpack(_F64.pack(value))[0]
+        dbits = int(_U64.unpack(_F64.pack(value))[0])
         # Recover the top 23 mantissa bits (>> 29), keeping sign + signaling bit.
         bits = ((dbits >> 63) << 31) | _F32_EXP | ((dbits >> 29) & _F32_MANT)
         if (bits & _F32_MANT) == 0:
@@ -57,7 +57,7 @@ def _pack_f32_bits(value: float) -> int:
             # collapse to inf; force it back to a (quiet) NaN instead.
             bits |= 0x00400000
         return bits
-    return _U32.unpack(_F32.pack(value))[0]
+    return int(_U32.unpack(_F32.pack(value))[0])
 
 
 def pack_f32(value: float) -> bytes:
