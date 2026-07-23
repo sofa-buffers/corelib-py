@@ -15,13 +15,10 @@ engine (native/pure) is active.
 
 from __future__ import annotations
 
-import struct
-
 import pytest
 from vectors import reader
 
 from sofab import Decoder, Encoder, FixlenSubtype, WireType
-
 
 # We must feed the corelib the *literal* payload bytes: struct.unpack("<f", ...)
 # would itself quiet a signaling NaN before the library ever sees it (that
