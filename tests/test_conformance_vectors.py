@@ -106,9 +106,15 @@ def _replay(enc: Encoder, fields) -> None:
             else:
                 raise AssertionError(f"unknown element_type {et!r}")
         elif op == "sequence_begin":
-            enc.write_sequence_begin(f["id"])
+            enc.write_sequence_begin_lazy(f["id"])
         elif op == "sequence_end":
-            enc.write_sequence_end()
+            # The op list is replayed against the RAW encoder and compared to the
+            # DENSE `serialized` hex, which always carries the frame — including
+            # the three empty-sequence vectors. So the close has to be the
+            # frame-keeping one; `write_sequence_end` would drop those frames and
+            # encode them to nothing. Sparse omission (MESSAGE_SPEC §2) is a
+            # message-layer decision, not one this replay makes.
+            enc.write_sequence_end_keep()
         else:
             raise AssertionError(f"unknown op {op!r}")
 

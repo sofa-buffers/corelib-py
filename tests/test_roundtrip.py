@@ -130,7 +130,7 @@ def test_max_depth_nesting_roundtrips():
 
     def build(e):
         for _ in range(MAX_DEPTH):
-            e.write_sequence_begin(0)
+            e.write_sequence_begin_lazy(0)
         e.write_unsigned(1, 42)
         for _ in range(MAX_DEPTH):
             e.write_sequence_end()
@@ -147,9 +147,9 @@ def test_max_depth_nesting_roundtrips():
 def test_nested_sequences_skip_whole():
     def build(e):
         e.write_unsigned(0, 7)
-        e.write_sequence_begin(1)
+        e.write_sequence_begin_lazy(1)
         e.write_unsigned(0, 1)
-        e.write_sequence_begin(2)
+        e.write_sequence_begin_lazy(2)
         e.write_signed(0, -9)
         e.write_sequence_end()
         e.write_sequence_end()

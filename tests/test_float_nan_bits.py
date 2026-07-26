@@ -119,7 +119,14 @@ def test_f_0031_reproduce_wire_roundtrips():
 
 
 def _reencode_message(wire: bytes) -> bytes:
-    """Structural decode -> re-encode of a whole message (mirrors the harness)."""
+    """Structural decode -> re-encode of a whole message (mirrors the harness).
+
+    A transcoder must reproduce the input byte-for-byte, and the input carries an
+    empty frame (``a606 56 07 07``), so every sequence it copies closes with
+    ``write_sequence_end_keep``: it must preserve a frame it was handed, never
+    decide it away. Dropping it is the message layer's call (MESSAGE_SPEC §2),
+    made from the values, not from the bytes.
+    """
     dec = Decoder(reader(wire))
     enc = Encoder()
 
@@ -130,10 +137,10 @@ def _reencode_message(wire: bytes) -> bytes:
                 return
             t = f.type
             if t == WireType.SEQUENCE_START:
-                enc.write_sequence_begin(f.id)
+                enc.write_sequence_begin_lazy(f.id)
                 copy()
             elif t == WireType.SEQUENCE_END:
-                enc.write_sequence_end()
+                enc.write_sequence_end_keep()
                 return
             elif t == WireType.UNSIGNED:
                 enc.write_unsigned(f.id, dec.unsigned())

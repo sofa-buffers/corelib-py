@@ -8,6 +8,16 @@ Two construction models, mirroring the ecosystem:
 * ``Encoder.over_buffer(buf, offset, flush)`` — Rust/C/Java-style. Writes into
   a fixed caller buffer, reserving ``offset`` bytes at the front for a
   lower-layer header, draining via the ``flush`` sink when full.
+
+Sequences are framed **lazily**: :meth:`Encoder.write_sequence_begin_lazy` holds
+the header back until the sequence receives content, so a sequence-typed field
+whose value equals its declared default is omitted rather than emitted as an
+empty ``begin``/``end`` frame (MESSAGE_SPEC §2). The closer picks the outcome —
+:meth:`Encoder.write_sequence_end` drops a contentless sequence,
+:meth:`Encoder.write_sequence_end_keep` forces the frame out (wrapper-array
+elements, explicit empty arrays). Held-back ids are encoder state, never buffer
+content, so a flush can never split a pending run and a tiny output buffer
+produces exactly the one-shot bytes.
 """
 
 from __future__ import annotations
@@ -57,6 +67,11 @@ class Encoder:
         self._sticky = sticky
         self._error: SofaError | None = None
         self._depth = 0
+        # Ids of the innermost open sequences whose header has not been written
+        # yet (MESSAGE_SPEC §2 lazy framing). Always a contiguous suffix of the
+        # open sequences: writing any field commits the whole run at once, so
+        # :meth:`write_sequence_end` can simply pop the last entry.
+        self._pending: list[int] = []
 
     @classmethod
     def over_buffer(
@@ -88,6 +103,7 @@ class Encoder:
         self._sticky = sticky
         self._error = None
         self._depth = 0
+        self._pending = []
         self.buffer_set(buffer, offset)
         return self
 
@@ -181,9 +197,34 @@ class Encoder:
             self._put(encode_varint(value))
 
     def _header(self, field_id: int, wtype: WireType) -> None:
+        """Write a field header — the single choke point every field write passes
+        through, and therefore where a held-back sequence run is committed.
+
+        The field about to be written is *content*, which proves every enclosing
+        sequence differs from its declared default and must be framed after all.
+        Only genuine field writes reach here: a sequence is opened by
+        :meth:`write_sequence_begin_lazy` (which never writes) and closed by
+        :meth:`write_sequence_end` / :meth:`write_sequence_end_keep` (which emit
+        the bare ``0x07`` end marker themselves), so no gate on ``wtype`` is
+        needed and no writer can bypass the commit.
+        """
         if field_id < 0 or field_id > ID_MAX:
             raise SofaRangeError(f"id {field_id} out of range 0..{ID_MAX}")
+        if self._pending:
+            self._commit_pending()
         self._emit_varint((field_id << 3) | wtype)
+
+    def _commit_pending(self) -> None:
+        """Emit the held-back sequence headers, outermost first.
+
+        Cold: it runs at most once per non-default sequence, never per field.
+        The run is detached before the first byte goes out, so a flush sink that
+        re-enters the encoder cannot see a half-committed run.
+        """
+        run = self._pending
+        self._pending = []
+        for field_id in run:
+            self._emit_varint((field_id << 3) | WireType.SEQUENCE_START)
 
     def _begin(self) -> bool:
         """Sticky-mode gate. Returns ``False`` if the op should be skipped."""
@@ -372,25 +413,51 @@ class Encoder:
 
     # --- sequences ----------------------------------------------------------
 
-    def write_sequence_begin(self, field_id: int) -> None:
-        """Open a nested sequence (sub-message) under ``field_id``.
+    def write_sequence_begin_lazy(self, field_id: int) -> None:
+        """Open a nested sequence (sub-message) under ``field_id``, **holding its
+        header back** until the sequence turns out to have content.
 
-        Must be balanced by a later :meth:`write_sequence_end`. Refuses to open
-        a sequence nested deeper than :data:`sofab.MAX_DEPTH` (255), raising
-        :class:`SofaRangeError`.
+        MESSAGE_SPEC §2 omits a sequence-typed *field* whose value equals its
+        declared default, and "not one child was written" is exactly that
+        condition — evaluated per child field, recursively, for free, because the
+        message layer already omits every child equal to its own default. A
+        sequence closed with nothing in it therefore emits **nothing** instead of
+        a two-byte empty frame, and an all-default message becomes the empty byte
+        string. The predicate is never a byte image of the object, so in-memory
+        padding cannot influence it.
+
+        This is the only way to open a sequence. How it closes decides whether a
+        contentless one survives: :meth:`write_sequence_end` drops it,
+        :meth:`write_sequence_end_keep` forces the frame out.
+
+        Must be balanced by a later :meth:`write_sequence_end` /
+        :meth:`write_sequence_end_keep`. Refuses to open a sequence nested deeper
+        than :data:`sofab.MAX_DEPTH` (255), raising :class:`SofaRangeError`.
         """
         if not self._begin():
             return
         try:
             if self._depth >= MAX_DEPTH:
                 raise SofaRangeError(f"nesting exceeds MAX_DEPTH={MAX_DEPTH}")
-            self._header(field_id, WireType.SEQUENCE_START)
+            if field_id < 0 or field_id > ID_MAX:
+                raise SofaRangeError(f"id {field_id} out of range 0..{ID_MAX}")
+            # No hold-back window to exhaust: the pending run is a Python list
+            # bounded only by MAX_DEPTH, so there is no eager-framing fallback
+            # and the "pending is a contiguous suffix of the open sequences"
+            # invariant holds unconditionally.
+            self._pending.append(field_id)
             self._depth += 1
         except SofaError as exc:
             self._fail(exc)
 
     def write_sequence_end(self) -> None:
-        """Close the innermost open sequence.
+        """Close the innermost open sequence, letting it **vanish** if it received
+        no content.
+
+        Use it wherever absence encodes the same value as an empty frame: a
+        ``struct``/``union`` field, and an array field whose declared ``default``
+        is the empty collection (MESSAGE_SPEC §2). Where the frame must be
+        visible, close with :meth:`write_sequence_end_keep` instead.
 
         Raises :class:`SofaStateError` if no sequence is currently open.
         """
@@ -399,6 +466,50 @@ class Encoder:
         try:
             if self._depth <= 0:
                 raise SofaStateError("sequence_end without matching begin")
+            if self._pending:
+                # The innermost open sequence is the last held-back one (the
+                # pending run is a suffix), so dropping it is a plain pop: no
+                # header and no end marker ever reach the wire.
+                self._pending.pop()
+                self._depth -= 1
+                return
+            self._emit_varint(WireType.SEQUENCE_END)
+            self._depth -= 1
+        except SofaError as exc:
+            self._fail(exc)
+
+    def write_sequence_end_keep(self) -> None:
+        """Close the innermost open sequence, **keeping** its frame even when it
+        received no content.
+
+        Behaves like a write: it first emits any held-back headers — this frame's
+        and every enclosing one's — and then the end marker, so an empty sequence
+        reaches the wire as ``begin`` + ``end``.
+
+        Required wherever the frame carries information beyond its contents:
+
+        * a **wrapper-array element** (``struct``/``union``/nested row): element
+          presence is what carries a dynamic array's length — *highest present id
+          + 1* (MESSAGE_SPEC §5.1) — so dropping an all-default element would
+          change the decoded length, not just the bytes;
+        * an array field already known to **differ from a non-empty declared
+          default**: absence would reconstruct that default, so the empty frame is
+          the only encoding of "explicitly empty" (§2, §3).
+
+        The two failure directions are not symmetric, which is why this is the
+        safe choice when in doubt: using it where :meth:`write_sequence_end` would
+        do costs one non-canonical empty frame that every decoder normalizes away,
+        while the reverse silently changes an array's length.
+
+        Raises :class:`SofaStateError` if no sequence is currently open.
+        """
+        if not self._begin():
+            return
+        try:
+            if self._depth <= 0:
+                raise SofaStateError("sequence_end without matching begin")
+            if self._pending:
+                self._commit_pending()
             self._emit_varint(WireType.SEQUENCE_END)
             self._depth -= 1
         except SofaError as exc:

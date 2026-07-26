@@ -89,14 +89,19 @@ def test_sequence_end_without_begin_raises():
         Encoder().write_sequence_end()
 
 
+def test_sequence_end_keep_without_begin_raises():
+    with pytest.raises(SofaStateError):
+        Encoder().write_sequence_end_keep()
+
+
 def test_sequence_nesting_exceeds_max_depth_raises():
     enc = Encoder()
     from sofab.types import MAX_DEPTH
 
     for i in range(MAX_DEPTH):
-        enc.write_sequence_begin(i)
+        enc.write_sequence_begin_lazy(i)
     with pytest.raises(SofaRangeError):
-        enc.write_sequence_begin(0)
+        enc.write_sequence_begin_lazy(0)
 
 
 # ============================ Encoder — sticky mode ==========================
@@ -124,8 +129,10 @@ def test_sticky_latches_first_error_and_turns_writes_into_noops():
     enc.write_signed_array(9, [-1, -2])
     enc.write_float32_array(10, [1.0])
     enc.write_float64_array(11, [1.0])
-    enc.write_sequence_begin(12)
+    enc.write_sequence_begin_lazy(12)
     enc.write_sequence_end()
+    enc.write_sequence_begin_lazy(13)
+    enc.write_sequence_end_keep()
 
     assert enc.error is first  # first error preserved, not overwritten
     assert enc.getvalue() == b""  # nothing was emitted after the latch
@@ -140,6 +147,8 @@ def test_sticky_records_but_does_not_raise_for_each_writer():
         lambda e: e.write_unsigned_array(0, [UNSIGNED_MAX + 1]),
         lambda e: e.write_signed_array(0, [1 << 70]),
         lambda e: e.write_sequence_end(),
+        lambda e: e.write_sequence_end_keep(),
+        lambda e: e.write_sequence_begin_lazy(ID_MAX + 1),
         lambda e: e.write_unsigned(ID_MAX + 1, 0),
     ]
     for trigger in cases:

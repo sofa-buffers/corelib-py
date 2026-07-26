@@ -5,7 +5,7 @@
   "notes": {
     "byte_order": "little-endian",
     "serialized.hex": "lowercase hex of the full (dense) message; primitive-layer ground truth and the decoder's skip input",
-    "serialized_sparse.hex": "lowercase hex of the sparse-canonical message (MESSAGE_SPEC S2): every leaf field equal to its type default is omitted, sequences stay framed; byte-exact target for a sparse encoder",
+    "serialized_sparse.hex": "lowercase hex of the sparse-canonical message (MESSAGE_SPEC S2): every leaf field equal to its type default is omitted, and a sequence left without content is omitted too (not framed empty); byte-exact target for a sparse encoder",
     "integers": "decimal JSON number literals (full u64/i64 range)",
     "floats": "finite values as JSON numbers; +/-infinity as the strings 'inf'/'-inf'",
     "blob.value_hex": "lowercase hex of the blob payload",
@@ -775,7 +775,7 @@
         { "op": "sequence_end" }
       ],
       "serialized": { "length": 2, "hex": "0e07" },
-      "serialized_sparse": { "length": 2, "hex": "0e07" }
+      "serialized_sparse": { "length": 0, "hex": "" }
     },
     {
       "name": "nested_empty_sequences",
@@ -790,7 +790,7 @@
         { "op": "sequence_end" }
       ],
       "serialized": { "length": 4, "hex": "0e160707" },
-      "serialized_sparse": { "length": 4, "hex": "0e160707" }
+      "serialized_sparse": { "length": 0, "hex": "" }
     },
     {
       "name": "empty_sequence_between_fields",
@@ -806,7 +806,7 @@
         { "op": "signed", "id": 2, "value": -7 }
       ],
       "serialized": { "length": 6, "hex": "00070e07110d" },
-      "serialized_sparse": { "length": 6, "hex": "00070e07110d" }
+      "serialized_sparse": { "length": 4, "hex": "0007110d" }
     },
     {
       "name": "nested_sequence",
@@ -971,7 +971,7 @@
         { "op": "sequence_end" }
       ],
       "serialized": { "length": 6, "hex": "0602020a0207" },
-      "serialized_sparse": { "length": 2, "hex": "0607" }
+      "serialized_sparse": { "length": 0, "hex": "" }
     },
     {
       "name": "array_string_leading_default",
