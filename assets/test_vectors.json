@@ -974,6 +974,63 @@
       "serialized_sparse": { "length": 0, "hex": "" }
     },
     {
+      "name": "array_struct_interior_default_element",
+      "group": "array/struct",
+      "description": "Array of struct where the middle element holds only a default-valued leaf: sparse drops the leaf but KEEPS the element frame, so the array still decodes at length 3.",
+      "offset": 0,
+      "requires": ["sequence"],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "unsigned", "id": 0, "value": 1 },
+        { "op": "sequence_end", "element": true },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 0 },
+        { "op": "sequence_end", "element": true },
+        { "op": "sequence_begin", "id": 2 },
+        { "op": "unsigned", "id": 0, "value": 3 },
+        { "op": "sequence_end", "element": true },
+        { "op": "sequence_end" }
+      ],
+      "serialized": { "length": 14, "hex": "06060001070e0000071600030707" },
+      "serialized_sparse": { "length": 12, "hex": "06060001070e071600030707" }
+    },
+    {
+      "name": "array_struct_all_default_elements",
+      "group": "array/struct",
+      "description": "Array of two all-default structs: both element frames survive, so [{},{}] stays distinguishable from [].",
+      "offset": 0,
+      "requires": ["sequence"],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "sequence_end", "element": true },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "sequence_end", "element": true },
+        { "op": "sequence_end" }
+      ],
+      "serialized": { "length": 6, "hex": "0606070e0707" },
+      "serialized_sparse": { "length": 6, "hex": "0606070e0707" }
+    },
+    {
+      "name": "array_of_string_arrays",
+      "group": "array/nested",
+      "description": "Array of string arrays: the second row is empty and keeps its frame, so the outer array decodes at length 2.",
+      "offset": 0,
+      "requires": ["fixlen", "sequence"],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "string", "id": 0, "value": "a" },
+        { "op": "sequence_end", "element": true },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "sequence_end", "element": true },
+        { "op": "sequence_end" }
+      ],
+      "serialized": { "length": 9, "hex": "0606020a61070e0707" },
+      "serialized_sparse": { "length": 9, "hex": "0606020a61070e0707" }
+    },
+    {
       "name": "array_string_leading_default",
       "group": "array/string",
       "description": "Array of string with leading and trailing default elements: the leading one leaves an id gap, the trailing one collapses.",
