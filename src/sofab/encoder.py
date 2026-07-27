@@ -16,8 +16,16 @@ empty ``begin``/``end`` frame (MESSAGE_SPEC §2). The closer picks the outcome �
 :meth:`Encoder.write_sequence_end` drops a contentless sequence,
 :meth:`Encoder.write_sequence_end_keep` forces the frame out (wrapper-array
 elements, explicit empty arrays). Held-back ids are encoder state, never buffer
-content, so a flush can never split a pending run and a tiny output buffer
-produces exactly the one-shot bytes.
+content, so a flush cannot split a pending run *by construction*: a pending header
+occupies no buffer space, and the buffer only fills through a write — which
+commits the whole run before its first byte goes out. A tiny output buffer
+therefore produces exactly the one-shot bytes.
+
+The run itself has no fixed window: it grows on demand, so the hold-back reaches
+the full :data:`sofab.MAX_DEPTH` and every depth is canonical (CORELIB_PLAN §6 —
+only a heap-free profile may bound the run and frame eagerly beyond the bound).
+It is allocated on the first hold-back, so an encoder that never opens a sequence
+never pays for it.
 """
 
 from __future__ import annotations
@@ -71,7 +79,12 @@ class Encoder:
         # yet (MESSAGE_SPEC §2 lazy framing). Always a contiguous suffix of the
         # open sequences: writing any field commits the whole run at once, so
         # :meth:`write_sequence_end` can simply pop the last entry.
-        self._pending: list[int] = []
+        #
+        # ``None`` until the first hold-back: the list grows on demand (CORELIB_PLAN
+        # §6 — an implementation that can allocate holds back to the full MAX_DEPTH,
+        # so there is no fixed window and no eager-framing fallback), and an encoder
+        # that never opens a sequence never allocates it at all.
+        self._pending: list[int] | None = None
 
     @classmethod
     def over_buffer(
@@ -103,7 +116,7 @@ class Encoder:
         self._sticky = sticky
         self._error = None
         self._depth = 0
-        self._pending = []
+        self._pending = None
         self.buffer_set(buffer, offset)
         return self
 
@@ -222,8 +235,8 @@ class Encoder:
         re-enters the encoder cannot see a half-committed run.
         """
         run = self._pending
-        self._pending = []
-        for field_id in run:
+        self._pending = None
+        for field_id in run or ():
             self._emit_varint((field_id << 3) | WireType.SEQUENCE_START)
 
     def _begin(self) -> bool:
@@ -442,10 +455,17 @@ class Encoder:
             if field_id < 0 or field_id > ID_MAX:
                 raise SofaRangeError(f"id {field_id} out of range 0..{ID_MAX}")
             # No hold-back window to exhaust: the pending run is a Python list
-            # bounded only by MAX_DEPTH, so there is no eager-framing fallback
+            # that grows on demand, so it reaches the full MAX_DEPTH (CORELIB_PLAN
+            # §6: only a heap-free profile may bound the run and frame eagerly
+            # beyond the bound). There is therefore no eager-framing fallback,
             # and the "pending is a contiguous suffix of the open sequences"
-            # invariant holds unconditionally.
-            self._pending.append(field_id)
+            # invariant holds unconditionally. The list itself is allocated here,
+            # on the first hold-back, not in the constructor — an encoder that
+            # never opens a sequence never pays for one.
+            if self._pending is None:
+                self._pending = [field_id]
+            else:
+                self._pending.append(field_id)
             self._depth += 1
         except SofaError as exc:
             self._fail(exc)

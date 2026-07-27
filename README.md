@@ -63,7 +63,7 @@ import sofab   # Encoder, Decoder, Visitor, wire-format types and limits
 | Runs everywhere | With no compiler or wheel, `pip` still installs a working pure-Python build (`py3-none-any`). Native and pure paths are byte-for-byte identical — falling back changes only speed. |
 | Sticky errors | `Encoder(sticky=True)` records the first failure and turns later writes into no-ops, so generated `marshal` code can check `enc.error` once. |
 | Reserve-offset | `Encoder.over_buffer(buf, offset=…)` leaves room at the front of the buffer for a lower-layer protocol header. |
-| Sparse sequences | `write_sequence_begin_lazy` holds a sequence header back until the sequence receives content, so a sequence-typed field equal to its declared default is **omitted** rather than framed empty (MESSAGE_SPEC §2) — decided in one forward pass, without buffering the sub-message. `write_sequence_end` drops a contentless sequence; `write_sequence_end_keep` forces the frame out where presence itself carries meaning. |
+| Sparse sequences | `write_sequence_begin_lazy` holds a sequence header back until the sequence receives content, so a sequence-typed field equal to its declared default is **omitted** rather than framed empty (MESSAGE_SPEC §2) — decided in one forward pass, without buffering the sub-message. `write_sequence_end` drops a contentless sequence; `write_sequence_end_keep` forces the frame out where presence itself carries meaning — a wrapper-array **element** is still always framed, even when all-default, because element presence is what carries a dynamic array's length (§5.1). |
 | Typed | Fully type-annotated with a `py.typed` marker (PEP 561); clean under `mypy --strict`. |
 | Forward/backward compatible | Unknown fields are consumed with `skip()`. |
 
@@ -227,8 +227,13 @@ never provides a value buffer.**
   symmetric — `end_keep` where `end` would do costs one non-canonical empty frame
   every decoder normalizes away, while the reverse changes a decoded array's
   length — so `end_keep` is the safe choice when a call site is ambiguous. The
-  pending ids are encoder state, never buffer content, so a flush can never split
-  a run: a tiny output buffer yields exactly the one-shot bytes.
+  pending run grows on demand, so the hold-back reaches the full `MAX_DEPTH` and
+  every nesting depth is canonical, and it is allocated on the first hold-back —
+  an encoder that never opens a sequence never pays for it. The pending ids are
+  encoder state, never buffer content, so a flush cannot split a run *by
+  construction*: a held-back header takes no buffer space, and the buffer only
+  fills through a write, which commits the run before its first byte. A tiny
+  output buffer therefore yields exactly the one-shot bytes.
 
 ## Native accelerator
 

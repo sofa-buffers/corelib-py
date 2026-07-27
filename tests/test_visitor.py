@@ -21,6 +21,13 @@ VECTORS = json.loads(
 )["vectors"]
 _IDS = [v["name"] for v in VECTORS]
 
+# Decode-side driver: it reads each vector's `serialized` hex, the dense
+# primitive-layer ground truth. The `serialized_sparse` column (MESSAGE_SPEC §2
+# omission of an all-default sequence *field*) is not read here or anywhere else in
+# this repo — see the note in tests/test_conformance_vectors.py for why a corelib
+# cannot produce it and where it is actually exercised (the generator's
+# conformance drivers).
+
 
 class Recorder(Visitor):
     """Records every hook into the same ``(tag, ...)`` tuples the conformance

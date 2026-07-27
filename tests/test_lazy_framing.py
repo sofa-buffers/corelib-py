@@ -28,6 +28,7 @@ from __future__ import annotations
 import pytest
 
 from sofab.encoder import Encoder as PyEncoder
+from sofab.types import MAX_DEPTH
 
 _ENGINES = [pytest.param(PyEncoder, id="python")]
 try:  # pragma: no cover - depends on whether the extension was built
@@ -44,6 +45,20 @@ def _encode(Encoder, fn) -> bytes:
     enc = Encoder()
     fn(enc)
     return enc.getvalue()
+
+
+def _varint(value: int) -> bytes:
+    """Independent varint encoder, so an expected byte string can be built for a
+    nesting depth whose sequence headers no longer fit in one byte."""
+    out = bytearray()
+    while True:
+        b = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
 
 
 # --- the seven framing tests -------------------------------------------------
@@ -154,54 +169,84 @@ def test_lazy_sequence_after_content_is_independent(Encoder):
 
 
 @engine
-def test_lazy_framing_is_buffer_size_independent(Encoder):
-    """Held-back headers are encoder state, not buffer content, so a flush can
-    never split a pending run: a 3-byte output buffer sees exactly the bytes a
-    one-shot encode produces."""
+def test_a_run_committed_across_flushes_is_byte_identical(Encoder):
+    """A committed run split across flush boundaries yields exactly the one-shot
+    bytes: encoding through a 3-byte output buffer that drains repeatedly produces
+    the same wire image as the in-memory encoder.
+
+    Note what this does *not* — and cannot — show: a flush landing while a header
+    is still held back. That is unreachable by construction, not merely untested.
+    A held-back header occupies no buffer space (the pending ids are encoder
+    state, never buffer content), and the buffer only fills through a write, which
+    commits the whole run *before* its first byte goes out. So there is no state in
+    which a pending run straddles a flush. What is left to prove is this: that the
+    bytes of an already-committed run survive being chopped up by the sink.
+    """
     chunks: list[bytes] = []
     enc = Encoder.over_buffer(bytearray(3), 0, chunks.append)
     enc.write_sequence_begin_lazy(1)
     enc.write_sequence_begin_lazy(2)
     enc.write_sequence_end()
     enc.write_unsigned(0, 42)
+    enc.write_string(3, "a longer payload, so the 3-byte buffer drains repeatedly")
     enc.write_sequence_end()
     enc.flush()
-    assert b"".join(chunks) == bytes([0x0E, 0x00, 0x2A, 0x07])
+
+    def build(e):
+        e.write_sequence_begin_lazy(1)
+        e.write_sequence_begin_lazy(2)
+        e.write_sequence_end()
+        e.write_unsigned(0, 42)
+        e.write_string(3, "a longer payload, so the 3-byte buffer drains repeatedly")
+        e.write_sequence_end()
+
+    assert len(chunks) > 1  # the sink really did drain mid-message
+    assert b"".join(chunks) == _encode(Encoder, build)
+    assert b"".join(chunks).startswith(bytes([0x0E, 0x00, 0x2A]))
 
 
 # --- supporting invariants ---------------------------------------------------
 
 
+#: Every public writer, one entry each — parametrized so each is an independent
+#: test case (a plain loop would report as one case and stop at the first
+#: offender, hiding any writer after it).
+_WRITERS = [
+    pytest.param(lambda e: e.write_unsigned(0, 1), id="unsigned"),
+    pytest.param(lambda e: e.write_signed(0, -1), id="signed"),
+    pytest.param(lambda e: e.write_bool(0, True), id="bool"),
+    pytest.param(lambda e: e.write_float32(0, 1.0), id="fp32"),
+    pytest.param(lambda e: e.write_float64(0, 1.0), id="fp64"),
+    pytest.param(lambda e: e.write_string(0, "x"), id="string"),
+    pytest.param(lambda e: e.write_bytes(0, b"x"), id="blob"),
+    pytest.param(lambda e: e.write_unsigned_array(0, [1]), id="unsigned_array"),
+    pytest.param(lambda e: e.write_signed_array(0, [-1]), id="signed_array"),
+    pytest.param(lambda e: e.write_float32_array(0, [1.0]), id="fp32_array"),
+    pytest.param(lambda e: e.write_float64_array(0, [1.0]), id="fp64_array"),
+    pytest.param(
+        lambda e: (e.write_sequence_begin_lazy(0), e.write_sequence_end_keep()),
+        id="nested_kept_frame",
+    ),
+]
+
+
 @engine
-def test_writer_choke_point_is_complete(Encoder):
+@pytest.mark.parametrize("write", _WRITERS)
+def test_writer_choke_point_is_complete(Encoder, write):
     """Invariant 1: *every* writer must commit the pending run before its first
     byte. Each case opens a sequence lazily, writes exactly one field through a
     different writer, and closes with the dropping ``end``: if that writer bypassed
     the choke point, the ``0x0E`` header would be missing (and ``end`` would then
     have dropped a frame that already had content)."""
-    writers = [
-        ("unsigned", lambda e: e.write_unsigned(0, 1)),
-        ("signed", lambda e: e.write_signed(0, -1)),
-        ("bool", lambda e: e.write_bool(0, True)),
-        ("fp32", lambda e: e.write_float32(0, 1.0)),
-        ("fp64", lambda e: e.write_float64(0, 1.0)),
-        ("string", lambda e: e.write_string(0, "x")),
-        ("blob", lambda e: e.write_bytes(0, b"x")),
-        ("unsigned_array", lambda e: e.write_unsigned_array(0, [1])),
-        ("signed_array", lambda e: e.write_signed_array(0, [-1])),
-        ("fp32_array", lambda e: e.write_float32_array(0, [1.0])),
-        ("fp64_array", lambda e: e.write_float64_array(0, [1.0])),
-        ("nested_kept_frame", lambda e: (e.write_sequence_begin_lazy(0), e.write_sequence_end_keep())),
-    ]
-    for name, write in writers:
-        def build(e, write=write):
-            e.write_sequence_begin_lazy(1)
-            write(e)
-            e.write_sequence_end()
 
-        out = _encode(Encoder, build)
-        assert out[:1] == b"\x0e", f"{name} bypassed the pending-run commit: {out.hex()}"
-        assert out[-1:] == b"\x07", f"{name} lost its sequence end: {out.hex()}"
+    def build(e):
+        e.write_sequence_begin_lazy(1)
+        write(e)
+        e.write_sequence_end()
+
+    out = _encode(Encoder, build)
+    assert out[:1] == b"\x0e", f"bypassed the pending-run commit: {out.hex()}"
+    assert out[-1:] == b"\x07", f"lost its sequence end: {out.hex()}"
 
 
 @engine
@@ -223,17 +268,48 @@ def test_pending_run_is_a_suffix_so_end_pops_the_innermost(Encoder):
 
 
 @engine
-def test_all_default_message_encodes_to_zero_bytes(Encoder):
+@pytest.mark.parametrize("depth", [1, 8, 40, MAX_DEPTH])
+def test_all_default_message_encodes_to_zero_bytes(Encoder, depth):
     """MESSAGE_SPEC §2: with every sequence omitted, a message whose every field
-    equals its default is the empty byte string."""
+    equals its default is the empty byte string — at *every* depth.
+
+    CORELIB_PLAN §6 ("how deep the hold-back reaches"): both engines can allocate,
+    so both hold back to the full ``MAX_DEPTH`` and are canonical everywhere. The
+    pending run grows on demand — a Python list, a doubling heap block in the
+    accelerator — so there is no window to overflow and no eager-framing fallback
+    that would emit the empty frames §2 omits. 40 levels is deliberately past any
+    plausible fixed window (and ``MAX_DEPTH`` is past every one).
+    """
 
     def build(e):
-        for depth in range(8):
-            e.write_sequence_begin_lazy(depth)
-        for _ in range(8):
+        for i in range(depth):
+            e.write_sequence_begin_lazy(i)
+        for _ in range(depth):
             e.write_sequence_end()
 
     assert _encode(Encoder, build) == b""
+
+
+@engine
+@pytest.mark.parametrize("depth", [40, MAX_DEPTH])
+def test_deep_nesting_commits_the_whole_run_in_order(Encoder, depth):
+    """The other half of the same claim: nested that deep, one leaf write must
+    still bring *every* enclosing header back, outermost first, and each ``end``
+    must then emit its marker. Nothing may be framed eagerly and nothing dropped."""
+
+    def build(e):
+        for i in range(depth):
+            e.write_sequence_begin_lazy(i)
+        e.write_unsigned(0, 42)
+        for _ in range(depth):
+            e.write_sequence_end()
+
+    expected = bytearray()
+    for i in range(depth):
+        expected += _varint((i << 3) | 0x06)  # header: id=i, wire type 6 = SEQUENCE_START
+    expected += bytes([0x00, 0x2A])  # the leaf: id 0, unsigned, value 42
+    expected += b"\x07" * depth
+    assert _encode(Encoder, build) == bytes(expected)
 
 
 @engine

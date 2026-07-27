@@ -179,11 +179,17 @@ cdef class Encoder:
     cdef int _depth
     # Ids of the innermost open sequences whose header has not been written yet
     # (MESSAGE_SPEC S2 lazy framing). Always a contiguous suffix of the open
-    # sequences, so write_sequence_end simply pops the last entry. Sized to
-    # _MAX_DEPTH: the pending run is a subset of the open sequences, which _depth
-    # caps at 255, so it can never overflow and needs no eager-framing fallback.
-    cdef uint32_t _pending[255]
+    # sequences, so write_sequence_end simply pops the last entry.
+    #
+    # A heap block that is NULL until the first hold-back and doubles on demand
+    # (CORELIB_PLAN S6: an implementation that can allocate MUST hold back to the
+    # full MAX_DEPTH, so there is no fixed window and no eager-framing fallback;
+    # only a heap-free profile may bound the run). Growing on demand also keeps an
+    # encoder that never opens a sequence from paying for the run at all -- the
+    # fixed 255-entry array this replaces cost every stream ~1 KiB it never used.
+    cdef uint32_t* _pending
     cdef int _npending
+    cdef int _pcap
 
     def __cinit__(self):
         self._out = NULL
@@ -199,7 +205,9 @@ cdef class Encoder:
         self._sticky = False
         self._error = None
         self._depth = 0
+        self._pending = NULL
         self._npending = 0
+        self._pcap = 0
 
     def __init__(self, writer=None, *, bint sticky=False):
         self._writer = writer
@@ -209,6 +217,10 @@ cdef class Encoder:
         if self._out != NULL:
             free(self._out)
             self._out = NULL
+        if self._pending != NULL:
+            free(self._pending)
+            self._pending = NULL
+            self._pcap = 0
 
     @classmethod
     def over_buffer(cls, bytearray buffer, int offset=0, flush=None, *, bint sticky=False):
@@ -330,12 +342,43 @@ cdef class Encoder:
         # Emit the held-back sequence headers, outermost first. Cold: it runs at
         # most once per non-default sequence, never per field. The run is
         # detached before the first byte goes out, so a flush sink that re-enters
-        # the encoder cannot observe a half-committed run.
+        # the encoder cannot observe a half-committed run (it starts a fresh run
+        # of its own; the block below is then handed back or freed).
+        cdef uint32_t* run = self._pending
         cdef int n = self._npending
+        cdef int cap = self._pcap
         cdef int i
+        self._pending = NULL
         self._npending = 0
-        for i in range(n):
-            self._emit_varint((<uint64_t>self._pending[i] << 3) | <uint64_t>_WT_SEQUENCE_START)
+        self._pcap = 0
+        try:
+            for i in range(n):
+                self._emit_varint((<uint64_t>run[i] << 3) | <uint64_t>_WT_SEQUENCE_START)
+        finally:
+            if self._pending == NULL:
+                # Nothing re-entered: keep the block for the next hold-back.
+                self._pending = run
+                self._pcap = cap
+            else:
+                free(run)
+        return 0
+
+    cdef int _pending_push(self, uint32_t field_id) except -1:
+        # Append one id to the pending run, growing the block on demand. NULL
+        # until the first hold-back, so an encoder that never opens a sequence
+        # never allocates it; capacity doubles from 8 and is implicitly bounded
+        # by _MAX_DEPTH (the run is a subset of the open sequences).
+        cdef int newcap
+        cdef uint32_t* grown
+        if self._npending >= self._pcap:
+            newcap = self._pcap * 2 if self._pcap else 8
+            grown = <uint32_t*>realloc(self._pending, <size_t>newcap * sizeof(uint32_t))
+            if grown == NULL:
+                raise MemoryError()
+            self._pending = grown
+            self._pcap = newcap
+        self._pending[self._npending] = field_id
+        self._npending += 1
         return 0
 
     cdef inline bint _begin(self):
@@ -566,8 +609,7 @@ cdef class Encoder:
                 raise SofaRangeError("nesting exceeds MAX_DEPTH=%d" % _MAX_DEPTH)
             if field_id < 0 or field_id > ID_MAX:
                 raise SofaRangeError("id %d out of range 0..%d" % (field_id, _ID_MAX))
-            self._pending[self._npending] = <uint32_t>field_id
-            self._npending += 1
+            self._pending_push(<uint32_t>field_id)
             self._depth += 1
         except SofaError as exc:
             self._fail(exc)
