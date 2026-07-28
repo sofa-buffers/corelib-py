@@ -79,7 +79,7 @@ ARRAY_CASES = [
 
 def _nested_sequence(e: Encoder) -> None:
     e.write_unsigned(0, 42)
-    e.write_sequence_begin(1)
+    e.write_sequence_begin_lazy(1)
     e.write_unsigned(0, 42)
     e.write_signed(2, -42)
     e.write_sequence_end()
@@ -88,7 +88,7 @@ def _nested_sequence(e: Encoder) -> None:
 
 def _nested_sequence_with_array(e: Encoder) -> None:
     e.write_unsigned(0, 42)
-    e.write_sequence_begin(3)
+    e.write_sequence_begin_lazy(3)
     e.write_unsigned(0, 42)
     e.write_signed_array(3, [-42, -43, -44])
     e.write_sequence_end()
@@ -98,7 +98,7 @@ def _nested_sequence_with_array(e: Encoder) -> None:
 def _nested_sequence_multilevel(e: Encoder) -> None:
     e.write_unsigned(0, 42)
     for _ in range(10):
-        e.write_sequence_begin(1)
+        e.write_sequence_begin_lazy(1)
         e.write_unsigned(0, 42)
         e.write_signed(2, -42)
     for _ in range(10):

@@ -35,6 +35,21 @@ _DATA = json.loads(VECTORS_PATH.read_text())
 VECTORS = _DATA["vectors"]
 _IDS = [v["name"] for v in VECTORS]
 
+# WHICH COLUMN THIS REPO ASSERTS: `serialized` — the dense, primitive-layer ground
+# truth, every sequence framed, produced by replaying the vector's op list through
+# the raw Encoder. That is the only column a corelib *can* produce.
+#
+# The vectors also carry `serialized_sparse`, the MESSAGE_SPEC §2 form in which a
+# sequence-typed FIELD equal to its declared default is omitted (a wrapper-array
+# ELEMENT keeps its frame, §5.1). Omitting is a decision made from *values against
+# schema defaults*, and this repo has no message layer and no schema — it never
+# sees a default, so it cannot emit that form and no test here reads the column.
+# `serialized_sparse` is consumed by the generator's conformance drivers
+# (sofabgen, `tests/conformance/<lang>/run.sh`), where generated code knows each
+# field's default and picks `write_sequence_end` vs `write_sequence_end_keep`.
+# What this repo owes that layer is the two closers behaving exactly as specified
+# — proven in `tests/test_lazy_framing.py`, not from these vectors.
+
 # Shared negative UTF-8 vectors (issue #85 / MESSAGE_SPEC §8, CORELIB_PLAN §6.4).
 # The `invalid_utf8` array is copied verbatim from corelib-c-cpp (the ground
 # truth) and tracks corelib-c-cpp#97. Each entry carries `string_hex` (the raw
@@ -106,9 +121,15 @@ def _replay(enc: Encoder, fields) -> None:
             else:
                 raise AssertionError(f"unknown element_type {et!r}")
         elif op == "sequence_begin":
-            enc.write_sequence_begin(f["id"])
+            enc.write_sequence_begin_lazy(f["id"])
         elif op == "sequence_end":
-            enc.write_sequence_end()
+            # The op list is replayed against the RAW encoder and compared to the
+            # DENSE `serialized` hex, which always carries the frame — including
+            # the three empty-sequence vectors. So the close has to be the
+            # frame-keeping one; `write_sequence_end` would drop those frames and
+            # encode them to nothing. Sparse omission (MESSAGE_SPEC §2) is a
+            # message-layer decision, not one this replay makes.
+            enc.write_sequence_end_keep()
         else:
             raise AssertionError(f"unknown op {op!r}")
 

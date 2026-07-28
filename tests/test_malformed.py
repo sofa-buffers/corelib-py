@@ -538,9 +538,9 @@ def test_encode_nesting_beyond_max_depth_rejected():
 
     enc = Encoder()
     for i in range(MAX_DEPTH):  # 255 nested sequences are allowed
-        enc.write_sequence_begin(i % 100)
+        enc.write_sequence_begin_lazy(i % 100)
     with pytest.raises(SofaRangeError):
-        enc.write_sequence_begin(0)  # the 256th must be refused
+        enc.write_sequence_begin_lazy(0)  # the 256th must be refused
 
 
 def test_sequence_end_without_begin():

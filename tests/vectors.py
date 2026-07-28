@@ -55,7 +55,13 @@ def encode(fn) -> bytes:
 
 
 def build_full_scale(enc: Encoder) -> None:
-    """Reproduce test_write_full_scale_example exactly."""
+    """Reproduce test_write_full_scale_example exactly.
+
+    Every sequence here receives content, so the lazily held-back header is
+    committed by the first child write and the bytes are identical to the eager
+    framing the C reference emits — which is exactly what makes this a byte-exact
+    check of the commit path.
+    """
     enc.write_unsigned(0, 200)
     enc.write_signed(1, -100)
     enc.write_unsigned(2, 50000)
@@ -65,14 +71,14 @@ def build_full_scale(enc: Encoder) -> None:
     enc.write_unsigned(6, 10000000000000)
     enc.write_signed(7, -5000000000000)
 
-    enc.write_sequence_begin(10)
+    enc.write_sequence_begin_lazy(10)
     enc.write_float32(0, 3.14)
     enc.write_float64(1, 3.14159265)
     enc.write_string(2, "Hello, World!")
     enc.write_bytes(3, bytes([0xDE, 0xAD, 0xBE, 0xEF]))
     enc.write_sequence_end()
 
-    enc.write_sequence_begin(100)
+    enc.write_sequence_begin_lazy(100)
     enc.write_unsigned_array(0, [0, 64, 128, 191, 255])
     enc.write_signed_array(1, [-128, -64, 0, 63, 127])
     enc.write_unsigned_array(2, [0, 16384, 32768, 49151, 65535])
@@ -99,13 +105,13 @@ def build_full_scale(enc: Encoder) -> None:
             9223372036854775807,
         ],
     )
-    enc.write_sequence_begin(10)
+    enc.write_sequence_begin_lazy(10)
     enc.write_float32_array(0, [1.0, 2.0, 3.0, -FLT_MAX, FLT_MAX])
     enc.write_float64_array(1, [1.0, 2.0, 3.0, -DBL_MAX, DBL_MAX])
     enc.write_sequence_end()
     enc.write_sequence_end()
 
-    enc.write_sequence_begin(200)
+    enc.write_sequence_begin_lazy(200)
     enc.write_string(0, "Hello, Sofab!")
     enc.write_string(1, "")
     enc.write_string(2, "1234567890")

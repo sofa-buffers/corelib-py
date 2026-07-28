@@ -77,7 +77,7 @@ def _sofab_bodies(sofab):
         e = Encoder()
         e.write_unsigned(1, 0xDEADBEEF); e.write_signed(2, -12345); e.write_bool(3, True)
         e.write_float32(4, 3.14159); e.write_string(5, "sofab"); e.write_unsigned_array(6, ARR16)
-        e.write_sequence_begin(7); e.write_unsigned(1, 99); e.write_signed(2, -7); e.write_sequence_end()
+        e.write_sequence_begin_lazy(7); e.write_unsigned(1, 99); e.write_signed(2, -7); e.write_sequence_end()
         e.flush(); return e.getvalue()
 
     arr_bytes = enc_arr()
