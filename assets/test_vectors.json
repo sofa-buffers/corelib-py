@@ -1060,6 +1060,35 @@
       "serialized_sparse": { "length": 7, "hex": "060a0a78120207" }
     },
     {
+      "name": "array_element_wire_type_mismatch",
+      "group": "array/struct",
+      "description": "Wrapper array whose element id 0 arrives as a SCALAR where the schema declares a sequence (struct) element. MESSAGE_SPEC S7.3: it MUST be skipped exactly as a field with an unknown id is skipped, so it does NOT occupy its id and does NOT count toward the array's length (S5.1) -- a schema-aware receiver reconstructs the slot from the element default, decodes the EMPTY array, and re-encodes these bytes as nothing at all (S2). Control: array_element_empty_frame_present.",
+      "offset": 0,
+      "requires": ["sequence"],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "unsigned", "id": 0, "value": 7 },
+        { "op": "sequence_end" }
+      ],
+      "serialized": { "length": 4, "hex": "06000707" },
+      "serialized_sparse": { "length": 4, "hex": "06000707" }
+    },
+    {
+      "name": "array_element_empty_frame_present",
+      "group": "array/struct",
+      "description": "The control for array_element_wire_type_mismatch: element id 0 arrives as a well-typed but EMPTY frame. An empty element is a PRESENT element -- it counts toward the length (MESSAGE_SPEC S5.1), so the array decodes at length 1 and keeps the frame on re-encode. Only a wire-type-mismatched element (S7.3) stops counting; the two cases are not the same.",
+      "offset": 0,
+      "requires": ["sequence"],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "sequence_end", "element": true },
+        { "op": "sequence_end" }
+      ],
+      "serialized": { "length": 4, "hex": "06060707" },
+      "serialized_sparse": { "length": 4, "hex": "06060707" }
+    },
+    {
       "name": "full_scale_example",
       "group": "composite",
       "description": "Large message mixing scalars, nested sequences, integer/float arrays and strings.",
