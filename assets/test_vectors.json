@@ -6,6 +6,7 @@
     "byte_order": "little-endian",
     "serialized.hex": "lowercase hex of the full (dense) message; primitive-layer ground truth and the decoder's skip input",
     "serialized_sparse.hex": "lowercase hex of the sparse-canonical message (MESSAGE_SPEC S2): every leaf field equal to its type default is omitted, and a sequence left without content is omitted too (not framed empty); byte-exact target for a sparse encoder",
+    "field.element": "true marks the op at a wrapper array's LAST element index (MESSAGE_SPEC S2/S5.1). A wrapper carries no length, so the length is highest present id + 1: that element is ALWAYS written -- a leaf as its (default) value, a sequence element as an empty frame -- while every INTERIOR element equal to its default is omitted, leaf and sequence element alike. It is the only op the sparse column never drops",
     "integers": "decimal JSON number literals (full u64/i64 range)",
     "floats": "finite values as JSON numbers; +/-infinity as the strings 'inf'/'-inf'",
     "blob.value_hex": "lowercase hex of the blob payload",
@@ -657,6 +658,18 @@
       "serialized_sparse": { "length": 25, "hex": "0405010305ffffffffffffffffff01feffffffffffffffff01" }
     },
     {
+      "name": "array_unsigned_trailing_defaults",
+      "group": "array/integer",
+      "description": "Unsigned array ending in default (zero) elements: M is the array's length, so all four elements stay on the wire.",
+      "offset": 0,
+      "requires": ["array"],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "u32", "values": [1, 2, 0, 0] }
+      ],
+      "serialized": { "length": 6, "hex": "030401020000" },
+      "serialized_sparse": { "length": 6, "hex": "030401020000" }
+    },
+    {
       "name": "array_u8_large",
       "group": "array/integer",
       "description": "200-element u8 array — the element count crosses into two varint bytes.",
@@ -937,7 +950,7 @@
         { "op": "sequence_begin", "id": 0 },
         { "op": "string", "id": 0, "value": "a" },
         { "op": "string", "id": 1, "value": "" },
-        { "op": "string", "id": 2, "value": "c" },
+        { "op": "string", "id": 2, "value": "c", "element": true },
         { "op": "sequence_end" }
       ],
       "serialized": { "length": 10, "hex": "06020a610a02120a6307" },
@@ -946,83 +959,83 @@
     {
       "name": "array_string_trailing_default",
       "group": "array/string",
-      "description": "Array of string with a trailing default element: sparse drops it, so [\"a\",\"\"] encodes exactly like [\"a\"].",
+      "description": "Array of string whose LAST element is the default (empty): it is written anyway, so [\"a\",\"\"] stays distinct from [\"a\"] -- the sparse form equals the dense one.",
       "offset": 0,
       "requires": ["fixlen", "sequence"],
       "fields": [
         { "op": "sequence_begin", "id": 0 },
         { "op": "string", "id": 0, "value": "a" },
-        { "op": "string", "id": 1, "value": "" },
+        { "op": "string", "id": 1, "value": "", "element": true },
         { "op": "sequence_end" }
       ],
       "serialized": { "length": 7, "hex": "06020a610a0207" },
-      "serialized_sparse": { "length": 5, "hex": "06020a6107" }
+      "serialized_sparse": { "length": 7, "hex": "06020a610a0207" }
     },
     {
       "name": "array_string_all_default",
       "group": "array/string",
-      "description": "Array of only default (empty) string elements: every element drops, so it encodes as the empty wrapper sequence.",
+      "description": "Array of only default (empty) string elements: the interior one drops, so it encodes as its final element alone, at id 1 -- not as the empty array.",
       "offset": 0,
       "requires": ["fixlen", "sequence"],
       "fields": [
         { "op": "sequence_begin", "id": 0 },
         { "op": "string", "id": 0, "value": "" },
-        { "op": "string", "id": 1, "value": "" },
+        { "op": "string", "id": 1, "value": "", "element": true },
         { "op": "sequence_end" }
       ],
       "serialized": { "length": 6, "hex": "0602020a0207" },
-      "serialized_sparse": { "length": 0, "hex": "" }
+      "serialized_sparse": { "length": 4, "hex": "060a0207" }
     },
     {
       "name": "array_struct_interior_default_element",
       "group": "array/struct",
-      "description": "Array of struct where the middle element holds only a default-valued leaf: sparse drops the leaf but KEEPS the element frame, so the array still decodes at length 3.",
+      "description": "Array of struct where the middle element holds only a default-valued leaf: sparse drops the element entirely (id gap), and the array still decodes at length 3 from id 2.",
       "offset": 0,
       "requires": ["sequence"],
       "fields": [
         { "op": "sequence_begin", "id": 0 },
         { "op": "sequence_begin", "id": 0 },
         { "op": "unsigned", "id": 0, "value": 1 },
-        { "op": "sequence_end", "element": true },
+        { "op": "sequence_end" },
         { "op": "sequence_begin", "id": 1 },
         { "op": "unsigned", "id": 0, "value": 0 },
-        { "op": "sequence_end", "element": true },
+        { "op": "sequence_end" },
         { "op": "sequence_begin", "id": 2 },
         { "op": "unsigned", "id": 0, "value": 3 },
         { "op": "sequence_end", "element": true },
         { "op": "sequence_end" }
       ],
       "serialized": { "length": 14, "hex": "06060001070e0000071600030707" },
-      "serialized_sparse": { "length": 12, "hex": "06060001070e071600030707" }
+      "serialized_sparse": { "length": 10, "hex": "06060001071600030707" }
     },
     {
       "name": "array_struct_all_default_elements",
       "group": "array/struct",
-      "description": "Array of two all-default structs: both element frames survive, so [{},{}] stays distinguishable from [].",
+      "description": "Array of two all-default structs: the interior element drops and the last one keeps its empty frame, so [{},{}] stays distinguishable from [] at length 2.",
       "offset": 0,
       "requires": ["sequence"],
       "fields": [
         { "op": "sequence_begin", "id": 0 },
         { "op": "sequence_begin", "id": 0 },
-        { "op": "sequence_end", "element": true },
+        { "op": "sequence_end" },
         { "op": "sequence_begin", "id": 1 },
         { "op": "sequence_end", "element": true },
         { "op": "sequence_end" }
       ],
       "serialized": { "length": 6, "hex": "0606070e0707" },
-      "serialized_sparse": { "length": 6, "hex": "0606070e0707" }
+      "serialized_sparse": { "length": 4, "hex": "060e0707" }
     },
     {
       "name": "array_of_string_arrays",
       "group": "array/nested",
-      "description": "Array of string arrays: the second row is empty and keeps its frame, so the outer array decodes at length 2.",
+      "description": "Array of string arrays: the second row is empty and, being the last element, keeps its frame, so the outer array decodes at length 2.",
       "offset": 0,
       "requires": ["fixlen", "sequence"],
       "fields": [
         { "op": "sequence_begin", "id": 0 },
         { "op": "sequence_begin", "id": 0 },
-        { "op": "string", "id": 0, "value": "a" },
-        { "op": "sequence_end", "element": true },
+        { "op": "string", "id": 0, "value": "a", "element": true },
+        { "op": "sequence_end" },
         { "op": "sequence_begin", "id": 1 },
         { "op": "sequence_end", "element": true },
         { "op": "sequence_end" }
@@ -1033,18 +1046,18 @@
     {
       "name": "array_string_leading_default",
       "group": "array/string",
-      "description": "Array of string with leading and trailing default elements: the leading one leaves an id gap, the trailing one collapses.",
+      "description": "Array of string with leading and trailing default elements: the leading one leaves an id gap, the trailing one is the last element and is written.",
       "offset": 0,
       "requires": ["fixlen", "sequence"],
       "fields": [
         { "op": "sequence_begin", "id": 0 },
         { "op": "string", "id": 0, "value": "" },
         { "op": "string", "id": 1, "value": "x" },
-        { "op": "string", "id": 2, "value": "" },
+        { "op": "string", "id": 2, "value": "", "element": true },
         { "op": "sequence_end" }
       ],
       "serialized": { "length": 9, "hex": "0602020a0a78120207" },
-      "serialized_sparse": { "length": 5, "hex": "060a0a7807" }
+      "serialized_sparse": { "length": 7, "hex": "060a0a78120207" }
     },
     {
       "name": "full_scale_example",
@@ -1087,7 +1100,7 @@
         { "op": "string", "id": 1, "value": "" },
         { "op": "string", "id": 2, "value": "1234567890" },
         { "op": "string", "id": 3, "value": "äöüÄÖÜß" },
-        { "op": "string", "id": 4, "value": "This_is_a_very_long_test_string_with_!@#$%^&*()_+-=[]{}" },
+        { "op": "string", "id": 4, "value": "This_is_a_very_long_test_string_with_!@#$%^&*()_+-=[]{}", "element": true },
         { "op": "sequence_end" }
       ],
       "serialized": { "length": 436, "hex": "00c80109c70110d0860319bfb8022080bcc1960b29ffa7d6b9073080c0caf384a30239ffbfcaf384a302560220c3f548400a41f1d4c853fb210940126a48656c6c6f2c20576f726c64211a23deadbeef07a606030500408001bf01ff010c05ff017f007efe01130500808001808002ffff02ffff031c05ffff03ffff0100feff01feff0323050080808080048080808008ffffffff0bffffffff0f2c05ffffffff0fffffffff0700feffffff07feffffff0f33050080808080808080804080808080808080808001ffffffffffffffffbf01ffffffffffffffffff013c05fdffffffffffffffff01ffffffffffffffff7f00feffffffffffffff7ffeffffffffffffffff01560505200000803f0000004000004040ffff7fffffff7f7f0d0541000000000000f03f00000000000000400000000000000840ffffffffffffefffffffffffffffef7f0707c60c026a48656c6c6f2c20536f666162210a021252313233343536373839301a72c3a4c3b6c3bcc384c396c39cc39f22ba03546869735f69735f615f766572795f6c6f6e675f746573745f737472696e675f776974685f21402324255e262a28295f2b2d3d5b5d7b7d07" },
