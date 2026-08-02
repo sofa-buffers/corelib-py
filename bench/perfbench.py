@@ -124,20 +124,41 @@ def decode_typical(data: bytes) -> int:
 
 
 # ---- throughput (MB/s) ------------------------------------------------------
+#
+# The clock is read once per *batch*, not once per operation: a
+# ``time.process_time()`` call costs about a microsecond, which is a fixed cost
+# per operation rather than a scaling factor — barely visible on a 1000-element
+# array, dominant on a 37-byte message. Each batch is grown until it spans
+# BATCH_SECONDS, so one clock reading is a rounding error against what it
+# measures. Calibration doubles as extra warmup.
+
+BATCH_SECONDS = 0.01  # clock cost lands under ~0.01% of a batch
+
+
+def _calibrate_batch(body) -> int:
+    """Grow a batch until it spans BATCH_SECONDS."""
+    batch = 1
+    while True:
+        t0 = time.process_time()
+        for _ in range(batch):
+            body()
+        if time.process_time() - t0 >= BATCH_SECONDS:
+            return batch
+        batch *= 2
 
 
 def measure(body, msg_bytes: int) -> float:
     """Run ``body`` for ~1s of CPU time (after a warmup) → MB/s (MB = 1e6)."""
     body()  # warmup
+    batch = _calibrate_batch(body)
     t0 = time.process_time()
     iters = 0
     el = 0.0
-    while True:
-        body()
-        iters += 1
+    while el < 1.0:
+        for _ in range(batch):
+            body()
+        iters += batch
         el = time.process_time() - t0
-        if el >= 1.0:
-            break
     return msg_bytes * iters / el / 1e6
 
 
@@ -242,15 +263,15 @@ def decode_perf(data: bytes) -> int:
 def measure_perop(body, msg_bytes: int) -> tuple[int, float, float]:
     """Run ``body`` for ~1s CPU time → (iterations, ns/op, MB/s)."""
     body()  # warmup
+    batch = _calibrate_batch(body)
     t0 = time.process_time()
     iters = 0
     el = 0.0
-    while True:
-        body()
-        iters += 1
+    while el < 1.0:
+        for _ in range(batch):
+            body()
+        iters += batch
         el = time.process_time() - t0
-        if el >= 1.0:
-            break
     return iters, el / iters * 1e9, msg_bytes * iters / el / 1e6
 
 
