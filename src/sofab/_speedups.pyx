@@ -1,4 +1,7 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
+# cython: initializedcheck=False, nonecheck=False, overflowcheck=False
+# cython: binding=False, always_allow_keywords=False, embedsignature=False
+# cython: optimize.use_switch=True, optimize.unpack_method_calls=True
 """Native (Cython) accelerator for the SofaBuffers wire format.
 
 This module provides drop-in ``Encoder`` and ``Decoder`` classes that are
@@ -12,16 +15,416 @@ requirement.
 The design mirrors the pure-Python one exactly (same construction models, same
 streaming/refill semantics, same errors) so the two are interchangeable and the
 shared conformance vectors validate both.
+
+Where the speed comes from
+--------------------------
+
+Being compiled is only the start; on a format this small the cost lives in the
+per-field and per-element edges between Python and C. In rough order of what the
+benchmark workloads showed:
+
+* **Values reach C in one step.** A write's range check *is* its conversion —
+  the converter fails on exactly the values the format rejects — and for an exact
+  ``int`` the conversion reads CPython's digits directly (see ``__sofab_u64``).
+  The previous spelling paid two Python rich-comparisons and then a conversion
+  that walked the same digits a third time.
+* **Varints move a word at a time.** The continuation bits are one bit per byte,
+  so a whole varint fits in a 64-bit word: ``_varint_put`` / ``_varint_take``
+  replace the ten-step byte chain with three mask/shift steps.
+* **Attribute and call shapes the interpreter can specialize.** ``Field``'s five
+  attributes are published as slot descriptors and the methods as plain method
+  descriptors (hence ``binding=False`` / ``always_allow_keywords=False`` above),
+  which is what lets CPython's inline caches turn ``field.id`` and ``dec.next()``
+  into their specialized forms instead of the generic attribute path.
+* **Nothing is copied that is only going to be read.** Array writes walk the
+  caller's list in place, string writes take the str's own UTF-8 buffer, and
+  fixlen reads are built straight off the decode buffer.
+
+The two layout-dependent tricks (digit access, slot descriptors) verify their own
+assumptions at import time and fall back to the portable path if they do not
+hold — see ``__sofab_digits_selftest`` and ``__sofab_field_slot_attrs``. They can
+therefore cost speed on an unexpected build, never correctness.
 """
+
+cimport cython
 
 from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize, PyBytes_GET_SIZE
 from cpython.bytearray cimport PyByteArray_AS_STRING, PyByteArray_GET_SIZE
-from cpython.list cimport PyList_New, PyList_SET_ITEM
-from cpython.long cimport PyLong_FromUnsignedLongLong, PyLong_FromLongLong
-from cpython.ref cimport Py_INCREF
+from cpython.exc cimport PyErr_Clear, PyErr_Occurred
+from cpython.float cimport PyFloat_AS_DOUBLE, PyFloat_CheckExact
+from cpython.list cimport PyList_Append, PyList_GET_ITEM, PyList_GET_SIZE, PyList_New, PyList_SET_ITEM
+from cpython.long cimport PyLong_CheckExact, PyLong_FromUnsignedLongLong, PyLong_FromLongLong
+from cpython.ref cimport Py_INCREF, PyObject
 from libc.stdint cimport uint8_t, uint32_t, uint64_t, int64_t
 from libc.stdlib cimport malloc, realloc, free
 from libc.string cimport memcpy
+
+cdef extern from *:
+    # Widest-native-int converters, picked per platform.
+    #
+    # Both spellings are public CPython API and both range-check, but they are
+    # not equally cheap: on CPython 3.12+ the ``LongLong`` forms are implemented
+    # on top of the generic ``_PyLong_AsByteArray`` serializer, while the
+    # ``Long`` forms are a three-iteration digit loop. Where a C ``long`` is
+    # already 64 bits wide (every LP64 platform: Linux, macOS, the BSDs) the
+    # narrower-looking spelling is therefore both equivalent *and* several times
+    # faster on exactly the full-width values a varint format exists to carry.
+    # Where it is not (LLP64, i.e. Windows), the ``LongLong`` form is the only
+    # correct one and is used.
+    """
+    #include <stdint.h>
+
+    #if ULONG_MAX >= 0xFFFFFFFFFFFFFFFFULL
+      #define __sofab_as_u64(o) ((unsigned long long) PyLong_AsUnsignedLong(o))
+      #define __sofab_as_i64(o) ((long long) PyLong_AsLong(o))
+    #else
+      #define __sofab_as_u64(o) PyLong_AsUnsignedLongLong(o)
+      #define __sofab_as_i64(o) PyLong_AsLongLong(o)
+    #endif
+
+    /* --- int -> C integer, straight off the digits ------------------------
+     *
+     * Even the cheap converter above is an out-of-line call that re-derives
+     * what the caller already knows (that the object is an exact int) before
+     * walking the same two or three digits this does. A CPython int is a small
+     * sign/size tag plus an array of fixed-width digits, and reading those
+     * directly turns the conversion into a two-iteration shift-and-or with an
+     * overflow test — which matters because it runs once per array element.
+     *
+     * The layout is CPython's internal one, so it is treated as an assumption
+     * to be *proved*, never assumed: __sofab_digits_selftest() below round-trips
+     * a set of values spanning every digit count and both failure modes
+     * (negative, and above the 64-bit domain) through this code at import time,
+     * and only a clean sweep sets __sofab_digits_ok. Otherwise — including on
+     * any build where the layout is not reachable at all — every conversion
+     * goes through the public API instead, at full speed of correctness.
+     */
+    #if !defined(Py_LIMITED_API) && defined(PyLong_SHIFT)
+      #define __SOFAB_DIGITS 1
+      #if PY_VERSION_HEX >= 0x030C0000
+        #define __sofab_lv(x)      (&((PyLongObject *)(x))->long_value)
+        #define __sofab_ndigits(x) ((Py_ssize_t)(__sofab_lv(x)->lv_tag >> 3))
+        #define __sofab_isneg(x)   ((__sofab_lv(x)->lv_tag & 3) == 2)
+        #define __sofab_digits(x)  (__sofab_lv(x)->ob_digit)
+      #else
+        #define __sofab_ndigits(x) (Py_SIZE(x) < 0 ? -Py_SIZE(x) : Py_SIZE(x))
+        #define __sofab_isneg(x)   (Py_SIZE(x) < 0)
+        #define __sofab_digits(x)  (((PyLongObject *)(x))->ob_digit)
+      #endif
+    #else
+      #define __SOFAB_DIGITS 0
+      #define __sofab_ndigits(x) 0
+      #define __sofab_isneg(x)   1
+      #define __sofab_digits(x)  ((const digit *) 0)
+    #endif
+
+    static int __sofab_digits_ok = 0;   /* set by the self-test at import time */
+
+    /* Magnitude as a uint64_t. Returns 0 (leaving no exception set) when the
+       value does not fit, which is exactly the format's unsigned domain. */
+    static int __sofab_u64_digits(PyObject *x, uint64_t *out) {
+        Py_ssize_t n = __sofab_ndigits(x);
+        const digit *d = __sofab_digits(x);
+        uint64_t v = 0;
+        if (__sofab_isneg(x)) return 0;
+        while (n-- > 0) {
+            if (v > (~(uint64_t) 0 >> PyLong_SHIFT)) return 0;
+            v = (v << PyLong_SHIFT) | (uint64_t) d[n];
+        }
+        *out = v;
+        return 1;
+    }
+
+    static int __sofab_u64(PyObject *x, uint64_t *out) {
+        unsigned long long v;
+        if (__sofab_digits_ok) return __sofab_u64_digits(x, out);
+        v = __sofab_as_u64(x);
+        if (v == (unsigned long long) -1 && PyErr_Occurred()) { PyErr_Clear(); return 0; }
+        *out = (uint64_t) v;
+        return 1;
+    }
+
+    static int __sofab_i64(PyObject *x, int64_t *out) {
+        long long v;
+        uint64_t mag;
+        if (__sofab_digits_ok) {
+            int neg = __sofab_isneg(x);
+            Py_ssize_t n = __sofab_ndigits(x);
+            const digit *d = __sofab_digits(x);
+            mag = 0;
+            while (n-- > 0) {
+                if (mag > (~(uint64_t) 0 >> PyLong_SHIFT)) return 0;
+                mag = (mag << PyLong_SHIFT) | (uint64_t) d[n];
+            }
+            /* Two's complement: -2**63 is representable, +2**63 is not. */
+            if (neg) {
+                if (mag > (uint64_t) 1 << 63) return 0;
+                *out = (int64_t) (~mag + 1);
+            } else {
+                if (mag > (uint64_t) INT64_MAX) return 0;
+                *out = (int64_t) mag;
+            }
+            return 1;
+        }
+        v = __sofab_as_i64(x);
+        if (v == -1 && PyErr_Occurred()) { PyErr_Clear(); return 0; }
+        *out = (int64_t) v;
+        return 1;
+    }
+
+    static int __sofab_digits_selftest(void) {
+        static const unsigned long long probe[] = {
+            0ULL, 1ULL, 127ULL, 128ULL, 255ULL, 65535ULL,
+            ((unsigned long long) 1 << 30) - 1, (unsigned long long) 1 << 30,
+            ((unsigned long long) 1 << 32) - 1, (unsigned long long) 1 << 32,
+            (unsigned long long) 1 << 60, 0x9E3779B97F4A7C15ULL,
+            ~0ULL - 1, ~0ULL
+        };
+        static const long long sprobe[] = {
+            0, 1, -1, 127, -128, 65535, -65536,
+            (long long) 1 << 40, -((long long) 1 << 40),
+            (long long) 0x7FFFFFFFFFFFFFFFLL, (-(long long) 0x7FFFFFFFFFFFFFFFLL) - 1
+        };
+        size_t i;
+    #if !__SOFAB_DIGITS
+        return 0;
+    #else
+        __sofab_digits_ok = 1;      /* provisional: the probes below decide */
+        for (i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
+            PyObject *o = PyLong_FromUnsignedLongLong(probe[i]);
+            uint64_t got = 0;
+            int ok;
+            if (o == NULL) { PyErr_Clear(); goto fail; }
+            ok = __sofab_u64_digits(o, &got);
+            Py_DECREF(o);
+            if (!ok || got != (uint64_t) probe[i]) goto fail;
+        }
+        for (i = 0; i < sizeof(sprobe) / sizeof(sprobe[0]); i++) {
+            PyObject *o = PyLong_FromLongLong(sprobe[i]);
+            int64_t got = 0;
+            int ok;
+            if (o == NULL) { PyErr_Clear(); goto fail; }
+            ok = __sofab_i64(o, &got);
+            Py_DECREF(o);
+            if (!ok || got != (int64_t) sprobe[i]) goto fail;
+        }
+        {   /* The edges of both domains: what must be accepted, and what must
+               be *rejected* rather than wrapped. */
+            static const struct { const char *text; int u_ok; int i_ok; } edge[] = {
+                { "18446744073709551615",  1, 0 },   /*  2**64 - 1 */
+                { "18446744073709551616",  0, 0 },   /*  2**64     */
+                { "9223372036854775807",   1, 1 },   /*  2**63 - 1 */
+                { "9223372036854775808",   1, 0 },   /*  2**63     */
+                { "-9223372036854775808",  0, 1 },   /* -2**63     */
+                { "-9223372036854775809",  0, 0 },   /* -2**63 - 1 */
+                { "-1",                    0, 1 }
+            };
+            for (i = 0; i < sizeof(edge) / sizeof(edge[0]); i++) {
+                PyObject *o = PyLong_FromString(edge[i].text, NULL, 10);
+                uint64_t u; int64_t sv;
+                int u_got, i_got;
+                if (o == NULL) { PyErr_Clear(); goto fail; }
+                u_got = __sofab_u64_digits(o, &u);
+                i_got = __sofab_i64(o, &sv);
+                Py_DECREF(o);
+                if (u_got != edge[i].u_ok || i_got != edge[i].i_ok) goto fail;
+            }
+        }
+        return 1;
+    fail:
+        __sofab_digits_ok = 0;
+        return 0;
+    #endif
+    }
+    """
+    # Deliberately *unchecked* (``noexcept``): the ``cpython.long`` declarations
+    # carry Cython's own ``except? -1``, which routes every call site through
+    # Cython's generic conversion helper. Calling CPython directly lets the hot
+    # path decide for itself what a failure means — an out-of-range value must
+    # surface as SofaRangeError, not as the bare OverflowError left pending.
+    #
+    # They take a *borrowed* pointer so array element loops need no per-element
+    # incref/decref pair: nothing in such a loop can run Python code, so the
+    # list's own reference keeps every element alive.
+    unsigned long long _AsU64 "__sofab_as_u64" (PyObject*) noexcept
+    long long _AsI64 "__sofab_as_i64" (PyObject*) noexcept
+    bint _IsLong "PyLong_CheckExact" (PyObject*) noexcept
+    bint _IsFloat "PyFloat_CheckExact" (PyObject*) noexcept
+    double _AsDouble "PyFloat_AS_DOUBLE" (PyObject*) noexcept
+    # Range-checked conversions that report failure by return value instead of a
+    # pending OverflowError. See __sofab_u64 below.
+    bint _ToU64 "__sofab_u64" (PyObject*, uint64_t*) noexcept
+    bint _ToI64 "__sofab_i64" (PyObject*, int64_t*) noexcept
+    bint __sofab_digits_selftest()
+
+cdef extern from *:
+    # --- Word-at-a-time varint codec -----------------------------------------
+    #
+    # A varint is a byte-serial format, and decoding or encoding it one byte at a
+    # time is a chain of dependent shift/mask/branch steps — about eight
+    # instructions per byte, ten bytes for a full-width 64-bit value. But the
+    # continuation bits are just one bit in every byte, so a whole varint fits in
+    # a single 64-bit word: load (or store) eight bytes at once and move the
+    # 7-bit groups with three mask/shift steps, and the ten-step chain becomes a
+    # dozen straight-line instructions with no data-dependent branching at all.
+    #
+    # The transform pair below is exact and total, not an approximation of the
+    # byte loop: ``__sofab_gather7`` packs eight 7-bit groups down into the low
+    # 56 bits and ``__sofab_spread7`` is its inverse. Both are pure integer
+    # arithmetic, so the only platform assumption is that a byte sequence and a
+    # 64-bit word agree on order — i.e. little-endian, which is what the format
+    # is defined in anyway (§4). Where that cannot be established at compile
+    # time, or the compiler offers no bit-scan builtin, the flag below stays 0
+    # and the byte-serial paths are used unchanged.
+    """
+    #include <stdint.h>
+    #include <string.h>
+
+    #if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && \
+        __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ && \
+        (defined(__GNUC__) || defined(__clang__))
+      #define __SOFAB_SWAR 1
+      #define __sofab_bitlen(v)  (64 - __builtin_clzll(v))   /* v != 0 */
+      #define __sofab_ctz(v)     __builtin_ctzll(v)          /* v != 0 */
+    #elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+      #define __SOFAB_SWAR 1
+      #include <intrin.h>
+      static int __sofab_bitlen(unsigned __int64 v) {
+          unsigned long i; _BitScanReverse64(&i, v); return (int) i + 1;
+      }
+      static int __sofab_ctz(unsigned __int64 v) {
+          unsigned long i; _BitScanForward64(&i, v); return (int) i;
+      }
+    #else
+      #define __SOFAB_SWAR 0
+      #define __sofab_bitlen(v)  0
+      #define __sofab_ctz(v)     0
+    #endif
+
+    #define __SOFAB_MSBS  0x8080808080808080ULL
+
+    /* Eight 7-bit groups, one per byte, packed into the low 56 bits. */
+    static uint64_t __sofab_gather7(uint64_t x) {
+        x &= 0x7F7F7F7F7F7F7F7FULL;
+        x = (x & 0x007F007F007F007FULL) | ((x & 0x7F007F007F007F00ULL) >> 1);
+        x = (x & 0x00003FFF00003FFFULL) | ((x & 0x3FFF00003FFF0000ULL) >> 2);
+        x = (x & 0x000000000FFFFFFFULL) | ((x & 0x0FFFFFFF00000000ULL) >> 4);
+        return x;
+    }
+
+    /* The inverse: 56 payload bits back out into one 7-bit group per byte. */
+    static uint64_t __sofab_spread7(uint64_t x) {
+        x = (x & 0x000000000FFFFFFFULL) | ((x & 0x00FFFFFFF0000000ULL) << 4);
+        x = (x & 0x00003FFF00003FFFULL) | ((x & 0x0FFFC0000FFFC000ULL) << 2);
+        x = (x & 0x007F007F007F007FULL) | ((x & 0x3F803F803F803F80ULL) << 1);
+        return x;
+    }
+
+    static uint64_t __sofab_load8(const unsigned char *p) {
+        uint64_t w; memcpy(&w, p, 8); return w;
+    }
+
+    static void __sofab_store8(unsigned char *p, uint64_t w) {
+        memcpy(p, &w, 8);
+    }
+    """
+    int __SOFAB_SWAR
+    uint64_t __SOFAB_MSBS
+    uint64_t __sofab_gather7(uint64_t) noexcept nogil
+    uint64_t __sofab_spread7(uint64_t) noexcept nogil
+    uint64_t __sofab_load8(const unsigned char*) noexcept nogil
+    void __sofab_store8(unsigned char*, uint64_t) noexcept nogil
+    int __sofab_bitlen(uint64_t) noexcept nogil
+    int __sofab_ctz(uint64_t) noexcept nogil
+
+cdef extern from *:
+    # --- Field attributes as *slot* descriptors ------------------------------
+    #
+    # Reading ``field.id`` / ``field.type`` is the most repeated operation any
+    # consumer of the decoder performs — generated code touches both on every
+    # field — and it is the one part of the hot path that runs in the caller's
+    # bytecode, where the interpreter's inline caches decide the cost. CPython
+    # specializes an attribute that is a *member* descriptor (LOAD_ATTR_SLOT: a
+    # guarded load straight out of the object) but has no specialization for the
+    # *getset* descriptors Cython emits for ``cdef readonly`` attributes, which
+    # fall all the way back to the generic PyObject_GenericGetAttr path. Measured
+    # on CPython 3.12 that is about a 2x difference per attribute read.
+    #
+    # So the five attributes are re-published as member descriptors after the
+    # type exists. The offsets are not guessed blindly: the layout Cython emits
+    # for a ``cdef class`` whose only attributes are five ``object`` slots is the
+    # object head followed by those five pointers, and the installer *verifies*
+    # exactly that against a probe instance — both the total size and that every
+    # computed offset reads back the object the probe was constructed with —
+    # before publishing anything. If the layout is ever anything else the
+    # descriptors are simply not installed and the original getsets stay in
+    # place, so this can lose the optimization but cannot misread memory.
+    # Descriptors are read-only, matching ``cdef readonly``.
+    """
+    #if !defined(Py_LIMITED_API)
+    #include <structmember.h>
+    #ifndef Py_T_OBJECT_EX      /* spelling before CPython 3.12 */
+      #define Py_T_OBJECT_EX T_OBJECT_EX
+      #define Py_READONLY READONLY
+    #endif
+
+    static PyMemberDef __sofab_field_members[5];
+    static const char *const __sofab_field_names[5] = {
+        "id", "type", "size", "count", "subtype"
+    };
+
+    static int __sofab_field_slot_attrs(PyObject *type_obj, PyObject *probe) {
+        PyTypeObject *tp = (PyTypeObject *) type_obj;
+        const Py_ssize_t base = (Py_ssize_t) sizeof(PyObject);
+        const Py_ssize_t step = (Py_ssize_t) sizeof(PyObject *);
+        char *mem = (char *) probe;
+        Py_ssize_t i;
+
+        if (tp->tp_basicsize != base + 5 * step) return 0;
+        if (!Py_IS_TYPE(probe, tp)) return 0;
+        for (i = 0; i < 5; i++) {
+            PyObject *slot = *(PyObject **) (mem + base + i * step);
+            PyObject *want = PyObject_GetAttrString(probe, __sofab_field_names[i]);
+            int same;
+            if (want == NULL) { PyErr_Clear(); return 0; }
+            same = (slot == want);
+            Py_DECREF(want);
+            if (!same) return 0;
+        }
+        for (i = 0; i < 5; i++) {
+            PyObject *descr;
+            __sofab_field_members[i].name = (char *) __sofab_field_names[i];
+            __sofab_field_members[i].type = Py_T_OBJECT_EX;
+            __sofab_field_members[i].offset = base + i * step;
+            __sofab_field_members[i].flags = Py_READONLY;
+            __sofab_field_members[i].doc = NULL;
+            descr = PyDescr_NewMember(tp, &__sofab_field_members[i]);
+            if (descr == NULL) { PyErr_Clear(); return 0; }
+            if (PyDict_SetItemString(tp->tp_dict, __sofab_field_names[i], descr) < 0) {
+                Py_DECREF(descr);
+                PyErr_Clear();
+                return 0;
+            }
+            Py_DECREF(descr);
+        }
+        PyType_Modified(tp);
+        return 1;
+    }
+    #else
+    static int __sofab_field_slot_attrs(PyObject *type_obj, PyObject *probe) {
+        (void) type_obj; (void) probe; return 0;
+    }
+    #endif
+    """
+    bint __sofab_field_slot_attrs(object type_obj, object probe)
+
+cdef extern from "Python.h":
+    # Decodes UTF-8 straight out of the decoder's buffer, so a string field
+    # never materialises an intermediate ``bytes`` object.
+    str PyUnicode_DecodeUTF8(const char*, Py_ssize_t, const char*)
+    # The str's own UTF-8 form (cached on the object), so encoding a string does
+    # not allocate a ``bytes`` either.
+    const char* PyUnicode_AsUTF8AndSize(object, Py_ssize_t*) except NULL
 
 # Wire-format constants, enums, the Field descriptor and the error classes all
 # live in the shared pure-Python ``types`` module — reuse them verbatim so the
@@ -53,6 +456,13 @@ from .types import (
 # (``id``/``type``/``size``/``count``/``subtype``) but allocated at the C level,
 # which is dramatically cheaper than the pure-Python ``@dataclass`` on the
 # per-field decode hot path. Attribute reads are plain C-struct slot reads.
+#
+# One Field is built per decoded field and dropped again as soon as the caller
+# moves on, so allocation is a per-field cost: the freelist recycles the last 64
+# instances instead of round-tripping through the object allocator
+# (tp_alloc/PyObject_GC_Del) every time. Sized well past the fields a decode loop
+# holds at once, so the recycle hits on the steady state.
+@cython.freelist(64)
 cdef class Field:
     """Describes the field the decoder is currently positioned on.
 
@@ -80,6 +490,20 @@ cdef class Field:
                 and self.id == other.id and self.type == other.type
                 and self.size == other.size and self.count == other.count
                 and self.subtype == other.subtype)
+
+
+# Whether the digit-level int conversion passed its import-time self-test (see
+# __sofab_digits_selftest). ``False`` means every conversion goes through the
+# public CPython converters instead — slower, identical results.
+INT_DIGITS_FAST = __sofab_digits_selftest()
+
+
+# Republish the five attributes as slot descriptors (see __sofab_field_slot_attrs
+# above). The probe is built from five distinct objects so a layout that differs
+# in *order* is caught as surely as one that differs in size. Exposed for the
+# test suite; ``False`` simply means the getset descriptors are still in use.
+FIELD_SLOT_ATTRS = __sofab_field_slot_attrs(
+    Field, Field(object(), object(), object(), object(), object()))
 
 
 cdef object _ZERO = 0
@@ -143,6 +567,231 @@ cdef inline uint64_t _zigzag_encode(int64_t v) noexcept nogil:
 
 cdef inline int64_t _zigzag_decode(uint64_t u) noexcept nogil:
     return <int64_t>(u >> 1) ^ -<int64_t>(u & 1)
+
+
+# --- varint codec ------------------------------------------------------------
+#
+# Both directions have the same shape: a one-byte fast path (the common case for
+# ids, counts and small values), then a whole-word path for everything longer,
+# then the byte-serial fallback for platforms the word path cannot serve. All
+# three produce identical bytes and identical values — the word path is a
+# reformulation of the byte loop, not a different encoding.
+
+cdef inline int _varint_put(unsigned char* out, uint64_t value) noexcept nogil:
+    """Encode ``value`` at ``out`` (which must have room for 10 bytes) and return
+    the number of bytes written."""
+    cdef uint64_t rest
+    cdef unsigned char* q
+    cdef int n
+    if value < 0x80:                       # ids, counts, and small values
+        out[0] = <unsigned char>value
+        return 1
+    if __SOFAB_SWAR:
+        if value < (<uint64_t>1 << 56):
+            # Up to eight groups: one spread, one 8-byte store. The continuation
+            # bits are set on every byte but the last in a single mask.
+            n = (__sofab_bitlen(value) - 1) // 7 + 1
+            __sofab_store8(out, __sofab_spread7(value)
+                                | (__SOFAB_MSBS & (((<uint64_t>1) << (8 * (n - 1))) - 1)))
+            return n
+        # 2**56 and above: the low 56 bits fill all eight bytes, one or two more
+        # bytes carry the rest.
+        __sofab_store8(out, __sofab_spread7(value & <uint64_t>0x00FFFFFFFFFFFFFF)
+                            | __SOFAB_MSBS)
+        rest = value >> 56
+        if rest < 0x80:
+            out[8] = <unsigned char>rest
+            return 9
+        out[8] = <unsigned char>((rest & 0x7F) | 0x80)
+        out[9] = <unsigned char>(rest >> 7)
+        return 10
+    q = out
+    while value >= 0x80:
+        q[0] = <unsigned char>(value | 0x80)
+        q += 1
+        value >>= 7
+    q[0] = <unsigned char>value
+    return <int>(q + 1 - out)
+
+
+cdef struct _Varint:
+    uint64_t value
+    int used            # bytes consumed, or -1 for an overlong (>64-bit) varint
+
+
+cdef inline _Varint _varint_take(const unsigned char* p) noexcept nogil:
+    """Decode the varint at ``p``, returning its value and its byte length.
+
+    The caller must have proved at least 10 readable bytes are present, which is
+    the longest a varint can be — so this never has to test for the end of the
+    buffer, and a value that runs off it is impossible rather than checked for.
+    Reporting the overlong case through ``used`` rather than an exception keeps
+    the cursor in a register and this function ``nogil``.
+    """
+    cdef _Varint r
+    cdef Py_ssize_t at = 0
+    cdef unsigned char b = p[at]
+    cdef uint64_t w, msbs, value
+    cdef int shift, n
+    if b < 0x80:                           # ids, counts, and small values
+        r.value = b
+        r.used = 1
+        return r
+    if __SOFAB_SWAR:
+        w = __sofab_load8(p + at)
+        msbs = (~w) & __SOFAB_MSBS
+        if msbs:
+            # A byte without its continuation bit set ends the value; its
+            # position gives the length, and one gather yields the payload.
+            n = (__sofab_ctz(msbs) >> 3) + 1
+            r.value = __sofab_gather7(w) & ((((<uint64_t>1) << (7 * n)) - 1))
+            r.used = n
+            return r
+        # Eight continuation bytes: 56 bits so far, one or two bytes to go.
+        value = __sofab_gather7(w)
+        b = p[at + 8]
+        if b < 0x80:
+            r.value = value | ((<uint64_t>b) << 56)
+            r.used = 9
+            return r
+        value |= (<uint64_t>(b & 0x7F)) << 56
+        b = p[at + 9]
+        # Tenth byte: only bit 63 is still free, so anything above 0x01 either
+        # carries a payload bit past bit 63 or continues into an eleventh byte —
+        # both are the overlong (>64-bit) INVALID case (§4.1/§6.3, issue #43).
+        if b > 0x01:
+            r.used = -1
+            return r
+        r.value = value | ((<uint64_t>b) << 63)
+        r.used = 10
+        return r
+    value = b & 0x7F
+    shift = 7
+    at += 1
+    while shift < 63:
+        b = p[at]
+        at += 1
+        value |= (<uint64_t>(b & 0x7F)) << shift
+        if b < 0x80:
+            r.value = value
+            r.used = <int>at
+            return r
+        shift += 7
+    b = p[at]
+    if b > 0x01:
+        r.used = -1
+        return r
+    r.value = value | ((<uint64_t>b) << 63)
+    r.used = <int>(at + 1)
+    return r
+
+
+# --- Python int -> C int, with the format's range rule ------------------------
+#
+# Every value the encoder writes arrives as a Python object and has to end up in
+# a C register, range-checked. The obvious spelling — compare against the
+# UNSIGNED_MAX / SIGNED_* module constants, then cast — costs two Python
+# rich-comparisons per value, and the cast itself then re-walks the int: for a
+# full-width 64-bit value (three 30-bit digits) Cython's generic converter has no
+# digit-level fast path at all and falls back to a *third* pass through
+# PyObject_RichCompareBool + PyLong_AsUnsignedLong. That was the single largest
+# cost in the array-encode workload.
+#
+# These helpers collapse all of it into one CPython call for the overwhelmingly
+# common case (an exact ``int``): the converter is *itself* the range check — it
+# fails exactly on the values the format rejects — so out-of-range is read off
+# the pending OverflowError instead of being predicted by comparisons. Anything
+# that is not an exact int (bool, enum, numpy scalar, float, __index__ provider)
+# takes the original comparison path, so accepted-value semantics are unchanged.
+# Which value is out of range, as a plain int: the message text is only ever
+# needed on the error path, and a ``str`` argument would cost an incref/decref
+# pair on every element of every array instead.
+cdef int _WHAT_U = 0
+cdef int _WHAT_S = 1
+cdef int _WHAT_UA = 2
+cdef int _WHAT_SA = 3
+cdef tuple _WHATS = ("unsigned value", "signed value",
+                     "unsigned array value", "signed array value")
+
+cdef inline uint64_t _u64_elem(PyObject* p, int what) except? 0xDEAD:
+    cdef uint64_t r
+    if _IsLong(p) and _ToU64(p, &r):
+        return r
+    return _u64_other(<object>p, what)
+
+cdef inline int64_t _i64_elem(PyObject* p, int what) except? -0xDEAD:
+    cdef int64_t r
+    if _IsLong(p) and _ToI64(p, &r):
+        return r
+    return _i64_other(<object>p, what)
+
+cdef inline uint64_t _u64_arg(object value, int what=_WHAT_U) except? 0xDEAD:
+    return _u64_elem(<PyObject*>value, what)
+
+cdef inline int64_t _i64_arg(object value, int what=_WHAT_S) except? -0xDEAD:
+    return _i64_elem(<PyObject*>value, what)
+
+cdef uint64_t _u64_other(object value, int what) except? 0xDEAD:
+    # Cold: an exact int the converter rejected (out of the 64-bit domain), or a
+    # value that is not an exact int at all — the original comparison path, which
+    # accepts anything ``<uint64_t>`` accepts (bool, IntEnum, float, __index__).
+    if not PyLong_CheckExact(value) and 0 <= value <= UNSIGNED_MAX:
+        return <uint64_t>value
+    raise SofaRangeError("%s %d out of range" % (_WHATS[what], value))
+
+cdef int64_t _i64_other(object value, int what) except? -0xDEAD:
+    if not PyLong_CheckExact(value) and SIGNED_MIN <= value <= SIGNED_MAX:
+        return <int64_t>value
+    raise SofaRangeError("%s %d out of range" % (_WHATS[what], value))
+
+cdef inline uint64_t _id_arg(object field_id) except? 0xDEAD:
+    # Field ids are 0..ID_MAX (2**31-1), so the *value* range is narrower than
+    # what the converter itself rejects; the explicit bound stays, but on C ints.
+    cdef int64_t r
+    if _IsLong(<PyObject*>field_id):
+        if _ToI64(<PyObject*>field_id, &r):
+            if r < 0 or r > <int64_t>_ID_MAX:
+                raise SofaRangeError("id %d out of range 0..%d" % (field_id, _ID_MAX))
+            return <uint64_t>r
+    elif 0 <= field_id <= ID_MAX:
+        return <uint64_t>field_id
+    raise SofaRangeError("id %d out of range 0..%d" % (field_id, _ID_MAX))
+
+
+# --- array-input plumbing -----------------------------------------------------
+#
+# An array write is handed any iterable. Materialising it with ``list(values)``
+# is what the element loop needs — random access and a fixed length — but it is
+# also a full copy, and the overwhelmingly common input already *is* a list. So
+# take the caller's list as-is and pay the copy only for anything else.
+cdef inline list _as_list(object values):
+    if type(values) is list:
+        return <list>values
+    return list(values)
+
+cdef inline PyObject* _elem(list seq, Py_ssize_t i) except NULL:
+    # Element access with the length re-read every time. Converting an element
+    # can run arbitrary Python (a non-int with ``__index__``), which could shrink
+    # the very list being walked now that it is no longer a private copy; the
+    # count is already on the wire at this point, so a short read has to be an
+    # error rather than a silently truncated array.
+    if i >= PyList_GET_SIZE(seq):
+        raise SofaStateError("array shrank while it was being encoded")
+    return PyList_GET_ITEM(seq, i)
+
+cdef inline list _as_float_list(object values):
+    # A float array is packed straight into the output buffer, so every element
+    # must already be a float before the first byte is written: a ``__float__``
+    # running mid-pack could re-enter this encoder and reallocate the very buffer
+    # being written into. The check is a scan, not a copy — a list that is
+    # already all floats (the normal case) is used as-is, and anything else falls
+    # back to materialising the converted list up front, as before.
+    cdef list seq = _as_list(values)
+    cdef Py_ssize_t i, n = PyList_GET_SIZE(seq)
+    for i in range(n):
+        if not _IsFloat(PyList_GET_ITEM(seq, i)):
+            return [float(x) for x in seq]
+    return seq
 
 
 # =============================================================================
@@ -293,34 +942,25 @@ cdef class Encoder:
     cdef inline int _emit_varint(self, uint64_t value) except -1:
         # The hot path. Grow-mode writes straight into the C buffer; fixed-mode
         # encodes to a small stack scratch and hands it to the chunk-aware _put.
+        #
+        # Ten bytes of room is all _varint_put ever needs, so the capacity check
+        # happens once per value rather than once per byte.
         cdef unsigned char scratch[10]
-        cdef int i = 0
-        cdef unsigned char b
         if not self._is_fixed:
             self._ensure(10)
-            while True:
-                b = <unsigned char>(value & 0x7F)
-                value >>= 7
-                if value:
-                    self._out[self._len] = b | 0x80
-                    self._len += 1
-                else:
-                    self._out[self._len] = b
-                    self._len += 1
-                    return 0
-        else:
-            while True:
-                b = <unsigned char>(value & 0x7F)
-                value >>= 7
-                if value:
-                    scratch[i] = b | 0x80
-                    i += 1
-                else:
-                    scratch[i] = b
-                    i += 1
-                    break
-            self._put(scratch, <size_t>i)
+            self._len += <size_t>_varint_put(self._out + self._len, value)
             return 0
+        else:
+            self._put(scratch, <size_t>_varint_put(scratch, value))
+            return 0
+
+    cdef inline int _header_c(self, uint64_t field_id, int wtype) except -1:
+        # ``_header`` with the id already validated and in a C register — used by
+        # every write path, which converts the id exactly once (see _id_arg).
+        if self._npending:
+            self._commit_pending()
+        self._emit_varint((field_id << 3) | <uint64_t>wtype)
+        return 0
 
     cdef inline int _header(self, object field_id, int wtype) except -1:
         # The single choke point every field write passes through, and therefore
@@ -331,11 +971,7 @@ cdef class Encoder:
         # (which writes nothing) and closed by write_sequence_end /
         # write_sequence_end_keep (which emit the bare 0x07 themselves) -- so no
         # gate on wtype is needed and no writer can bypass the commit.
-        if field_id < 0 or field_id > ID_MAX:
-            raise SofaRangeError("id %d out of range 0..%d" % (field_id, _ID_MAX))
-        if self._npending:
-            self._commit_pending()
-        self._emit_varint((<uint64_t>field_id << 3) | <uint64_t>wtype)
+        self._header_c(_id_arg(field_id), wtype)
         return 0
 
     cdef int _commit_pending(self) except -1:
@@ -418,27 +1054,40 @@ cdef class Encoder:
     def write_unsigned(self, object field_id, object value):
         if not self._begin():
             return
+        cdef uint64_t fid
+        cdef uint64_t uv
         try:
-            if value < 0 or value > UNSIGNED_MAX:
-                raise SofaRangeError("unsigned value %d out of range" % value)
-            self._header(field_id, _WT_UNSIGNED)
-            self._emit_varint(<uint64_t>value)
+            uv = _u64_arg(value)          # value range first, as the pure engine does
+            fid = _id_arg(field_id)
+            self._header_c(fid, _WT_UNSIGNED)
+            self._emit_varint(uv)
         except SofaError as exc:
             self._fail(exc)
 
     def write_signed(self, object field_id, object value):
         if not self._begin():
             return
+        cdef uint64_t fid
+        cdef int64_t sv
         try:
-            if value < SIGNED_MIN or value > SIGNED_MAX:
-                raise SofaRangeError("signed value %d out of range" % value)
-            self._header(field_id, _WT_SIGNED)
-            self._emit_varint(_zigzag_encode(<int64_t>value))
+            sv = _i64_arg(value)          # value range first, as the pure engine does
+            fid = _id_arg(field_id)
+            self._header_c(fid, _WT_SIGNED)
+            self._emit_varint(_zigzag_encode(sv))
         except SofaError as exc:
             self._fail(exc)
 
     def write_bool(self, object field_id, object value):
-        self.write_unsigned(field_id, 1 if value else 0)
+        # A boolean is an unsigned 0/1 on the wire (§4.4). Written here rather
+        # than by delegating to write_unsigned: the delegation was a full Python
+        # method call per boolean, and the value needs no range check at all.
+        if not self._begin():
+            return
+        try:
+            self._header_c(_id_arg(field_id), _WT_UNSIGNED)
+            self._emit_varint(1 if value else 0)
+        except SofaError as exc:
+            self._fail(exc)
 
     def write_float32(self, object field_id, double value):
         cdef unsigned char buf[4]
@@ -456,15 +1105,21 @@ cdef class Encoder:
         # InvalidArgument outcome (CORELIB_PLAN §6.4 / MESSAGE_SPEC §8). Python
         # str is a Unicode type, hence always strict; SOFAB_STRICT_UTF8 is a
         # no-op and omitted. Mirrors the pure-Python Encoder.write_string.
+        #
+        # The payload comes from the str's own (cached) UTF-8 form rather than a
+        # fresh ``text.encode("utf-8")`` bytes object: the bytes were only ever a
+        # vehicle for a pointer and a length, and this is the same encoder, same
+        # strictness, one allocation fewer per string field.
         if not self._begin():
             return
-        cdef bytes data
+        cdef const char* utf8
+        cdef Py_ssize_t n
         try:
-            data = text.encode("utf-8")
+            utf8 = PyUnicode_AsUTF8AndSize(text, &n)
         except UnicodeEncodeError as exc:
             self._fail(SofaRangeError("string field is not valid UTF-8: %s" % exc))
             return
-        self._write_fixlen_bytes(field_id, data, _ST_STRING)
+        self._write_fixlen_raw(field_id, <const unsigned char*>utf8, <size_t>n, _ST_STRING)
 
     def write_bytes(self, object field_id, object data):
         cdef bytes b = bytes(data)
@@ -499,35 +1154,28 @@ cdef class Encoder:
     def write_unsigned_array(self, object field_id, values):
         if not self._begin():
             return
-        cdef object v
         cdef list seq
+        cdef Py_ssize_t i, count
         try:
-            seq = list(values)
-            self._array_header(field_id, _WT_ARRAY_UNSIGNED, len(seq))
-            # Convert straight to uint64 in C; an out-of-range element makes the
-            # cast raise OverflowError, which we surface as SofaRangeError below.
-            # This spares the hot loop two Python rich-comparisons per element.
-            try:
-                for v in seq:
-                    self._emit_varint(<uint64_t>v)
-            except OverflowError:
-                raise SofaRangeError("unsigned array value out of range")
+            seq = _as_list(values)
+            count = PyList_GET_SIZE(seq)
+            self._array_header(field_id, _WT_ARRAY_UNSIGNED, count)
+            for i in range(count):
+                self._emit_varint(_u64_elem(_elem(seq, i), _WHAT_UA))
         except SofaError as exc:
             self._fail(exc)
 
     def write_signed_array(self, object field_id, values):
         if not self._begin():
             return
-        cdef object v
         cdef list seq
+        cdef Py_ssize_t i, count
         try:
-            seq = list(values)
-            self._array_header(field_id, _WT_ARRAY_SIGNED, len(seq))
-            try:
-                for v in seq:
-                    self._emit_varint(_zigzag_encode(<int64_t>v))
-            except OverflowError:
-                raise SofaRangeError("signed array value out of range")
+            seq = _as_list(values)
+            count = PyList_GET_SIZE(seq)
+            self._array_header(field_id, _WT_ARRAY_SIGNED, count)
+            for i in range(count):
+                self._emit_varint(_zigzag_encode(_i64_elem(_elem(seq, i), _WHAT_SA)))
         except SofaError as exc:
             self._fail(exc)
 
@@ -546,8 +1194,8 @@ cdef class Encoder:
         cdef unsigned char* region
         cdef double d
         try:
-            seq = [float(x) for x in values]
-            count = len(seq)
+            seq = _as_float_list(values)
+            count = PyList_GET_SIZE(seq)
             self._array_header(field_id, _WT_ARRAY_FIXLEN, count)
             # §4.8: the fixlen_word is ALWAYS emitted (even for an empty array),
             # then the packed payload (zero bytes when empty).
@@ -560,20 +1208,18 @@ cdef class Encoder:
                 region = self._out + self._len
                 if elem_size == 4:
                     for i in range(count):
-                        _pack_f32(<double>seq[i], region + i * 4)
+                        _pack_f32(_AsDouble(PyList_GET_ITEM(seq, i)), region + i * 4)
                 else:
                     for i in range(count):
-                        _pack_f64(<double>seq[i], region + i * 8)
+                        _pack_f64(_AsDouble(PyList_GET_ITEM(seq, i)), region + i * 8)
                 self._len += <size_t>(count * elem_size)
             else:
                 if elem_size == 4:
                     for i in range(count):
-                        d = <double>seq[i]
-                        self._put_f32(d)
+                        self._put_f32(_AsDouble(PyList_GET_ITEM(seq, i)))
                 else:
                     for i in range(count):
-                        d = <double>seq[i]
-                        self._put_f64(d)
+                        self._put_f64(_AsDouble(PyList_GET_ITEM(seq, i)))
         except SofaError as exc:
             self._fail(exc)
         return 0
@@ -599,6 +1245,12 @@ cdef class Encoder:
 
     # --- sequences ----------------------------------------------------------
 
+    # The module disables keyword arguments so that the zero-argument methods —
+    # the ones the decode loop calls per field — can use CPython's METH_NOARGS
+    # calling convention, which the interpreter specializes. That trade is only
+    # free where there is no keyword to pass, so the two methods that take one
+    # argument keep accepting it by name, exactly as the pure engine does.
+    @cython.always_allow_keywords(True)
     def write_sequence_begin_lazy(self, object field_id):
         # Open a sequence and hold its header back until it turns out to have
         # content (MESSAGE_SPEC S2). See sofab.encoder.Encoder for the contract.
@@ -736,11 +1388,18 @@ cdef class Decoder:
     cdef object _max_string_len
     cdef object _max_blob_len
     cdef bytes _buf                 # owns the bytes the pointer indexes into
+    # Owns a fixlen payload that had to be assembled across refills, for as long
+    # as a pointer into it can still be in use (see _take_fixlen_ptr).
+    cdef bytes _spill
     cdef const unsigned char* _p
     cdef Py_ssize_t _n
     cdef Py_ssize_t _pos
     cdef int _depth
     cdef object _cur
+    # Wire type of ``_cur`` as a plain int (-1 before the first field / at EOF),
+    # so the internal dispatch in skip()/drive() compares C ints instead of
+    # rich-comparing WireType members.
+    cdef int _cur_wtype
     # pending unconsumed value
     cdef int _pk                    # pending kind
     cdef int _pend_wtype
@@ -761,6 +1420,8 @@ cdef class Decoder:
         self._pos = 0
         self._depth = 0
         self._cur = None
+        self._cur_wtype = -1
+        self._spill = None
         self._pk = _PEND_NONE
 
     cdef inline void _rebind(self, bytes newbuf):
@@ -792,7 +1453,22 @@ cdef class Decoder:
         self._pos = 0
         return True
 
-    cdef uint64_t _varint(self) except? 0xDEAD:
+    cdef inline uint64_t _varint(self) except? 0xDEAD:
+        # Fast path: a varint is at most 10 bytes, so with that many buffered the
+        # whole value is known to be present and the per-byte "is there another
+        # byte?" test (and the refill machinery behind it) disappears. Only the
+        # tail of the buffer — where a value may genuinely straddle a refill —
+        # needs the careful loop.
+        cdef _Varint v
+        if self._n - self._pos >= 10:
+            v = _varint_take(self._p + self._pos)
+            if v.used < 0:
+                raise SofaDecodeError("overlong varint")
+            self._pos += v.used
+            return v.value
+        return self._varint_refill()
+
+    cdef uint64_t _varint_refill(self) except? 0xDEAD:
         cdef Py_ssize_t pos = self._pos
         cdef const unsigned char* p = self._p
         cdef Py_ssize_t n = self._n
@@ -865,63 +1541,57 @@ cdef class Decoder:
             self._pos = 0
         return bytes(acc[:n])
 
-    cdef list _read_varints(self, Py_ssize_t count):
-        # Build the result incrementally rather than pre-sizing to the wire count.
-        # ``count`` is attacker-controlled and capped only at ARRAY_MAX (2^31), so
-        # PyList_New(count) would try to allocate ~16 GB of NULL slots for a tiny
-        # hostile message claiming count = 2^31 before a single element byte is
-        # read (amplification DoS, issue #31). Appending grows the list only as
-        # elements are actually decoded, so a truncated oversize claim runs the
-        # reader dry and raises SofaIncompleteError promptly. (When a caller sets
-        # max_array_count the count is already bounded in next(); this keeps the
-        # unconfigured default safe too.)
-        cdef list out = []
-        cdef Py_ssize_t i = 0
+    cdef list _read_varints(self, Py_ssize_t count, bint zigzag):
+        # Decode ``count`` consecutive varints into a list. ``zigzag`` folds the
+        # signed-array transform into this same pass, so a signed array is one
+        # walk producing one list rather than a list of raw values rebuilt into a
+        # second list of decoded ones.
+        #
+        # The result is pre-sized, but never on the strength of the wire count
+        # alone: ``count`` is attacker-controlled and capped only at ARRAY_MAX
+        # (2^31), so PyList_New(count) would let a tiny hostile message claiming
+        # count = 2^31 demand ~16 GB of NULL slots before a single element byte
+        # is read (amplification DoS, issue #31). Each element occupies at least
+        # one wire byte, so the bytes actually *buffered* are an upper bound on
+        # the elements actually present — pre-size to that and the allocation
+        # stays proportional to data really received, while the fully-buffered
+        # common case still pre-sizes exactly once. Anything beyond it (a
+        # chunk-fed reader delivering more as we go) falls back to appending.
         cdef Py_ssize_t pos = self._pos
         cdef const unsigned char* p = self._p
         cdef Py_ssize_t n = self._n
-        cdef unsigned char b
+        cdef Py_ssize_t prealloc = n - pos
+        cdef Py_ssize_t i = 0
+        cdef _Varint v
         cdef uint64_t result
-        cdef int shift
-        cdef int room
+        cdef object item
+        if prealloc > count:
+            prealloc = count
+        cdef list out = PyList_New(prealloc)
         while i < count:
-            if pos >= n:
+            if n - pos >= 10:
+                # Whole element guaranteed buffered: no per-byte bounds test.
+                v = _varint_take(p + pos)
+                if v.used < 0:
+                    raise SofaDecodeError("overlong varint")
+                pos += v.used
+                result = v.value
+            else:
+                # Near the end of the buffer an element may straddle a refill.
                 self._pos = pos
-                if not self._need(1):
-                    raise SofaIncompleteError("truncated varint")
+                result = self._varint_refill()
                 p = self._p
                 pos = self._pos
                 n = self._n
-            b = p[pos]
-            pos += 1
-            if b < 0x80:
-                out.append(PyLong_FromUnsignedLongLong(b))
-                i += 1
-                continue
-            result = b & 0x7F
-            shift = 7
-            while True:
-                if pos >= n:
-                    self._pos = pos
-                    if not self._need(1):
-                        raise SofaIncompleteError("truncated varint")
-                    p = self._p
-                    pos = self._pos
-                    n = self._n
-                b = p[pos]
-                pos += 1
-                # Reject an overlong (>64-bit) varint before OR-ing (see
-                # ``_varint`` above; §4.1/§6.3, issue #43).
-                room = 64 - shift
-                if room < 7 and (b & 0x7F) >> room:
-                    raise SofaDecodeError("overlong varint")
-                result |= (<uint64_t>(b & 0x7F)) << shift
-                if b < 0x80:
-                    break
-                shift += 7
-                if shift >= 64:
-                    raise SofaDecodeError("overlong varint")
-            out.append(PyLong_FromUnsignedLongLong(result))
+            if zigzag:
+                item = PyLong_FromLongLong(_zigzag_decode(result))
+            else:
+                item = PyLong_FromUnsignedLongLong(result)
+            if i < prealloc:
+                Py_INCREF(item)
+                PyList_SET_ITEM(out, i, item)
+            else:
+                PyList_Append(out, item)
             i += 1
         self._pos = pos
         return out
@@ -952,6 +1622,12 @@ cdef class Decoder:
         return self._cur
 
     def next(self):
+        return self._next_field()
+
+    cdef object _next_field(self):
+        # The body of ``next()``, callable from C: ``skip()`` and ``drive()``
+        # both iterate fields, and going through the Python method wrapper for
+        # every one of them costs a full attribute lookup and call frame.
         cdef uint64_t header
         cdef int wtype
         cdef object field_id
@@ -962,14 +1638,16 @@ cdef class Decoder:
         if self._pk != _PEND_NONE:
             self._skip_pending()
 
-        if not self._need(1):
+        if self._pos >= self._n and not self._need(1):
             if self._depth != 0:
                 raise SofaIncompleteError("truncated: unbalanced sequence")
+            self._cur_wtype = -1
             return None
 
         header = self._varint()
         wtype = <int>(header & 0x07)
         fid = header >> 3
+        self._cur_wtype = wtype
 
         if wtype == _WT_SEQUENCE_END:
             if self._depth <= 0:
@@ -1125,10 +1803,10 @@ cdef class Decoder:
 
     def skip(self):
         cdef int target
-        if self._cur is not None and self._cur.type == _WT[_WT_SEQUENCE_START]:
+        if self._cur_wtype == _WT_SEQUENCE_START:
             target = self._depth - 1
             while self._depth > target:
-                if self.next() is None:
+                if self._next_field() is None:
                     raise SofaIncompleteError("truncated sequence")
             return
         if self._pk != _PEND_NONE:
@@ -1159,17 +1837,33 @@ cdef class Decoder:
         self._pk = _PEND_NONE
         return self._read_exact(<Py_ssize_t>self._pend_size)
 
+    cdef const unsigned char* _take_fixlen_ptr(self, int subtype, Py_ssize_t n) except NULL:
+        # Fixlen payload as a pointer instead of a ``bytes``. When the payload is
+        # already buffered — the ordinary case — the value can be built straight
+        # off the buffer, so the copy the intermediate ``bytes`` object used to
+        # cost disappears. When it is not (a chunk-fed reader mid-payload), fall
+        # back to _read_exact and park its object in ``_spill``, which owns it
+        # for as long as the caller can still hold the pointer.
+        if self._pk != _PEND_FIXLEN:
+            raise SofaStateError("current field is not a fixlen value")
+        if self._pend_subtype != subtype:
+            raise SofaStateError("fixlen subtype does not match the requested read")
+        self._pk = _PEND_NONE
+        cdef const unsigned char* p
+        if self._n - self._pos >= n:
+            self._spill = None
+            p = self._p + self._pos
+            self._pos += n
+            return p
+        self._spill = self._read_exact(n)
+        return <const unsigned char*>PyBytes_AS_STRING(self._spill)
+
     def float32(self):
-        cdef bytes data = self._take_fixlen(_ST_FP32)
-        if PyBytes_GET_SIZE(data) != 4:
-            raise SofaDecodeError("fp32 payload must be 4 bytes")
-        return _unpack_f32(<const unsigned char*>PyBytes_AS_STRING(data))
+        # Width is settled at header time (§4.6/§7), so _pend_size is 4 here.
+        return _unpack_f32(self._take_fixlen_ptr(_ST_FP32, 4))
 
     def float64(self):
-        cdef bytes data = self._take_fixlen(_ST_FP64)
-        if PyBytes_GET_SIZE(data) != 8:
-            raise SofaDecodeError("fp64 payload must be 8 bytes")
-        return _unpack_f64(<const unsigned char*>PyBytes_AS_STRING(data))
+        return _unpack_f64(self._take_fixlen_ptr(_ST_FP64, 8))
 
     def fixlen_len(self):
         # Peek the current fixlen field's payload byte length (from its length
@@ -1182,14 +1876,29 @@ cdef class Decoder:
         return self._pend_size
 
     def string(self):
-        cdef bytes raw = self._take_fixlen(_ST_STRING)
+        cdef Py_ssize_t n
+        cdef const unsigned char* p
+        if self._pk != _PEND_FIXLEN:
+            raise SofaStateError("current field is not a fixlen value")
+        n = <Py_ssize_t>self._pend_size      # bounded by FIXLEN_MAX in next()
+        p = self._take_fixlen_ptr(_ST_STRING, n)
         try:
-            return raw.decode("utf-8")
+            # Decoded straight off the buffer: strict UTF-8 (no ``errors=``), so
+            # an invalid payload raises rather than being replaced (§6.4).
+            return PyUnicode_DecodeUTF8(<const char*>p, n, NULL)
         except UnicodeDecodeError as exc:
             raise SofaDecodeError("invalid UTF-8 in string field") from exc
 
     def bytes(self):
-        return self._take_fixlen(_ST_BLOB)
+        cdef Py_ssize_t n
+        cdef const unsigned char* p
+        if self._pk != _PEND_FIXLEN:
+            raise SofaStateError("current field is not a fixlen value")
+        n = <Py_ssize_t>self._pend_size
+        p = self._take_fixlen_ptr(_ST_BLOB, n)
+        if self._spill is not None:
+            return self._spill      # already an exact-size bytes; hand it over
+        return PyBytes_FromStringAndSize(<const char*>p, n)
 
     # --- array reads --------------------------------------------------------
 
@@ -1201,19 +1910,11 @@ cdef class Decoder:
 
     def read_unsigned_array(self):
         cdef uint64_t count = self._take_varray(_WT_ARRAY_UNSIGNED)
-        return self._read_varints(<Py_ssize_t>count)
+        return self._read_varints(<Py_ssize_t>count, False)
 
     def read_signed_array(self):
         cdef uint64_t count = self._take_varray(_WT_ARRAY_SIGNED)
-        cdef list raw = self._read_varints(<Py_ssize_t>count)
-        cdef Py_ssize_t i
-        cdef list out = PyList_New(<Py_ssize_t>count)
-        cdef object item
-        for i in range(<Py_ssize_t>count):
-            item = PyLong_FromLongLong(_zigzag_decode(<uint64_t><object>raw[i]))
-            Py_INCREF(item)
-            PyList_SET_ITEM(out, i, item)
-        return out
+        return self._read_varints(<Py_ssize_t>count, True)
 
     cdef _take_farray(self, int subtype):
         if self._pk != _PEND_FARRAY:
@@ -1261,27 +1962,30 @@ cdef class Decoder:
 
     # --- visitor driver -----------------------------------------------------
 
+    @cython.always_allow_keywords(True)
     def drive(self, visitor):
+        # Dispatch on the C wire type rather than rich-comparing the WireType
+        # member against up to eight candidates per field.
         cdef object f
-        cdef object t
+        cdef int t
         cdef object st
         while True:
-            f = self.next()
+            f = self._next_field()
             if f is None:
                 break
-            t = f.type
-            if t == _WT[_WT_SEQUENCE_END]:
+            t = self._cur_wtype
+            if t == _WT_SEQUENCE_END:
                 visitor.on_sequence_end()
-            elif t == _WT[_WT_SEQUENCE_START]:
+            elif t == _WT_SEQUENCE_START:
                 if visitor.on_sequence_begin(f.id) is False:
                     self.skip()
             elif visitor.on_field(f) is False:
                 self.skip()
-            elif t == _WT[_WT_UNSIGNED]:
+            elif t == _WT_UNSIGNED:
                 visitor.on_unsigned(f.id, self.unsigned())
-            elif t == _WT[_WT_SIGNED]:
+            elif t == _WT_SIGNED:
                 visitor.on_signed(f.id, self.signed())
-            elif t == _WT[_WT_FIXLEN]:
+            elif t == _WT_FIXLEN:
                 st = f.subtype
                 if st == _ST[_ST_FP32]:
                     visitor.on_float32(f.id, self.float32())
@@ -1291,9 +1995,9 @@ cdef class Decoder:
                     visitor.on_string(f.id, self.string())
                 else:
                     visitor.on_bytes(f.id, self.bytes())
-            elif t == _WT[_WT_ARRAY_UNSIGNED]:
+            elif t == _WT_ARRAY_UNSIGNED:
                 visitor.on_unsigned_array(f.id, self.read_unsigned_array())
-            elif t == _WT[_WT_ARRAY_SIGNED]:
+            elif t == _WT_ARRAY_SIGNED:
                 visitor.on_signed_array(f.id, self.read_signed_array())
             else:  # ARRAY_FIXLEN
                 if f.subtype == _ST[_ST_FP32]:

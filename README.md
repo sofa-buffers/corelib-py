@@ -290,23 +290,30 @@ sides so it is apples-to-apples with the SofaBuffers pull API:
 
 ```bash
 python bench/perfbench.py time            # throughput on this machine, MB/s (MB = 1e6)
+python bench/perfbench.py perf            # per-op cost for the shared 12-field message
+bash  bench/run_callgrind.sh              # instructions/op (Callgrind) — clock-independent
 pip install protobuf                      # optional; the column is dropped if absent
 python bench/compare_protobuf.py          # best-of-5 MB/s table
 ```
+
+`time` / `perf` measure this machine and move with its load; `run_callgrind.sh`
+counts instructions retired, which is deterministic and comparable across hosts,
+so it is the one to trust when judging a change to the library itself.
 
 Representative result (throughput MB/s, higher is better; one x86-64 host,
 CPython 3.12 — the *ratios* are the point):
 
 | Workload | sofab **native** | sofab pure | protobuf (upb) | native vs protobuf |
 |----------|-----------------:|-----------:|---------------:|:------------------:|
-| encode: u64 array (1000) | **≈300** | ≈9 | ≈190 | **≈1.6× faster** |
-| encode: typical message  | **≈14**  | ≈4.5 | ≈10 | **≈1.5× faster** |
-| decode: u64 array (1000) | **≈285** | ≈6.7 | ≈180 | **≈1.6× faster** |
-| decode: typical message  | ≈7.3     | ≈2.0 | ≈8.6 | ≈0.85× (see note) |
+| encode: u64 array (1000) | **≈840** | ≈11 | ≈160 | **≈5× faster** |
+| encode: typical message  | **≈18**  | ≈4.4 | ≈10 | **≈1.7× faster** |
+| decode: u64 array (1000) | **≈460** | ≈7.8 | ≈195 | **≈2.4× faster** |
+| decode: typical message  | ≈9.2     | ≈2.1 | ≈9.0 | ≈1.0× (see note) |
 
-The native accelerator is **~15–45× faster than the pure-Python fallback** and
-beats protobuf on encode and array-heavy decode. The one workload where protobuf
-edges ahead is decoding a *tiny* mixed message: the streaming **pull** API crosses
-the Python↔C boundary twice per field (`next()` then a typed read), whereas
-protobuf parses the whole message in one C call — an inherent pull-vs-parse-tree
-trade-off that only shows on very small messages.
+The native accelerator is **~4× faster than the pure-Python fallback on a small
+mixed message and ~60–75× on array-heavy ones**, and beats protobuf everywhere
+except the smallest decode, where the two are level. That last workload is where
+the streaming **pull** API costs the most: it crosses the Python↔C boundary twice
+per field (`next()` then a typed read), whereas protobuf parses the whole message
+in one C call — an inherent pull-vs-parse-tree trade-off that only shows on very
+small messages, and the price of never having to hold one in memory.

@@ -27,6 +27,15 @@ CSRC = os.path.join("src", "sofab", "_speedups.c")
 # Allow an explicit opt-out (e.g. to build a pure-Python-only wheel/sdist).
 _DISABLE = os.environ.get("SOFAB_DISABLE_NATIVE") == "1"
 
+# The accelerator exists only to be fast, so it is compiled for speed rather
+# than at the interpreter's default (usually ``-O2``): the hot paths are tight
+# varint/buffer loops that benefit from the extra inlining and unrolling ``-O3``
+# enables. Both flags are understood by every compiler that can build CPython
+# extensions on the respective platform, and the extension is ``optional=True``
+# anyway — a toolchain that rejects them falls back to pure Python rather than
+# failing the install.
+_OPT_FLAGS = ["/O2"] if sys.platform == "win32" else ["-O3"]
+
 
 def _make_extension() -> list[Extension]:
     if _DISABLE:
@@ -47,6 +56,7 @@ def _make_extension() -> list[Extension]:
     ext = Extension(
         "sofab._speedups",
         sources=[source],
+        extra_compile_args=list(_OPT_FLAGS),
         optional=True,  # never fail the whole build if this ext won't compile
     )
     if source == PYX:
