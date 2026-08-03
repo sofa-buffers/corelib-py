@@ -122,7 +122,16 @@ class SofaLimitError(SofaError):
 
 
 class SofaRangeError(SofaError):
-    """A value (or id/count) is outside the permitted range on encode."""
+    """A value (or id/count) is not writable on encode — the ``InvalidArgument``
+    outcome of CORELIB_PLAN §6.3.
+
+    Either it is outside the permitted range, or it is not an integer at all:
+    integer fields accept whatever Python considers losslessly an integer (any
+    object with ``__index__`` — ``int``, ``bool``, ``IntEnum``, NumPy integers),
+    and refuse everything else rather than silently truncating it. A ``float`` is
+    therefore rejected, ``3.0`` included; convert explicitly with ``int(x)`` if
+    that is what you mean.
+    """
 
 
 class SofaStateError(SofaError):

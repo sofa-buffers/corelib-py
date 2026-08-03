@@ -15,6 +15,7 @@ have a compiler.
 
 from __future__ import annotations
 
+import enum
 import inspect
 import io
 
@@ -158,6 +159,121 @@ def test_signed_domain_rejected(enc_cls, value):
     enc = enc_cls()
     with pytest.raises(SofaRangeError):
         enc.write_signed(1, value)
+
+
+# --- what counts as an integer (issue #55) -----------------------------------
+#
+# Both engines accept exactly what Python accepts where an integer is required:
+# an object with __index__. A float has none — it cannot become an integer
+# without discarding information — so it is refused rather than truncated.
+
+
+class _Indexable:
+    """Stands in for a third-party integer type (NumPy scalar, etc.)."""
+
+    def __index__(self) -> int:
+        return 5
+
+
+class _FloatOnly:
+    """Convertible to a number, but not losslessly to an integer."""
+
+    def __float__(self) -> float:
+        return 5.0
+
+    def __int__(self) -> int:      # __int__ is lossy by design; not enough
+        return 5
+
+
+class _Enum(enum.IntEnum):
+    FIVE = 5
+
+
+INTEGRAL = [5, True, False, _Enum.FIVE, _Indexable()]
+NON_INTEGRAL = [3.7, 3.0, -0.5, float("nan"), float("inf"), _FloatOnly(), "5", b"5", None, [5]]
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("value", INTEGRAL)
+def test_integral_values_are_accepted(enc_cls, value):
+    enc = enc_cls()
+    enc.write_unsigned(1, value)
+    enc.write_signed(2, value)
+    enc.write_unsigned_array(3, [value])
+    enc.write_signed_array(4, [value])
+    enc.flush()
+    dec = NativeDecoder(reader(enc.getvalue()))
+    expected = int(value)
+    assert (dec.next() is not None) and dec.unsigned() == expected
+    assert (dec.next() is not None) and dec.signed() == expected
+    assert (dec.next() is not None) and dec.read_unsigned_array() == [expected]
+    assert (dec.next() is not None) and dec.read_signed_array() == [expected]
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("value", NON_INTEGRAL)
+def test_non_integral_values_are_refused_not_truncated(enc_cls, value):
+    """A value that is not losslessly an integer must never reach the wire as a
+    silently truncated one — that would change what the caller asked to send in
+    a way the receiver cannot detect."""
+    for method, args in (
+        ("write_unsigned", (1, value)),
+        ("write_signed", (1, value)),
+        ("write_unsigned_array", (1, [value])),
+        ("write_signed_array", (1, [value])),
+        ("write_unsigned", (value, 1)),          # also as a field id
+        ("write_sequence_begin_lazy", (value,)),  # the id that is held back
+    ):
+        enc = enc_cls()
+        with pytest.raises(SofaRangeError):
+            getattr(enc, method)(*args)
+
+
+@pytest.mark.parametrize("value", NON_INTEGRAL + [1 << 64, -1])
+def test_both_engines_agree_on_every_rejection(value):
+    """Whether a value is writable must not depend on which engine is loaded."""
+    outcomes = []
+    for cls in ENCODERS:
+        enc = cls()
+        try:
+            enc.write_unsigned(1, value)
+            enc.flush()
+            outcomes.append(("ok", enc.getvalue()))
+        except Exception as exc:                 # noqa: BLE001 - the type is the point
+            outcomes.append(("raised", type(exc).__name__))
+    assert outcomes[0] == outcomes[1]
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("value", [_Indexable(), 3.7])
+def test_integer_rule_holds_over_a_fixed_buffer_too(enc_cls, value):
+    """The fixed-buffer model runs its own element loop and its own scalar path;
+    both apply the same rule as the growable one."""
+    accepted = hasattr(type(value), "__index__")
+    for method, args in (
+        ("write_unsigned", (1, value)),
+        ("write_signed", (1, value)),
+        ("write_unsigned_array", (1, [value])),
+        ("write_signed_array", (1, [value])),
+    ):
+        enc = enc_cls.over_buffer(bytearray(64), 0)
+        if accepted:
+            getattr(enc, method)(*args)
+            assert enc.bytes_used() > 0
+        else:
+            with pytest.raises(SofaRangeError):
+                getattr(enc, method)(*args)
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_rejection_is_a_sofa_error_so_sticky_mode_latches_it(enc_cls):
+    """A refused value has to travel the same path as any other invalid
+    argument, or sticky mode would let it escape as a bare TypeError."""
+    enc = enc_cls(sticky=True)
+    enc.write_unsigned(1, 3.7)
+    enc.write_unsigned(2, 5)                     # suppressed: the error latched
+    assert isinstance(enc.error, SofaRangeError)
+    assert enc.getvalue() == b""
 
 
 @pytest.mark.parametrize("enc_cls", ENCODERS)
