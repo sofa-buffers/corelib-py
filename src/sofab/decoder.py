@@ -221,6 +221,7 @@ class Decoder:
         float path already reads its payload first (``read_float32_array``); this
         brings the varint path in line."""
         out: list[int] = []
+        append = out.append
         buf = self._buf
         pos = self._pos
         n = len(buf)
@@ -236,7 +237,7 @@ class Decoder:
             b = buf[pos]
             pos += 1
             if b < 0x80:  # one-byte element
-                out.append(b)
+                append(b)
                 i += 1
                 continue
             result = b & 0x7F
@@ -257,7 +258,7 @@ class Decoder:
                 shift += 7
                 if shift >= 64:
                     raise SofaDecodeError("varint overflow")
-            out.append(result & MASK64)
+            append(result & MASK64)
             i += 1
         self._pos = pos
         return out
@@ -623,7 +624,9 @@ class Decoder:
         Raises :class:`SofaStateError` if the field is not a signed array.
         """
         count = self._take_varray(WireType.ARRAY_SIGNED)
-        return [zigzag_decode(v) for v in self._read_varints(count)]
+        # ZigZag inlined rather than calling zigzag_decode per element: the
+        # transform is two operations, the call around it was the expensive part.
+        return [(v >> 1) ^ -(v & 1) for v in self._read_varints(count)]
 
     def _take_farray(self, subtype: FixlenSubtype) -> tuple[int, int]:
         pending = self._pending

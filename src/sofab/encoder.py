@@ -346,11 +346,23 @@ class Encoder:
         try:
             seq = list(values)
             self._array_header(field_id, WireType.ARRAY_UNSIGNED, len(seq))
-            emit = self._emit_varint
-            for v in seq:
-                if v < 0 or v > UNSIGNED_MAX:
-                    raise SofaRangeError(f"unsigned array value {v} out of range")
-                emit(v)
+            if self._fixed is None:
+                # Hot path: the varint codec is inlined over the whole array so
+                # each element costs a loop iteration rather than a Python call.
+                buf = self._buf
+                for v in seq:
+                    if v < 0 or v > UNSIGNED_MAX:
+                        raise SofaRangeError(f"unsigned array value {v} out of range")
+                    while v >= 0x80:
+                        buf.append((v & 0x7F) | 0x80)
+                        v >>= 7
+                    buf.append(v)
+            else:
+                emit = self._emit_varint
+                for v in seq:
+                    if v < 0 or v > UNSIGNED_MAX:
+                        raise SofaRangeError(f"unsigned array value {v} out of range")
+                    emit(v)
         except SofaError as exc:
             self._fail(exc)
 
@@ -366,11 +378,22 @@ class Encoder:
         try:
             seq = list(values)
             self._array_header(field_id, WireType.ARRAY_SIGNED, len(seq))
-            emit = self._emit_varint
-            for v in seq:
-                if v < SIGNED_MIN or v > SIGNED_MAX:
-                    raise SofaRangeError(f"signed array value {v} out of range")
-                emit(zigzag_encode(v))
+            if self._fixed is None:
+                buf = self._buf   # see write_unsigned_array: codec inlined
+                for v in seq:
+                    if v < SIGNED_MIN or v > SIGNED_MAX:
+                        raise SofaRangeError(f"signed array value {v} out of range")
+                    u = (v << 1) ^ (v >> 63)
+                    while u >= 0x80:
+                        buf.append((u & 0x7F) | 0x80)
+                        u >>= 7
+                    buf.append(u)
+            else:
+                emit = self._emit_varint
+                for v in seq:
+                    if v < SIGNED_MIN or v > SIGNED_MAX:
+                        raise SofaRangeError(f"signed array value {v} out of range")
+                    emit(zigzag_encode(v))
         except SofaError as exc:
             self._fail(exc)
 
