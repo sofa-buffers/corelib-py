@@ -17,6 +17,7 @@ from sofab import (
     SofaLimitError,
     SofaRangeError,
     SofaStateError,
+    WireType,
 )
 
 
@@ -615,3 +616,51 @@ def test_max_u64_control_still_decodes(decoder_cls):
     f = dec.next()
     assert f is not None and f.id == 6
     assert dec.unsigned() == (1 << 64) - 1
+
+
+# --- ID_MAX bounds a sequence-end header's id too ----------------------------
+#
+# Regression for issue #59 / Crucible F-0054 (spec §4.9/§6.2, documentation#35):
+# a sequence end's id is *discarded* (§4.9), but discarded is not unvalidated.
+# The header is an ordinary field header, so its id is bounded by ID_MAX (§6.2)
+# like every other — an id above the ceiling is INVALID on a sequence end as
+# anywhere, validated where the header is read rather than in the branch that
+# uses the id. The bound is on the id's *value*, not its spelling (§4.1), so a
+# non-minimal encoding of an in-range id stays valid. Both engines must agree.
+#
+# Isolate: 0x76 opens an unknown sequence (id 14); the next header is a sequence
+# end (wire type 7) whose id is 2**31 = ID_MAX + 1 -> INVALID.
+_SEQEND_ID_OVER_IDMAX = [0x76, 0x87, 0x80, 0x80, 0x80, 0x40]
+
+# Controls that must stay ACCEPTED — an in-range id decodes as an ordinary
+# sequence end (id discarded -> 0). 0x76 opens the sequence each one closes.
+_SEQEND_ID_CONTROLS = [
+    ([0x76, 0x07], "canonical, id 0"),
+    ([0x76, 0x1F], "id 3"),
+    ([0x76, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F], "id ID_MAX (2**31 - 1)"),
+    ([0x76, 0x87, 0x00], "non-minimal encoding of id 0"),
+]
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_seqend_header_id_over_idmax_is_invalid(decoder_cls):
+    dec = decoder_cls(reader(_SEQEND_ID_OVER_IDMAX))
+    start = dec.next()
+    assert start is not None and start.type == WireType.SEQUENCE_START
+    with pytest.raises(SofaDecodeError) as exc:
+        dec.next()
+    # INVALID, never INCOMPLETE — all six bytes are present.
+    assert not isinstance(exc.value, SofaIncompleteError)
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+@pytest.mark.parametrize("data,label", _SEQEND_ID_CONTROLS)
+def test_seqend_header_in_range_id_is_accepted(decoder_cls, data, label):
+    dec = decoder_cls(reader(data))
+    start = dec.next()
+    assert start is not None and start.type == WireType.SEQUENCE_START
+    end = dec.next()
+    # Whatever the id said on the wire, it is discarded: the field is id 0.
+    assert end is not None
+    assert end.type == WireType.SEQUENCE_END
+    assert end.id == 0

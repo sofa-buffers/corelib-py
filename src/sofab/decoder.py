@@ -307,15 +307,19 @@ class Decoder:
         wtype = header & 0x07
         field_id = header >> 3
 
+        # The id is bounded by ID_MAX on every header without exception (§6.2),
+        # including a sequence end whose id is otherwise discarded (§4.9): the
+        # bound is on the id's value, so this must run before the wire-type
+        # dispatch below, not inside the branches that use the id.
+        if field_id > ID_MAX:
+            raise SofaDecodeError(f"id {field_id} out of range")
+
         if wtype == WireType.SEQUENCE_END:
             if self._depth <= 0:
                 raise SofaDecodeError("unbalanced sequence end")
             self._depth -= 1
             self._cur = Field(0, WireType.SEQUENCE_END)
             return self._cur
-
-        if field_id > ID_MAX:
-            raise SofaDecodeError(f"id {field_id} out of range")
 
         if wtype == WireType.SEQUENCE_START:
             if self._depth >= MAX_DEPTH:
