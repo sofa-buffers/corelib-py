@@ -1681,6 +1681,12 @@ cdef class Decoder:
         fid = header >> 3
         self._cur_wtype = wtype
 
+        # ID_MAX bounds every header's id (§6.2), the sequence end included even
+        # though its id is discarded (§4.9); validate before the wire-type
+        # dispatch so wire type 7 is not an exception to the ceiling.
+        if fid > _ID_MAX:
+            raise SofaDecodeError("id %d out of range" % PyLong_FromUnsignedLongLong(fid))
+
         if wtype == _WT_SEQUENCE_END:
             if self._depth <= 0:
                 raise SofaDecodeError("unbalanced sequence end")
@@ -1688,8 +1694,6 @@ cdef class Decoder:
             self._cur = _mkfield(_ZERO, _WT[_WT_SEQUENCE_END], _ZERO, _ZERO, _NONE)
             return self._cur
 
-        if fid > _ID_MAX:
-            raise SofaDecodeError("id %d out of range" % PyLong_FromUnsignedLongLong(fid))
         field_id = PyLong_FromUnsignedLongLong(fid)
 
         if wtype == _WT_SEQUENCE_START:

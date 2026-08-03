@@ -73,6 +73,24 @@ RUN python${PYTHON_VERSION} -m ensurepip --upgrade 2>/dev/null || true \
     && pipx install poetry \
     && pipx install hatch
 
+# Python dev + test tooling in the default interpreter, matching what CI runs
+# (.github/workflows/ci.yml: `pip install -e . pytest ruff mypy`, plus the
+# coverage leg's pytest-cov/coverage). Cython is already a PEP 517 build
+# dependency, so `pip install -e .` pulls it in on that path — but having it in
+# the interpreter directly is what makes `python setup.py build_ext --inplace`
+# (the quick way to recompile the accelerator after editing _speedups.pyx) pick
+# up the edit instead of falling back to a stale generated _speedups.c. Without
+# this layer the container builds the package but cannot lint, type-check, test,
+# or measure coverage out of the box. Versions are left unpinned to track CI,
+# whose mypy floor is set by the oldest (3.9) leg — see the repo CI notes.
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+        "Cython>=3.0" \
+        pytest \
+        pytest-cov \
+        coverage \
+        ruff \
+        mypy
+
 # Node.js (LTS) for Claude Code
 RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
