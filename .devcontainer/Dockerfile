@@ -14,11 +14,18 @@ ENV PIP_NO_CACHE_DIR=1 \
 # accelerator (src/sofab/_speedups.pyx → C via Cython, pulled in as a PEP 517
 # build dependency). Without it the package still installs — it just falls back
 # to the pure-Python engine — but the devcontainer builds the fast path.
+#
+# valgrind is what bench/run_callgrind.sh runs under: instructions/op is the
+# benchmark number that means anything on a shared or virtualised host, since it
+# is independent of the clock and the scheduler, and it is one of the three
+# benchmark tools every corelib ships (CORELIB_PLAN §10). Without it that script
+# is the one shipped tool the container cannot run.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     git \
     build-essential \
+    valgrind \
     gnupg \
     && rm -rf /var/lib/apt/lists/*
 
@@ -35,6 +42,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends software-proper
     && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
     && update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1
+
+# A second interpreter, headers included, so the native accelerator can be built
+# and tested against more than one CPython locally — CI runs 3.9–3.14, and the
+# accelerator's fast paths depend on CPython-internal layouts that they verify at
+# import (see __sofab_digits_selftest / __sofab_field_slot_attrs in
+# _speedups.pyx). Those self-tests are only meaningful if someone actually runs
+# them on a second version:
+#
+#   python3.14 -m venv /tmp/v314 \
+#     && /tmp/v314/bin/pip install -e . pytest \
+#     && /tmp/v314/bin/python -m pytest
+#
+# It is not the default interpreter and nothing depends on it, so dropping this
+# layer only costs that cross-check.
+ARG EXTRA_PYTHON_VERSION=3.14
+ENV EXTRA_PYTHON_VERSION=${EXTRA_PYTHON_VERSION}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+       python${EXTRA_PYTHON_VERSION} \
+       python${EXTRA_PYTHON_VERSION}-venv \
+       python${EXTRA_PYTHON_VERSION}-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # pipx + uv (fast Python package/venv manager)
 ENV PIPX_HOME=/usr/local/pipx \
