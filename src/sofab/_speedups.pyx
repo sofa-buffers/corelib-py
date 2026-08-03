@@ -249,6 +249,11 @@ cdef extern from *:
     unsigned long long _AsU64 "__sofab_as_u64" (PyObject*) noexcept
     long long _AsI64 "__sofab_as_i64" (PyObject*) noexcept
     bint _IsLong "PyLong_CheckExact" (PyObject*) noexcept
+    # Subclasses included: what __index__ hands back is an int, but only from
+    # CPython 3.10 on is it guaranteed to be an *exact* one — before that a bool
+    # or an IntEnum member comes back as itself. Both share PyLongObject's
+    # layout, so every converter below reads them correctly.
+    bint _IsLongLike "PyLong_Check" (PyObject*) noexcept
     bint _IsFloat "PyFloat_CheckExact" (PyObject*) noexcept
     double _AsDouble "PyFloat_AS_DOUBLE" (PyObject*) noexcept
     # Range-checked conversions that report failure by return value instead of a
@@ -419,6 +424,9 @@ cdef extern from *:
     bint __sofab_field_slot_attrs(object type_obj, object probe)
 
 cdef extern from "Python.h":
+    # The __index__ protocol: returns the int an object considers itself to be,
+    # losslessly, or raises TypeError. See _index_arg.
+    object PyNumber_Index(object)
     # Decodes UTF-8 straight out of the decoder's buffer, so a string field
     # never materialises an intermediate ``bytes`` object.
     str PyUnicode_DecodeUTF8(const char*, Py_ssize_t, const char*)
@@ -710,8 +718,9 @@ cdef int _WHAT_U = 0
 cdef int _WHAT_S = 1
 cdef int _WHAT_UA = 2
 cdef int _WHAT_SA = 3
+cdef int _WHAT_ID = 4
 cdef tuple _WHATS = ("unsigned value", "signed value",
-                     "unsigned array value", "signed array value")
+                     "unsigned array value", "signed array value", "id")
 
 cdef inline uint64_t _u64_elem(PyObject* p, int what) except? 0xDEAD:
     cdef uint64_t r
@@ -731,31 +740,54 @@ cdef inline uint64_t _u64_arg(object value, int what=_WHAT_U) except? 0xDEAD:
 cdef inline int64_t _i64_arg(object value, int what=_WHAT_S) except? -0xDEAD:
     return _i64_elem(<PyObject*>value, what)
 
+cdef object _index_arg(object value, int what):
+    """The int ``value`` losslessly is, or SofaRangeError.
+
+    Integer fields accept whatever Python itself accepts where an integer is
+    required: an object implementing ``__index__`` (int, bool, IntEnum, NumPy
+    integers). ``float`` deliberately does not implement it — ``3.7`` cannot
+    become an integer without discarding information — so it is refused rather
+    than truncated, which would change the value the caller asked to send in a
+    way the receiver could never detect. Mirrors sofab.encoder._as_int exactly;
+    the two engines must accept and reject the same objects.
+    """
+    try:
+        return PyNumber_Index(value)
+    except TypeError:
+        raise SofaRangeError("%s must be an integer, not %s"
+                             % (_WHATS[what], type(value).__name__)) from None
+
 cdef uint64_t _u64_other(object value, int what) except? 0xDEAD:
-    # Cold: an exact int the converter rejected (out of the 64-bit domain), or a
-    # value that is not an exact int at all — the original comparison path, which
-    # accepts anything ``<uint64_t>`` accepts (bool, IntEnum, float, __index__).
-    if not PyLong_CheckExact(value) and 0 <= value <= UNSIGNED_MAX:
-        return <uint64_t>value
-    raise SofaRangeError("%s %d out of range" % (_WHATS[what], value))
+    # Cold: an exact int the converter rejected (outside the 64-bit domain), or
+    # something that is not an exact int at all.
+    cdef object idx = _index_arg(value, what)
+    cdef uint64_t out
+    if _IsLongLike(<PyObject*>idx) and _ToU64(<PyObject*>idx, &out):
+        return out
+    raise SofaRangeError("%s %d out of range" % (_WHATS[what], idx))
 
 cdef int64_t _i64_other(object value, int what) except? -0xDEAD:
-    if not PyLong_CheckExact(value) and SIGNED_MIN <= value <= SIGNED_MAX:
-        return <int64_t>value
-    raise SofaRangeError("%s %d out of range" % (_WHATS[what], value))
+    cdef object idx = _index_arg(value, what)
+    cdef int64_t out
+    if _IsLongLike(<PyObject*>idx) and _ToI64(<PyObject*>idx, &out):
+        return out
+    raise SofaRangeError("%s %d out of range" % (_WHATS[what], idx))
 
 cdef inline uint64_t _id_arg(object field_id) except? 0xDEAD:
     # Field ids are 0..ID_MAX (2**31-1), so the *value* range is narrower than
     # what the converter itself rejects; the explicit bound stays, but on C ints.
     cdef int64_t r
+    cdef object idx
     if _IsLong(<PyObject*>field_id):
         if _ToI64(<PyObject*>field_id, &r):
             if r < 0 or r > <int64_t>_ID_MAX:
                 raise SofaRangeError("id %d out of range 0..%d" % (field_id, _ID_MAX))
             return <uint64_t>r
-    elif 0 <= field_id <= ID_MAX:
-        return <uint64_t>field_id
-    raise SofaRangeError("id %d out of range 0..%d" % (field_id, _ID_MAX))
+        raise SofaRangeError("id %d out of range 0..%d" % (field_id, _ID_MAX))
+    idx = _index_arg(field_id, _WHAT_ID)
+    if _IsLongLike(<PyObject*>idx) and _ToI64(<PyObject*>idx, &r) and 0 <= r <= <int64_t>_ID_MAX:
+        return <uint64_t>r
+    raise SofaRangeError("id %d out of range 0..%d" % (idx, _ID_MAX))
 
 
 # --- array-input plumbing -----------------------------------------------------
@@ -1259,9 +1291,9 @@ cdef class Encoder:
         try:
             if self._depth >= _MAX_DEPTH:
                 raise SofaRangeError("nesting exceeds MAX_DEPTH=%d" % _MAX_DEPTH)
-            if field_id < 0 or field_id > ID_MAX:
-                raise SofaRangeError("id %d out of range 0..%d" % (field_id, _ID_MAX))
-            self._pending_push(<uint32_t>field_id)
+            # This is the one write that does not go through _header — the id is
+            # held back rather than emitted — so it applies the same rule itself.
+            self._pending_push(<uint32_t>_id_arg(field_id))
             self._depth += 1
         except SofaError as exc:
             self._fail(exc)

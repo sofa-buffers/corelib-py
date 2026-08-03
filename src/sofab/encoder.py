@@ -31,7 +31,8 @@ never pays for it.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Callable
+from operator import index as _index
+from typing import Callable, SupportsIndex
 
 from . import _core
 from ._varint import encode_varint, zigzag_encode
@@ -52,6 +53,30 @@ from .types import (
 
 FlushSink = Callable[[bytes], None]
 Writer = object  # anything with .write(bytes)
+
+
+def _as_int(value: object, what: str) -> int:
+    """Coerce ``value`` to the ``int`` an integer field will be written from.
+
+    The rule is Python's own: a type that considers itself *losslessly* an
+    integer implements ``__index__`` — ``int``, ``bool``, ``IntEnum``, NumPy
+    integers do; ``float`` deliberately does not, because ``3.7`` cannot become
+    an integer without discarding information. This is the same line CPython
+    draws wherever an integer is required (``seq[i]``, ``range(x)``,
+    ``bytes(n)``), and the same values both engines already agreed on.
+
+    Anything else is refused with :class:`SofaRangeError` (§6.3
+    ``InvalidArgument``) rather than truncated: writing ``3`` for a caller's
+    ``3.7`` would be a value change the receiver has no way to detect.
+    """
+    try:
+        # The TypeError this raises *is* the check — asking the object whether it
+        # is an integer is cheaper and more accurate than any isinstance test.
+        return _index(value)  # type: ignore[arg-type]
+    except TypeError:
+        raise SofaRangeError(
+            f"{what} must be an integer, not {type(value).__name__}"
+        ) from None
 
 
 class Encoder:
@@ -209,7 +234,7 @@ class Encoder:
         else:
             self._put(encode_varint(value))
 
-    def _header(self, field_id: int, wtype: WireType) -> None:
+    def _header(self, field_id: SupportsIndex, wtype: WireType) -> None:
         """Write a field header — the single choke point every field write passes
         through, and therefore where a held-back sequence run is committed.
 
@@ -221,6 +246,8 @@ class Encoder:
         the bare ``0x07`` end marker themselves), so no gate on ``wtype`` is
         needed and no writer can bypass the commit.
         """
+        if not isinstance(field_id, int):
+            field_id = _as_int(field_id, "id")
         if field_id < 0 or field_id > ID_MAX:
             raise SofaRangeError(f"id {field_id} out of range 0..{ID_MAX}")
         if self._pending:
@@ -252,15 +279,20 @@ class Encoder:
 
     # --- scalars ------------------------------------------------------------
 
-    def write_unsigned(self, field_id: int, value: int) -> None:
+    def write_unsigned(self, field_id: SupportsIndex, value: SupportsIndex) -> None:
         """Write an unsigned integer field as a base-128 varint.
 
-        ``value`` must be in ``0..UNSIGNED_MAX`` (64-bit), else
-        :class:`SofaRangeError`.
+        ``value`` must be an integer in ``0..UNSIGNED_MAX`` (64-bit), else
+        :class:`SofaRangeError`. "Integer" is Python's own rule — anything with
+        ``__index__`` (``int``, ``bool``, ``IntEnum``, NumPy integers). A
+        ``float`` is refused rather than truncated, ``3.0`` included; write
+        ``int(x)`` if that is what you mean.
         """
         if not self._begin():
             return
         try:
+            if not isinstance(value, int):
+                value = _as_int(value, "unsigned value")
             if value < 0 or value > UNSIGNED_MAX:
                 raise SofaRangeError(f"unsigned value {value} out of range")
             self._header(field_id, WireType.UNSIGNED)
@@ -268,15 +300,18 @@ class Encoder:
         except SofaError as exc:
             self._fail(exc)
 
-    def write_signed(self, field_id: int, value: int) -> None:
+    def write_signed(self, field_id: SupportsIndex, value: SupportsIndex) -> None:
         """Write a signed integer field, ZigZag-encoded into a varint.
 
-        ``value`` must be in ``SIGNED_MIN..SIGNED_MAX`` (64-bit), else
-        :class:`SofaRangeError`.
+        ``value`` must be an integer in ``SIGNED_MIN..SIGNED_MAX`` (64-bit),
+        else :class:`SofaRangeError` — see :meth:`write_unsigned` for what counts
+        as an integer.
         """
         if not self._begin():
             return
         try:
+            if not isinstance(value, int):
+                value = _as_int(value, "signed value")
             if value < SIGNED_MIN or value > SIGNED_MAX:
                 raise SofaRangeError(f"signed value {value} out of range")
             self._header(field_id, WireType.SIGNED)
@@ -284,19 +319,19 @@ class Encoder:
         except SofaError as exc:
             self._fail(exc)
 
-    def write_bool(self, field_id: int, value: bool) -> None:
+    def write_bool(self, field_id: SupportsIndex, value: bool) -> None:
         """Write a boolean as an unsigned field (``1``/``0``)."""
         self.write_unsigned(field_id, 1 if value else 0)
 
-    def write_float32(self, field_id: int, value: float) -> None:
+    def write_float32(self, field_id: SupportsIndex, value: float) -> None:
         """Write a 32-bit IEEE-754 float as a little-endian fixlen field."""
         self._write_fixlen(field_id, _core.pack_f32(value), FixlenSubtype.FP32)
 
-    def write_float64(self, field_id: int, value: float) -> None:
+    def write_float64(self, field_id: SupportsIndex, value: float) -> None:
         """Write a 64-bit IEEE-754 float as a little-endian fixlen field."""
         self._write_fixlen(field_id, _core.pack_f64(value), FixlenSubtype.FP64)
 
-    def write_string(self, field_id: int, text: str) -> None:
+    def write_string(self, field_id: SupportsIndex, text: str) -> None:
         r"""Write a UTF-8 string as a fixlen field (STRING subtype).
 
         Encoding is strict UTF-8 (``str.encode("utf-8")`` with no ``errors=``).
@@ -318,11 +353,13 @@ class Encoder:
             return
         self._write_fixlen(field_id, data, FixlenSubtype.STRING)
 
-    def write_bytes(self, field_id: int, data: bytes | bytearray | memoryview) -> None:
+    def write_bytes(self, field_id: SupportsIndex,
+                    data: bytes | bytearray | memoryview) -> None:
         """Write a raw byte blob as a fixlen field (BLOB subtype)."""
         self._write_fixlen(field_id, bytes(data), FixlenSubtype.BLOB)
 
-    def _write_fixlen(self, field_id: int, data: bytes, subtype: FixlenSubtype) -> None:
+    def _write_fixlen(self, field_id: SupportsIndex, data: bytes,
+                      subtype: FixlenSubtype) -> None:
         if not self._begin():
             return
         try:
@@ -334,12 +371,15 @@ class Encoder:
 
     # --- arrays -------------------------------------------------------------
 
-    def write_unsigned_array(self, field_id: int, values: Iterable[int]) -> None:
+    def write_unsigned_array(self, field_id: SupportsIndex,
+                             values: Iterable[SupportsIndex]) -> None:
         """Write an array of unsigned integers, each as a varint.
 
-        The element count must be ``0..ARRAY_MAX`` and every value in
-        ``0..UNSIGNED_MAX``, else :class:`SofaRangeError`. A zero-count array is
-        a valid, fully-specified empty array on the wire (``[header][count=0]``).
+        The element count must be ``0..ARRAY_MAX`` and every element an integer
+        in ``0..UNSIGNED_MAX``, else :class:`SofaRangeError` (see
+        :meth:`write_unsigned` for what counts as an integer). A zero-count array
+        is a valid, fully-specified empty array on the wire
+        (``[header][count=0]``).
         """
         if not self._begin():
             return
@@ -351,6 +391,8 @@ class Encoder:
                 # each element costs a loop iteration rather than a Python call.
                 buf = self._buf
                 for v in seq:
+                    if not isinstance(v, int):
+                        v = _as_int(v, "unsigned array value")
                     if v < 0 or v > UNSIGNED_MAX:
                         raise SofaRangeError(f"unsigned array value {v} out of range")
                     while v >= 0x80:
@@ -360,18 +402,22 @@ class Encoder:
             else:
                 emit = self._emit_varint
                 for v in seq:
+                    if not isinstance(v, int):
+                        v = _as_int(v, "unsigned array value")
                     if v < 0 or v > UNSIGNED_MAX:
                         raise SofaRangeError(f"unsigned array value {v} out of range")
                     emit(v)
         except SofaError as exc:
             self._fail(exc)
 
-    def write_signed_array(self, field_id: int, values: Iterable[int]) -> None:
+    def write_signed_array(self, field_id: SupportsIndex,
+                           values: Iterable[SupportsIndex]) -> None:
         """Write an array of signed integers, each ZigZag-encoded into a varint.
 
-        The element count must be ``0..ARRAY_MAX`` and every value in
-        ``SIGNED_MIN..SIGNED_MAX``, else :class:`SofaRangeError`. A zero-count
-        array is a valid, fully-specified empty array (``[header][count=0]``).
+        The element count must be ``0..ARRAY_MAX`` and every element an integer
+        in ``SIGNED_MIN..SIGNED_MAX``, else :class:`SofaRangeError` (see
+        :meth:`write_unsigned` for what counts as an integer). A zero-count array
+        is a valid, fully-specified empty array (``[header][count=0]``).
         """
         if not self._begin():
             return
@@ -381,6 +427,8 @@ class Encoder:
             if self._fixed is None:
                 buf = self._buf   # see write_unsigned_array: codec inlined
                 for v in seq:
+                    if not isinstance(v, int):
+                        v = _as_int(v, "signed array value")
                     if v < SIGNED_MIN or v > SIGNED_MAX:
                         raise SofaRangeError(f"signed array value {v} out of range")
                     u = (v << 1) ^ (v >> 63)
@@ -391,13 +439,15 @@ class Encoder:
             else:
                 emit = self._emit_varint
                 for v in seq:
+                    if not isinstance(v, int):
+                        v = _as_int(v, "signed array value")
                     if v < SIGNED_MIN or v > SIGNED_MAX:
                         raise SofaRangeError(f"signed array value {v} out of range")
                     emit(zigzag_encode(v))
         except SofaError as exc:
             self._fail(exc)
 
-    def write_float32_array(self, field_id: int, values: Iterable[float]) -> None:
+    def write_float32_array(self, field_id: SupportsIndex, values: Iterable[float]) -> None:
         """Write an array of 32-bit floats as a packed little-endian fixlen array.
 
         The element count must be ``0..ARRAY_MAX``, else :class:`SofaRangeError`.
@@ -407,7 +457,7 @@ class Encoder:
         """
         self._write_float_array(field_id, values, FixlenSubtype.FP32, _core.pack_f32_array, 4)
 
-    def write_float64_array(self, field_id: int, values: Iterable[float]) -> None:
+    def write_float64_array(self, field_id: SupportsIndex, values: Iterable[float]) -> None:
         """Write an array of 64-bit floats as a packed little-endian fixlen array.
 
         The element count must be ``0..ARRAY_MAX``, else :class:`SofaRangeError`.
@@ -419,7 +469,7 @@ class Encoder:
 
     def _write_float_array(
         self,
-        field_id: int,
+        field_id: SupportsIndex,
         values: Iterable[float],
         subtype: FixlenSubtype,
         pack_array: Callable[[list[float]], bytes],
@@ -439,7 +489,7 @@ class Encoder:
         except SofaError as exc:
             self._fail(exc)
 
-    def _array_header(self, field_id: int, wtype: WireType, count: int) -> None:
+    def _array_header(self, field_id: SupportsIndex, wtype: WireType, count: int) -> None:
         # Defensive: count is always len() of a materialized list, so it is
         # non-negative and can't exceed ARRAY_MAX without exhausting memory first.
         if count < 0 or count > ARRAY_MAX:  # pragma: no cover
@@ -449,7 +499,7 @@ class Encoder:
 
     # --- sequences ----------------------------------------------------------
 
-    def write_sequence_begin_lazy(self, field_id: int) -> None:
+    def write_sequence_begin_lazy(self, field_id: SupportsIndex) -> None:
         """Open a nested sequence (sub-message) under ``field_id``, **holding its
         header back** until the sequence turns out to have content.
 
@@ -475,6 +525,10 @@ class Encoder:
         try:
             if self._depth >= MAX_DEPTH:
                 raise SofaRangeError(f"nesting exceeds MAX_DEPTH={MAX_DEPTH}")
+            # This is the one write that does not go through _header — the id is
+            # held back rather than emitted — so it applies the same rule itself.
+            if not isinstance(field_id, int):
+                field_id = _as_int(field_id, "id")
             if field_id < 0 or field_id > ID_MAX:
                 raise SofaRangeError(f"id {field_id} out of range 0..{ID_MAX}")
             # No hold-back window to exhaust: the pending run is a Python list
