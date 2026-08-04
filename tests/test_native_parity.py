@@ -72,6 +72,47 @@ def test_encode_byte_identical():
     assert na.getvalue() == py.getvalue()
 
 
+def _encode_over_buffer(enc_cls, cap):
+    """Encode `_program` through a fixed `cap`-byte buffer whose sink installs a
+    FRESH buffer each time, which is the pattern `over_buffer` documents."""
+    acc = bytearray()
+    enc = None
+
+    def sink(chunk):
+        acc.extend(chunk)
+        enc.buffer_set(bytearray(cap))
+
+    enc = enc_cls.over_buffer(bytearray(cap), 0, sink)
+    _program(enc)
+    enc.flush()
+    return bytes(acc)
+
+
+@pytest.mark.parametrize("cap", [1, 2, 3, 5, 8, 16, 64])
+def test_over_buffer_byte_identical_with_buffer_set_sink(cap):
+    """A caller buffer smaller than the message must produce the one-shot bytes, in
+    both engines, at every size — including sizes that force a drain *inside* one
+    write.
+
+    The pure engine hoisted the buffer view out of its write loop and kept using it
+    after a drain, so once the sink installed a fresh buffer via ``buffer_set``
+    everything past the first flush landed in the orphaned one and the fresh buffer
+    was emitted zeroed. It surfaced only at small ``cap``; the native engine was
+    correct throughout.
+
+    A sink that drains and *reuses* the same buffer was never affected, which is
+    what the existing ``over_buffer`` tests do — hence this one installs a new
+    buffer, the pattern ``over_buffer``'s own docstring describes.
+    """
+    ref = PyEncoder()
+    _program(ref)
+    ref.flush()
+    want = ref.getvalue()
+
+    assert _encode_over_buffer(PyEncoder, cap) == want
+    assert _encode_over_buffer(NativeEncoder, cap) == want
+
+
 def _walk(dec):
     out = []
     while (f := dec.next()) is not None:

@@ -170,6 +170,12 @@ class Encoder:
         if self._fixed is None:
             self._buf += data
             return
+        # Hoisted for the common no-drain path, but they must be re-read after any
+        # drain: the flush sink may call buffer_set() to hand back a *different*
+        # buffer (the documented pattern — see over_buffer), which replaces both.
+        # Writing through a stale view sent everything past the first flush into the
+        # orphaned buffer while the fresh one was emitted zeroed. A sink that drains
+        # and reuses the same buffer was unaffected, which is why this survived.
         mv = self._fixed
         cap = self._cap
         pos = 0
@@ -177,6 +183,8 @@ class Encoder:
         while pos < n:
             if self._cursor >= cap:
                 self._drain()
+                mv = self._fixed
+                cap = self._cap
                 # Defensive: _drain either raises (no sink) or resets the cursor
                 # to 0, so a still-full buffer here is unreachable in practice.
                 if self._cursor >= cap:  # pragma: no cover
