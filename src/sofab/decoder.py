@@ -205,10 +205,50 @@ class Decoder:
             self._buf = bytes(out[n:])
         return bytes(out[:n])
 
-    def _read_varints(self, count: int) -> list[int]:
+    def _elem_bound_error(
+        self,
+        out: list[int],
+        lo: int | None,
+        hi: int | None,
+        zigzag: bool,
+    ) -> Exception:
+        """The exception a truncated array should actually raise.
+
+        :class:`SofaDecodeError` when an element already decoded falls outside
+        the field's declared width, otherwise the truncation that was about to
+        be reported. §5.2 makes INVALID dominate INCOMPLETE, and an element
+        outside its declared width is INVALID by §7.1 — it is established by its
+        own bytes, so the array running out behind it cannot downgrade the
+        verdict (generator#267, Crucible F-0043).
+
+        Applied HERE, at the truncation, rather than per element: an array that
+        completes is decided by the caller's own scan over the returned list,
+        which sees exactly the same elements and reaches the same answer. That
+        keeps the decode loop above a pure decode — the native engine, where a
+        typed compare is free, does check at the element (``_speedups.pyx``);
+        both produce the same verdict, which is what the shared vectors pin.
+        """
+        if hi is not None:
+            for v in out:
+                x = zigzag_decode(v) if zigzag else v
+                if x < lo or x > hi:  # type: ignore[operator]
+                    return SofaDecodeError("array element outside declared width")
+        return SofaIncompleteError("truncated varint")
+
+    def _read_varints(
+        self,
+        count: int,
+        lo: int | None = None,
+        hi: int | None = None,
+        zigzag: bool = False,
+    ) -> list[int]:
         """Decode ``count`` consecutive varints in one tight loop that advances
         the cursor over the buffer — the whole varint codec is inlined here (no
         per-element call) and refills only when it runs off the end.
+
+        ``lo``/``hi`` are the field's declared element width, when it declares
+        one; a truncation is then reported through :meth:`_elem_bound_error`,
+        which turns it into INVALID if an element already in hand breaches it.
 
         The result is built incrementally with ``append`` rather than pre-sized
         to ``count``: ``count`` comes straight off the wire and is capped only at
@@ -230,7 +270,7 @@ class Decoder:
             if pos >= n:
                 self._pos = pos
                 if not self._need(1):
-                    raise SofaIncompleteError("truncated varint")
+                    raise self._elem_bound_error(out, lo, hi, zigzag)
                 buf = self._buf
                 pos = self._pos
                 n = len(buf)
@@ -246,7 +286,7 @@ class Decoder:
                 if pos >= n:
                     self._pos = pos
                     if not self._need(1):
-                        raise SofaIncompleteError("truncated varint")
+                        raise self._elem_bound_error(out, lo, hi, zigzag)
                     buf = self._buf
                     pos = self._pos
                     n = len(buf)
@@ -614,23 +654,41 @@ class Decoder:
         self._pending = None
         return int(pending[2])
 
-    def read_unsigned_array(self) -> list[int]:
+    def read_unsigned_array(self, elem_max: int | None = None) -> list[int]:
         """Consume the current field as a list of unsigned integers.
+
+        Pass the schema's declared element width as ``elem_max`` (``255`` for a
+        ``u8`` array, and so on) so an element outside it keeps the message
+        INVALID even when the array behind it is truncated — a caller scanning
+        the returned list can only decide an array that arrives, and §5.2 makes
+        INVALID dominate the INCOMPLETE that one which does not would otherwise
+        report (§7.1, generator#267). Omit for ``u64``, whose range is the value
+        domain, and for an unbounded consumer.
 
         Raises :class:`SofaStateError` if the field is not an unsigned array.
         """
         count = self._take_varray(WireType.ARRAY_UNSIGNED)
-        return self._read_varints(count)
+        return self._read_varints(count, 0, elem_max)
 
-    def read_signed_array(self) -> list[int]:
+    def read_signed_array(
+        self,
+        elem_min: int | None = None,
+        elem_max: int | None = None,
+    ) -> list[int]:
         """Consume the current field as a list of ZigZag-decoded signed integers.
+
+        ``elem_min``/``elem_max`` bound each element to its declared width — see
+        :meth:`read_unsigned_array`.
 
         Raises :class:`SofaStateError` if the field is not a signed array.
         """
         count = self._take_varray(WireType.ARRAY_SIGNED)
         # ZigZag inlined rather than calling zigzag_decode per element: the
         # transform is two operations, the call around it was the expensive part.
-        return [(v >> 1) ^ -(v & 1) for v in self._read_varints(count)]
+        return [
+            (v >> 1) ^ -(v & 1)
+            for v in self._read_varints(count, elem_min, elem_max, True)
+        ]
 
     def _take_farray(self, subtype: FixlenSubtype) -> tuple[int, int]:
         pending = self._pending

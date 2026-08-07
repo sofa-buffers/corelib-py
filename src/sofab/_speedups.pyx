@@ -1573,11 +1573,22 @@ cdef class Decoder:
             self._pos = 0
         return bytes(acc[:n])
 
-    cdef list _read_varints(self, Py_ssize_t count, bint zigzag):
+    cdef list _read_varints(
+        self, Py_ssize_t count, bint zigzag, bint bounded, int64_t lo, int64_t hi
+    ):
         # Decode ``count`` consecutive varints into a list. ``zigzag`` folds the
         # signed-array transform into this same pass, so a signed array is one
         # walk producing one list rather than a list of raw values rebuilt into a
         # second list of decoded ones.
+        #
+        # ``bounded``/``lo``/``hi`` carry the field's declared element width
+        # (§7.1). It is checked AT the element, before the value is boxed: two
+        # typed integer compares, which is why this engine can afford exactness
+        # here where the pure one applies the same bound at the truncation
+        # instead (see Decoder._elem_bound_error). §5.2 makes the resulting
+        # INVALID dominate a truncation behind it, which is the whole point —
+        # a caller scanning the returned list never sees an array that does not
+        # arrive (generator#267, Crucible F-0043).
         #
         # The result is pre-sized, but never on the strength of the wire count
         # alone: ``count`` is attacker-controlled and capped only at ARRAY_MAX
@@ -1596,6 +1607,7 @@ cdef class Decoder:
         cdef Py_ssize_t i = 0
         cdef _Varint v
         cdef uint64_t result
+        cdef int64_t signed_val
         cdef object item
         if prealloc > count:
             prealloc = count
@@ -1616,8 +1628,15 @@ cdef class Decoder:
                 pos = self._pos
                 n = self._n
             if zigzag:
-                item = PyLong_FromLongLong(_zigzag_decode(result))
+                signed_val = _zigzag_decode(result)
+                if bounded and (signed_val < lo or signed_val > hi):
+                    raise SofaDecodeError("array element outside declared width")
+                item = PyLong_FromLongLong(signed_val)
             else:
+                # hi is a NARROWED unsigned maximum (u32 at the widest), so it is
+                # never negative and the unsigned compare is exact.
+                if bounded and result > <uint64_t>hi:
+                    raise SofaDecodeError("array element outside declared width")
                 item = PyLong_FromUnsignedLongLong(result)
             if i < prealloc:
                 Py_INCREF(item)
@@ -1944,13 +1963,23 @@ cdef class Decoder:
         self._pk = _PEND_NONE
         return self._pend_count
 
-    def read_unsigned_array(self):
+    def read_unsigned_array(self, elem_max=None):
+        # elem_max is the field's declared element width; see the pure engine's
+        # Decoder.read_unsigned_array for what it buys (§7.1/§5.2, #267).
         cdef uint64_t count = self._take_varray(_WT_ARRAY_UNSIGNED)
-        return self._read_varints(<Py_ssize_t>count, False)
+        if elem_max is None:
+            return self._read_varints(<Py_ssize_t>count, False, False, 0, 0)
+        return self._read_varints(
+            <Py_ssize_t>count, False, True, 0, <int64_t>elem_max
+        )
 
-    def read_signed_array(self):
+    def read_signed_array(self, elem_min=None, elem_max=None):
         cdef uint64_t count = self._take_varray(_WT_ARRAY_SIGNED)
-        return self._read_varints(<Py_ssize_t>count, True)
+        if elem_max is None:
+            return self._read_varints(<Py_ssize_t>count, True, False, 0, 0)
+        return self._read_varints(
+            <Py_ssize_t>count, True, True, <int64_t>elem_min, <int64_t>elem_max
+        )
 
     cdef _take_farray(self, int subtype):
         if self._pk != _PEND_FARRAY:
