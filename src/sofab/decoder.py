@@ -68,6 +68,10 @@ _FARRAY = 3
 # full ``WireType(wtype)`` coercion (IntEnum.__call__/__new__) on every field.
 _WT = tuple(WireType)
 
+# The lowest value a signed element can carry, used as the open lower side when
+# a field declares only the upper half of its element width (``_read_varints``).
+_I64_MIN = -(1 << 63)
+
 
 class _Reader(Protocol):
     """Read protocol: an object with ``read(n) -> bytes``."""
@@ -295,36 +299,6 @@ class Decoder:
         self._pos = end
         return buf[pos:end]
 
-    def _elem_bound_error(
-        self,
-        out: list[int],
-        lo: int | None,
-        hi: int | None,
-        zigzag: bool,
-    ) -> Exception:
-        """The exception a truncated array should actually raise.
-
-        :class:`SofaDecodeError` when an element already decoded falls outside
-        the field's declared width, otherwise the truncation that was about to
-        be reported. §5.2 makes INVALID dominate INCOMPLETE, and an element
-        outside its declared width is INVALID by §7.1 — it is established by its
-        own bytes, so the array running out behind it cannot downgrade the
-        verdict (generator#267, Crucible F-0043).
-
-        Applied HERE, at the truncation, rather than per element: an array that
-        completes is decided by the caller's own scan over the returned list,
-        which sees exactly the same elements and reaches the same answer. That
-        keeps the decode loop above a pure decode — the native engine, where a
-        typed compare is free, does check at the element (``_speedups.pyx``);
-        both produce the same verdict, which is what the shared vectors pin.
-        """
-        if hi is not None:
-            for v in out:
-                x = zigzag_decode(v) if zigzag else v
-                if x < lo or x > hi:  # type: ignore[operator]
-                    return SofaDecodeError("array element outside declared width")
-        return self._suspend("truncated varint")
-
     def _read_varints(
         self,
         count: int,
@@ -336,9 +310,23 @@ class Decoder:
         the cursor over the buffer — the whole varint codec is inlined here (no
         per-element call) and refills only when it runs off the end.
 
-        ``lo``/``hi`` are the field's declared element width, when it declares
-        one; a truncation is then reported through :meth:`_elem_bound_error`,
-        which turns it into INVALID if an element already in hand breaches it.
+        ``lo``/``hi`` are the field's declared element width, when the field
+        declares one, and either side may be omitted. An element outside it is
+        INVALID by §7.1, and the check happens AT the element — as soon as its
+        own bytes have been decoded, before the loop looks at anything else.
+        That is what makes the verdict a property of the element rather than of
+        the message around it: §7.1 forbids enforcement from being "an emergent
+        property of the memory model", so an array that completes and one that is
+        truncated behind the same bad element have to be rejected alike (issue
+        #67). It also gives §5.2's precedence for free — INVALID is raised before
+        the truncation behind it is ever reached (generator#267, Crucible F-0043)
+        — and matches the native engine element for element (``_speedups.pyx``).
+
+        The bound costs the one-byte fast path nothing in the usual case: a
+        one-byte element is 0..127 raw, -64..63 ZigZagged, so when the declared
+        width already spans that range (every width from u8/i8 up) the test is
+        hoisted out of the loop entirely and only multi-byte elements are
+        compared.
 
         The result is built incrementally with ``append`` rather than pre-sized
         to ``count``: ``count`` comes straight off the wire and is capped only at
@@ -352,6 +340,17 @@ class Decoder:
         brings the varint path in line."""
         out: list[int] = []
         append = out.append
+        # Normalise the declared width once: an omitted side is the widest value
+        # its domain can hold, so a one-sided bound binds its own side and leaves
+        # the other open instead of faulting on the missing half (issue #67).
+        bounded = lo is not None or hi is not None
+        blo = _I64_MIN if lo is None else lo
+        bhi = MASK64 if hi is None else hi
+        # A one-byte element spans 0..127 raw (-64..63 ZigZagged); when the bound
+        # covers all of it the fast path can skip the compare altogether.
+        check_fast = bounded and (
+            (blo > -65 or bhi < 63) if zigzag else (blo > 0 or bhi < 127)
+        )
         buf = self._buf
         pos = self._pos
         n = len(buf)
@@ -360,13 +359,17 @@ class Decoder:
             if pos >= n:
                 self._pos = pos
                 if not self._need(1):
-                    raise self._elem_bound_error(out, lo, hi, zigzag)
+                    raise self._suspend("truncated varint")
                 buf = self._buf
                 pos = self._pos
                 n = len(buf)
             b = buf[pos]
             pos += 1
             if b < 0x80:  # one-byte element
+                if check_fast:
+                    x = (b >> 1) ^ -(b & 1) if zigzag else b
+                    if x < blo or x > bhi:
+                        raise SofaDecodeError("array element outside declared width")
                 append(b)
                 i += 1
                 continue
@@ -376,7 +379,7 @@ class Decoder:
                 if pos >= n:
                     self._pos = pos
                     if not self._need(1):
-                        raise self._elem_bound_error(out, lo, hi, zigzag)
+                        raise self._suspend("truncated varint")
                     buf = self._buf
                     pos = self._pos
                     n = len(buf)
@@ -398,7 +401,12 @@ class Decoder:
                 shift += 7
                 if shift >= 64:
                     raise SofaDecodeError("overlong varint")
-            append(result & MASK64)
+            result &= MASK64
+            if bounded:
+                x = (result >> 1) ^ -(result & 1) if zigzag else result
+                if x < blo or x > bhi:
+                    raise SofaDecodeError("array element outside declared width")
+            append(result)
             i += 1
         self._pos = pos
         return out
@@ -796,18 +804,22 @@ class Decoder:
         """Consume the current field as a list of unsigned integers.
 
         Pass the schema's declared element width as ``elem_max`` (``255`` for a
-        ``u8`` array, and so on) so an element outside it keeps the message
-        INVALID even when the array behind it is truncated — a caller scanning
-        the returned list can only decide an array that arrives, and §5.2 makes
-        INVALID dominate the INCOMPLETE that one which does not would otherwise
-        report (§7.1, generator#267). Omit for ``u64``, whose range is the value
-        domain, and for an unbounded consumer.
+        ``u8`` array, and so on): an element outside it is INVALID (§7.1) and is
+        rejected as its own bytes are decoded, so the verdict is the same whether
+        the array completes or is truncated behind that element, and §5.2's
+        precedence of INVALID over the INCOMPLETE such a truncation would
+        otherwise report follows from the order alone (generator#267, issue #67).
+        Omit for ``u64``, whose range is the value domain, and for an unbounded
+        consumer.
 
         Raises :class:`SofaStateError` if the field is not an unsigned array.
         """
         count = self._take_varray(WireType.ARRAY_UNSIGNED)
         self._keep = self._pos
-        out = self._read_varints(count, 0, elem_max)
+        # No lower bound: an unsigned element decodes to 0..2**64-1 by
+        # construction, so passing 0 would only cost the loop a compare per
+        # element (and would arm the bound check for an unbounded u64 array).
+        out = self._read_varints(count, None, elem_max)
         self._pending = None  # committed only once the payload is in hand (§5.2)
         return out
 
@@ -819,7 +831,8 @@ class Decoder:
         """Consume the current field as a list of ZigZag-decoded signed integers.
 
         ``elem_min``/``elem_max`` bound each element to its declared width — see
-        :meth:`read_unsigned_array`.
+        :meth:`read_unsigned_array`. Either may be given on its own, which bounds
+        that side and leaves the other open.
 
         Raises :class:`SofaStateError` if the field is not a signed array.
         """

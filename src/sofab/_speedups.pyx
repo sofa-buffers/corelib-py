@@ -59,6 +59,12 @@ from libc.stdint cimport uint8_t, uint32_t, uint64_t, int64_t
 from libc.stdlib cimport malloc, realloc, free
 from libc.string cimport memcpy
 
+cdef extern from "stdint.h":
+    # The widest each side of a declared element width can be, used when a field
+    # declares only one of the two (see ``read_signed_array``).
+    const int64_t INT64_MIN
+    const int64_t INT64_MAX
+
 cdef extern from *:
     # Widest-native-int converters, picked per platform.
     #
@@ -1657,12 +1663,13 @@ cdef class Decoder:
         #
         # ``bounded``/``lo``/``hi`` carry the field's declared element width
         # (§7.1). It is checked AT the element, before the value is boxed: two
-        # typed integer compares, which is why this engine can afford exactness
-        # here where the pure one applies the same bound at the truncation
-        # instead (see Decoder._elem_bound_error). §5.2 makes the resulting
-        # INVALID dominate a truncation behind it, which is the whole point —
-        # a caller scanning the returned list never sees an array that does not
-        # arrive (generator#267, Crucible F-0043).
+        # typed integer compares. The pure engine checks at the same point (see
+        # Decoder._read_varints) — §7.1 requires the two to agree on which
+        # messages are valid, so neither may make the verdict depend on whether
+        # the array happened to complete (issue #67). Checking there also makes
+        # §5.2's precedence fall out of the order: the INVALID is raised before
+        # a truncation behind the bad element is ever reached (generator#267,
+        # Crucible F-0043).
         #
         # The result is pre-sized, but never on the strength of the wire count
         # alone: ``count`` is attacker-controlled and capped only at ARRAY_MAX
@@ -2106,15 +2113,23 @@ cdef class Decoder:
         return out
 
     def read_signed_array(self, elem_min=None, elem_max=None):
+        # The two halves of the declared width are independent: either may be
+        # given on its own, in which case it bounds its own side and the other
+        # stays at the widest an i64 element can be — passing one alone must not
+        # fault on the missing half (issue #67).
         cdef uint64_t count = self._take_varray(_WT_ARRAY_SIGNED)
         cdef list out
+        cdef int64_t lo = INT64_MIN
+        cdef int64_t hi = INT64_MAX
         self._arm()
-        if elem_max is None:
+        if elem_min is None and elem_max is None:
             out = self._read_varints(<Py_ssize_t>count, True, False, 0, 0)
         else:
-            out = self._read_varints(
-                <Py_ssize_t>count, True, True, <int64_t>elem_min, <int64_t>elem_max
-            )
+            if elem_min is not None:
+                lo = <int64_t>elem_min
+            if elem_max is not None:
+                hi = <int64_t>elem_max
+            out = self._read_varints(<Py_ssize_t>count, True, True, lo, hi)
         self._pk = _PEND_NONE   # committed only once the payload is in hand
         return out
 
