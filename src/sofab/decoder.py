@@ -292,12 +292,22 @@ class Decoder:
                     n = len(buf)
                 b = buf[pos]
                 pos += 1
+                # An element value is a varint like any other, so the 64-bit
+                # bound of §4.1 applies to it: if this byte's payload bits would
+                # land at bit >= 64 they are unrepresentable and the encoding is
+                # INVALID — masking them off on return would silently corrupt
+                # the value instead (issue #64). Same guard, same wording as
+                # ``_varint`` above; this loop inlines the codec for speed and
+                # so has to carry it itself. ``room`` is the bits left below 64.
+                room = 64 - shift
+                if room < 7 and (b & 0x7F) >> room:
+                    raise SofaDecodeError("overlong varint")
                 result |= (b & 0x7F) << shift
                 if b < 0x80:
                     break
                 shift += 7
                 if shift >= 64:
-                    raise SofaDecodeError("varint overflow")
+                    raise SofaDecodeError("overlong varint")
             append(result & MASK64)
             i += 1
         self._pos = pos

@@ -4,7 +4,7 @@ corelib-c-cpp/test/c/test_istream.c (SOFAB_RET_E_INVALID_MSG cases)."""
 from __future__ import annotations
 
 import pytest
-from vectors import reader
+from vectors import ChunkReader, reader
 
 from sofab import (
     Decoder,
@@ -327,6 +327,98 @@ def test_varint_over_64_bits_stays_malformed():
     data = [0x00] + [0xFF] * 10 + [0x7F]
     with pytest.raises(SofaDecodeError) as exc:
         _decode_fully(data)
+    assert not isinstance(exc.value, SofaIncompleteError)
+
+
+# --- the 64-bit bound applies to ARRAY ELEMENTS too (§4.1, issue #64) --------
+#
+# §4.1 puts the bound on the *encoding*, wherever a varint appears — headers,
+# fixlen_words, counts, skipped fields and *element values* alike: longer than
+# 10 bytes, or a tenth byte whose payload would land at bit >= 64 (any value
+# above 0x01), is INVALID, and a decoder MUST NOT silently drop the overflowing
+# bits. The array read loops inline the varint codec for speed, so each one
+# needs the guard of its own; both engines must reach the same verdict on the
+# same bytes (the pure one used to accept these and mask them down to 2^64-1).
+
+# A ten-byte element whose tenth byte is 0x7F carries payload bits 63..69 — those
+# high bits are unrepresentable in u64, so masking them away is corruption.
+_OVERLONG_ELEM = [0xFF] * 9 + [0x7F]
+# Eleven bytes: INVALID by length alone, even though the surplus byte is zero.
+_ELEVEN_BYTE_ELEM = [0xFF] * 10 + [0x00]
+# The largest *legal* element: 2^64-1, ten bytes with a tenth byte of 0x01.
+_MAX_U64_ELEM = [0xFF] * 9 + [0x01]
+_OVER_64_ELEMS = [_OVERLONG_ELEM, _ELEVEN_BYTE_ELEM]
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+@pytest.mark.parametrize("elem", _OVER_64_ELEMS, ids=["ten-byte", "eleven-byte"])
+def test_unsigned_array_element_over_64_bits_is_invalid(decoder_cls, elem):
+    # (1<<3)|ARRAY_UNSIGNED, count 1, then one out-of-range element.
+    dec = decoder_cls(reader([(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + elem))
+    assert dec.next() is not None
+    with pytest.raises(SofaDecodeError) as exc:
+        dec.read_unsigned_array()
+    assert not isinstance(exc.value, SofaIncompleteError)
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+@pytest.mark.parametrize("elem", _OVER_64_ELEMS, ids=["ten-byte", "eleven-byte"])
+def test_signed_array_element_over_64_bits_is_invalid(decoder_cls, elem):
+    dec = decoder_cls(reader([(1 << 3) | WireType.ARRAY_SIGNED, 0x01] + elem))
+    assert dec.next() is not None
+    with pytest.raises(SofaDecodeError) as exc:
+        dec.read_signed_array()
+    assert not isinstance(exc.value, SofaIncompleteError)
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_array_element_over_64_bits_is_invalid_when_chunk_fed(decoder_cls):
+    # The same element arriving one byte at a time: the guard has to live in the
+    # decode loop itself, not only in a "whole element already buffered" path.
+    data = bytes([(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + _OVERLONG_ELEM)
+    dec = decoder_cls(ChunkReader(data, 1))
+    assert dec.next() is not None
+    with pytest.raises(SofaDecodeError) as exc:
+        dec.read_unsigned_array()
+    assert not isinstance(exc.value, SofaIncompleteError)
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_array_element_over_64_bits_after_valid_elements_is_invalid(decoder_cls):
+    # The bad element sits behind two good ones, so the guard must hold on every
+    # iteration of the loop and not just the first.
+    data = [(1 << 3) | WireType.ARRAY_UNSIGNED, 0x03, 0x01, 0x02] + _OVERLONG_ELEM
+    dec = decoder_cls(reader(data))
+    assert dec.next() is not None
+    with pytest.raises(SofaDecodeError) as exc:
+        dec.read_unsigned_array()
+    assert not isinstance(exc.value, SofaIncompleteError)
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_max_u64_array_element_is_accepted(decoder_cls):
+    # Control: the boundary value itself is legal and must survive intact — the
+    # guard rejects overflowing payload *bits*, not a full-width element.
+    dec = decoder_cls(reader([(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + _MAX_U64_ELEM))
+    assert dec.next() is not None
+    assert dec.read_unsigned_array() == [0xFFFFFFFFFFFFFFFF]
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_min_i64_array_element_is_accepted(decoder_cls):
+    # Control for the signed path: the zig-zag encoding of INT64_MIN is 2^64-1.
+    dec = decoder_cls(reader([(1 << 3) | WireType.ARRAY_SIGNED, 0x01] + _MAX_U64_ELEM))
+    assert dec.next() is not None
+    assert dec.read_signed_array() == [-(2**63)]
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_skipped_array_with_over_64_bit_element_is_invalid(decoder_cls):
+    # Skipping does not lower the bar (§4.1: "and inside skipped fields").
+    dec = decoder_cls(reader([(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + _OVERLONG_ELEM))
+    assert dec.next() is not None
+    with pytest.raises(SofaDecodeError) as exc:
+        dec.skip()
     assert not isinstance(exc.value, SofaIncompleteError)
 
 

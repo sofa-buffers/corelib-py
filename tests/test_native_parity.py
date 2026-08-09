@@ -167,6 +167,50 @@ def test_cross_decode():
     assert _walk(PyDecoder(io.BytesIO(nd))) == _walk(NativeDecoder(io.BytesIO(pd)))
 
 
+# --- parity on *malformed* input, not just on valid programs (issue #64) -----
+#
+# Byte-identical encoding and identical decoded values are only half the
+# promise: the two engines must also reject the same bytes. The 64-bit varint
+# bound of §4.1 is where they drifted apart — the array read loops inline the
+# codec, and the pure one was missing the guard, so the same message decoded to
+# a value on a pure-Python host and to INVALID on a compiled one. Walk each
+# position a varint can appear in and compare the verdicts, not just the values.
+
+_OVER_64 = [0xFF] * 9 + [0x7F]          # tenth byte's payload lands at bit >= 64
+_ELEVEN_BYTES = [0xFF] * 10 + [0x00]    # too long even with a zero surplus byte
+_MAX_U64 = [0xFF] * 9 + [0x01]          # the legal boundary: 2^64-1
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        [(1 << 3) | WireType.UNSIGNED] + _OVER_64,                       # scalar value
+        [(1 << 3) | WireType.SIGNED] + _OVER_64,
+        [(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + _OVER_64,           # array element
+        [(1 << 3) | WireType.ARRAY_SIGNED, 0x01] + _OVER_64,
+        [(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + _ELEVEN_BYTES,
+        [(1 << 3) | WireType.ARRAY_UNSIGNED, 0x02, 0x01] + _OVER_64,     # behind a good one
+        [(1 << 3) | WireType.ARRAY_UNSIGNED] + _OVER_64,                 # element count
+        _OVER_64,                                                        # field header
+        [(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + _MAX_U64,           # legal control
+        [(1 << 3) | WireType.ARRAY_SIGNED, 0x01] + _MAX_U64,
+    ],
+    ids=[
+        "scalar-unsigned", "scalar-signed", "elem-unsigned", "elem-signed",
+        "elem-eleven-bytes", "elem-behind-valid", "array-count", "field-header",
+        "elem-max-u64", "elem-min-i64",
+    ],
+)
+def test_64_bit_bound_verdicts_identical(data):
+    def verdict(decoder_cls):
+        try:
+            return ("ok", _walk(decoder_cls(io.BytesIO(bytes(data)))))
+        except Exception as exc:  # the verdict IS the result under test here
+            return ("raise", type(exc).__name__)
+
+    assert verdict(PyDecoder) == verdict(NativeDecoder)
+
+
 def test_active_impl_is_consistent():
     import sofab
 
