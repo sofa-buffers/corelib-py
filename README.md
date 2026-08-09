@@ -235,8 +235,8 @@ got = Point.decode(wire)             # got.x == 3, got.y == 4
 
 Array counts and string/blob lengths are optional on the wire, so by default the
 decoder allocates whatever a message declares. Untrusted input can abuse that, so
-`Decoder` takes optional **receiver-side** caps that reject an oversize field at
-header-decode time — *before* any allocation or payload buffering:
+`Decoder` takes optional **receiver-side** caps that reject an oversize field on its
+count/length word alone — *before* any allocation or payload buffering:
 
 ```python
 dec = Decoder(reader, max_array_count=65536, max_string_len=1 << 20, max_blob_len=1 << 20)
@@ -245,15 +245,52 @@ dec = Decoder(reader, max_array_count=65536, max_string_len=1 << 20, max_blob_le
 A field whose declared count/length exceeds its cap raises `SofaLimitError`. That
 is a *policy* rejection, distinct from malformed input: it is a sibling of
 `SofaDecodeError` under `SofaError`, **not** a subclass, so `except
-SofaDecodeError` does not catch it. Each limit defaults to `None` (no cap —
-today's behaviour); the values are meant to be supplied by generated code, not
+SofaDecodeError` does not catch it. Each limit defaults to `None` (no cap);
+the values are meant to be supplied by generated code, not
 guessed by the runtime. Independent of any limit, the decoder never pre-allocates
 from an untrusted array count — a truncated oversize claim fails promptly as
 `SofaIncompleteError` rather than attempting a huge allocation.
 
-A **schema** bound is the opposite kind of thing: it is part of the message
-definition, so breaching it is malformed input, not policy. The integer-array
-reads take the declared element width for exactly that reason —
+The verdict is reached on the count/length word alone, inside `next()`, before a
+single payload byte is read or buffered — the point CORELIB_PLAN §6.2.1 requires
+it to be decided. It is *raised* by the call that would consume the field: a
+typed read, `skip()`, or the auto-skip the following `next()` performs. Nothing
+is read or allocated in between, and the field cannot be got at any other way, so
+the protection is the same; what the gap buys is the window in which the caller
+can say the field is not one of the cap's business.
+
+### A schema-bounded field is exempt: `schema_bounded()`
+
+A cap is *capacity* the deployment commits where the **sender** chooses the size.
+Where the **schema** already states a `count:`/`maxlen:`, that bound governs
+instead and an over-bound value is malformed input, so §6.2.1 forbids the cap
+there ("MUST NOT be applied to a field the schema already bounds") and §6.3
+forbids `SofaLimitError` on such a field. Only the schema knows which fields
+those are, so the caller declares them per field:
+
+```python
+f = dec.next()
+if f.id == 1:                 # `name: { type: string, maxlen: 4194304 }`
+    dec.schema_bounded()      # the cap does not bind this field
+    if dec.fixlen_len() > 4194304:
+        raise SofaDecodeError("name: string byte length above schema maxlen")
+    o.name = dec.string()
+```
+
+The declaration covers the current field only — the next `next()` starts an
+undeclared, and therefore capped, field again — and it is a no-op on a field no
+cap has rejected, so generated code emits it unconditionally on the fields its
+schema bounds. Declaring is a **promise to enforce**: with the cap off, nothing
+else stands between an untrusted length word and the allocation it implies, so
+the caller must reject an over-bound count/length itself, as `SofaDecodeError`
+(MESSAGE_SPEC §7.1). `fixlen_len()` is the peek for that — it consumes nothing
+and answers whether or not a cap has spoken on the field, so the schema bound can
+be decided in either order. A `Visitor` driven by `drive()` can call
+`schema_bounded()` from `on_field`, which is reached before the typed read.
+
+A **schema** bound is the opposite kind of thing from a cap: it is part of the
+message definition, so breaching it is malformed input, not policy. The
+integer-array reads take the declared element width for exactly that reason —
 `read_unsigned_array(255)` for a `u8` array, `read_signed_array(-128, 127)` for
 an `i8` one (either half may be given alone; the other side stays open). An
 element outside the declared width raises `SofaDecodeError` the moment its own

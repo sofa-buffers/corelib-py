@@ -586,6 +586,11 @@ cdef int _PEND_SCALAR = 1
 cdef int _PEND_FIXLEN = 2
 cdef int _PEND_VARRAY = 3
 cdef int _PEND_FARRAY = 4
+# A pending value a receiver-side cap has rejected (§6.2.1). The kind it stands
+# in for is kept in _pk_real and the rejection's message in _limit_msg, so the
+# rejection can still be waived by schema_bounded() and a peek can read through
+# it. Mirrors the pure decoder's _LIMIT wrapper tuple.
+cdef int _PEND_LIMIT = 5
 
 
 # --- ZigZag (identical math to sofab._varint) --------------------------------
@@ -1537,6 +1542,10 @@ cdef class Decoder:
     cdef int _cur_wtype
     # pending unconsumed value
     cdef int _pk                    # pending kind
+    # A parked receiver-cap rejection (§6.2.1): the kind _PEND_LIMIT stands in
+    # for, and the message the consume path raises. See _park_limit.
+    cdef int _pk_real
+    cdef object _limit_msg
     cdef int _pend_wtype
     cdef int _pend_subtype
     cdef uint64_t _pend_count
@@ -1564,6 +1573,8 @@ cdef class Decoder:
         self._cur_wtype = -1
         self._spill = None
         self._pk = _PEND_NONE
+        self._pk_real = _PEND_NONE
+        self._limit_msg = None
         self._keep = 0
         self._floor = -1
         self._keep_cur_wtype = -1
@@ -1911,46 +1922,47 @@ cdef class Decoder:
                 raise SofaDecodeError("fp32 fixlen length must be 4")
             if subtype == _ST_FP64 and length != 8:
                 raise SofaDecodeError("fp64 fixlen length must be 8")
-            # Receiver-configured limits (policy, not malformation): reject an
-            # oversize string/blob here — before its payload is read or buffered.
-            if subtype == _ST_STRING and self._max_string_len is not None \
-                    and PyLong_FromUnsignedLongLong(length) > self._max_string_len:
-                raise SofaLimitError("string length %d exceeds max_string_len %s"
-                                     % (PyLong_FromUnsignedLongLong(length), self._max_string_len))
-            if subtype == _ST_BLOB and self._max_blob_len is not None \
-                    and PyLong_FromUnsignedLongLong(length) > self._max_blob_len:
-                raise SofaLimitError("blob length %d exceeds max_blob_len %s"
-                                     % (PyLong_FromUnsignedLongLong(length), self._max_blob_len))
             self._cur = _mkfield(field_id, _WT[_WT_FIXLEN],
                                  PyLong_FromUnsignedLongLong(length), _ZERO, _ST[subtype])
             self._pk = _PEND_FIXLEN
             self._pend_subtype = subtype
             self._pend_size = length
+            # Receiver-configured caps (policy, not malformation): the verdict on
+            # an oversize string/blob is reached here, on the length word alone —
+            # before its payload is read or buffered — and PARKED on the pending
+            # value rather than raised, so the caller keeps the §6.2.1 window in
+            # which it can declare the field schema-bounded and take the cap off
+            # it. Every consume path raises it; see _park_limit / _pending_error.
+            if subtype == _ST_STRING and self._max_string_len is not None \
+                    and PyLong_FromUnsignedLongLong(length) > self._max_string_len:
+                self._park_limit("string length %d exceeds max_string_len %s"
+                                 % (PyLong_FromUnsignedLongLong(length), self._max_string_len))
+            elif subtype == _ST_BLOB and self._max_blob_len is not None \
+                    and PyLong_FromUnsignedLongLong(length) > self._max_blob_len:
+                self._park_limit("blob length %d exceeds max_blob_len %s"
+                                 % (PyLong_FromUnsignedLongLong(length), self._max_blob_len))
             return self._cur
 
         if wtype == _WT_ARRAY_UNSIGNED or wtype == _WT_ARRAY_SIGNED:
             count = self._varint()
             if count > _ARRAY_MAX:
                 raise SofaDecodeError("array count %d out of range" % PyLong_FromUnsignedLongLong(count))
-            if self._max_array_count is not None \
-                    and PyLong_FromUnsignedLongLong(count) > self._max_array_count:
-                raise SofaLimitError("array count %d exceeds max_array_count %s"
-                                     % (PyLong_FromUnsignedLongLong(count), self._max_array_count))
             self._cur = _mkfield(field_id, _WT[wtype], _ZERO,
                                  PyLong_FromUnsignedLongLong(count), _NONE)
             self._pk = _PEND_VARRAY
             self._pend_wtype = wtype
             self._pend_count = count
+            # Parked, not raised — see the fixlen branch above (§6.2.1).
+            if self._max_array_count is not None \
+                    and PyLong_FromUnsignedLongLong(count) > self._max_array_count:
+                self._park_limit("array count %d exceeds max_array_count %s"
+                                 % (PyLong_FromUnsignedLongLong(count), self._max_array_count))
             return self._cur
 
         # wtype == _WT_ARRAY_FIXLEN
         count = self._varint()
         if count > _ARRAY_MAX:
             raise SofaDecodeError("array count %d out of range" % PyLong_FromUnsignedLongLong(count))
-        if self._max_array_count is not None \
-                and PyLong_FromUnsignedLongLong(count) > self._max_array_count:
-            raise SofaLimitError("array count %d exceeds max_array_count %s"
-                                 % (PyLong_FromUnsignedLongLong(count), self._max_array_count))
         # §4.8: a fixlen array ALWAYS carries its fixlen_word — read it
         # unconditionally to recover the true subtype/width.
         elem_header = self._varint()
@@ -1976,7 +1988,44 @@ cdef class Decoder:
         self._pend_subtype = subtype
         self._pend_count = count
         self._pend_size = elem_size
+        # Parked, not raised — see the fixlen branch above (§6.2.1).
+        if self._max_array_count is not None \
+                and PyLong_FromUnsignedLongLong(count) > self._max_array_count:
+            self._park_limit("array count %d exceeds max_array_count %s"
+                             % (PyLong_FromUnsignedLongLong(count), self._max_array_count))
         return self._cur
+
+    # --- receiver caps vs. schema bounds (§6.2.1) ---------------------------
+
+    cdef inline int _park_limit(self, msg) except -1:
+        # Park a receiver-cap rejection on the pending value instead of raising
+        # it. The verdict is already final and was reached at the count/length
+        # header, before anything was read or allocated; parking it only moves
+        # the RAISE to the call that would consume the field, which is what
+        # leaves the caller room to declare the field schema-bounded first.
+        self._pk_real = self._pk
+        self._pk = _PEND_LIMIT
+        self._limit_msg = msg
+        return 0
+
+    cdef object _pending_error(self, msg):
+        # The exception a mismatched pending kind deserves: the parked cap
+        # rejection when one is what stands in the way, the caller's state error
+        # otherwise. Reached only once a read has already found the kind wrong,
+        # so the ordinary path never pays for it.
+        if self._pk == _PEND_LIMIT:
+            return SofaLimitError(self._limit_msg)
+        return SofaStateError(msg)
+
+    def schema_bounded(self):
+        # Declare the current field schema-bounded, so the receiver-side caps do
+        # not apply to it (§6.2.1). See sofab.decoder.Decoder.schema_bounded for
+        # the contract — the declaration covers this field only, is a no-op on a
+        # field no cap has rejected, and is a promise that the caller enforces
+        # the schema bound itself (as INVALID, MESSAGE_SPEC §7.1).
+        if self._pk == _PEND_LIMIT:
+            self._pk = self._pk_real
+            self._limit_msg = None
 
     # --- skipping -----------------------------------------------------------
 
@@ -2016,8 +2065,10 @@ cdef class Decoder:
             self._read_exact(<Py_ssize_t>self._pend_size)
         elif kind == _PEND_VARRAY:
             self._skip_varints(<Py_ssize_t>self._pend_count)
-        else:  # _PEND_FARRAY
+        elif kind == _PEND_FARRAY:
             self._read_exact(self._farray_nbytes(self._pend_count, self._pend_size))
+        else:  # _PEND_LIMIT — a skip still buffers the payload, so the cap binds it
+            raise SofaLimitError(self._limit_msg)
         # Cleared only now: had the value run out mid-skip, the field has to stay
         # pending so the retry skips it again from its first byte (§5.2).
         self._pk = _PEND_NONE
@@ -2094,7 +2145,7 @@ cdef class Decoder:
     cdef bytes _take_fixlen(self, int subtype):
         cdef bytes data
         if self._pk != _PEND_FIXLEN:
-            raise SofaStateError("current field is not a fixlen value")
+            raise self._pending_error("current field is not a fixlen value")
         if self._pend_subtype != subtype:
             raise SofaStateError("fixlen subtype does not match the requested read")
         self._arm()
@@ -2110,7 +2161,7 @@ cdef class Decoder:
         # back to _read_exact and park its object in ``_spill``, which owns it
         # for as long as the caller can still hold the pointer.
         if self._pk != _PEND_FIXLEN:
-            raise SofaStateError("current field is not a fixlen value")
+            raise self._pending_error("current field is not a fixlen value")
         if self._pend_subtype != subtype:
             raise SofaStateError("fixlen subtype does not match the requested read")
         cdef const unsigned char* p
@@ -2141,6 +2192,13 @@ cdef class Decoder:
         # schema maxlen on the exact wire byte length, before allocation and without
         # re-encoding a decoded str. Mirrors Decoder.fixlen_len in the pure engine.
         if self._pk != _PEND_FIXLEN:
+            # A parked receiver cap (§6.2.1) keeps the pending fixlen intact, and
+            # this peek reads and allocates nothing — so it answers through the
+            # parked rejection. That is what lets generated code decide the
+            # SCHEMA bound (INVALID, §7.1) whether or not schema_bounded() has
+            # been called yet. Mirrors Decoder.fixlen_len in the pure engine.
+            if self._pk == _PEND_LIMIT and self._pk_real == _PEND_FIXLEN:
+                return self._pend_size
             raise SofaStateError("current field is not a fixlen value")
         return self._pend_size
 
@@ -2148,7 +2206,7 @@ cdef class Decoder:
         cdef Py_ssize_t n
         cdef const unsigned char* p
         if self._pk != _PEND_FIXLEN:
-            raise SofaStateError("current field is not a fixlen value")
+            raise self._pending_error("current field is not a fixlen value")
         n = <Py_ssize_t>self._pend_size      # bounded by FIXLEN_MAX in next()
         p = self._take_fixlen_ptr(_ST_STRING, n)
         try:
@@ -2162,7 +2220,7 @@ cdef class Decoder:
         cdef Py_ssize_t n
         cdef const unsigned char* p
         if self._pk != _PEND_FIXLEN:
-            raise SofaStateError("current field is not a fixlen value")
+            raise self._pending_error("current field is not a fixlen value")
         n = <Py_ssize_t>self._pend_size
         p = self._take_fixlen_ptr(_ST_BLOB, n)
         if self._spill is not None:
@@ -2176,7 +2234,7 @@ cdef class Decoder:
         # cleared by the caller only once the payload has actually been decoded,
         # so a suspension leaves the array re-readable from element one (§5.2).
         if self._pk != _PEND_VARRAY or self._pend_wtype != wtype:
-            raise SofaStateError("current field is not a matching varint array")
+            raise self._pending_error("current field is not a matching varint array")
         return self._pend_count
 
     def read_unsigned_array(self, elem_max=None):
@@ -2219,7 +2277,7 @@ cdef class Decoder:
         # Like _take_varray, the pending value is cleared by the caller only
         # after the payload has been read (§5.2).
         if self._pk != _PEND_FARRAY:
-            raise SofaStateError("current field is not a fixlen array")
+            raise self._pending_error("current field is not a fixlen array")
         if self._pend_subtype != subtype:
             raise SofaStateError("fixlen-array subtype does not match the requested read")
         return self._pend_count, self._pend_size
