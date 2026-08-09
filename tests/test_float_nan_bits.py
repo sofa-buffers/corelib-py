@@ -169,3 +169,28 @@ def _reencode_message(wire: bytes) -> bytes:
 
     copy()
     return enc.getvalue()
+
+
+def test_fp32_array_mixes_nan_and_ordinary_elements():
+    """A NaN and an ordinary value in the *same* fp32 array.
+
+    Only a NaN needs the raw-bits path — every other value converts exactly
+    through ``struct``'s own ``f`` code — so the array codec decides per element.
+    An array that mixes the two is the case where getting that split wrong shows:
+    a NaN handed to the exact path would come back quieted, and an ordinary value
+    handed to the bit path must still come back identical.
+    """
+    payloads = ["0000803f", "0100807f", "000000c0", "ffff7f7f", "00000080"]
+
+    enc = Encoder()
+    enc.write_float32_array(4, [0.0] * len(payloads))
+    frame = enc.getvalue()[: -4 * len(payloads)] + bytes.fromhex("".join(payloads))
+
+    dec = Decoder(reader(frame))
+    dec.next()
+    got = dec.read_float32_array()
+    assert got[0] == 1.0 and got[2] == -2.0 and got[4] == 0.0
+
+    out = Encoder()
+    out.write_float32_array(4, got)
+    assert out.getvalue()[-4 * len(payloads):].hex() == "".join(payloads)

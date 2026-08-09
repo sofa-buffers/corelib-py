@@ -38,8 +38,10 @@ def _unpack_f32_bits(bits: int) -> float:
         # (top bit = is-quiet) maps to the top 23 bits of the 52-bit fp64
         # mantissa (<< 29), so the signaling bit and payload survive.
         dbits = ((bits >> 31) << 63) | (0x7FF << 52) | ((bits & _F32_MANT) << 29)
-        return float(_F64.unpack(_U64.pack(dbits))[0])
-    return float(_F32.unpack(_U32.pack(bits))[0])
+        wide: float = _F64.unpack(_U64.pack(dbits))[0]
+        return wide
+    value: float = _F32.unpack(_U32.pack(bits))[0]
+    return value
 
 
 def _pack_f32_bits(value: float) -> int:
@@ -60,7 +62,7 @@ def _pack_f32_bits(value: float) -> int:
     ``SofaError``, so sticky mode could not latch it).
     """
     if value != value:  # NaN — only a NaN is unequal to itself
-        dbits = int(_U64.unpack(_F64.pack(value))[0])
+        dbits: int = _U64.unpack(_F64.pack(value))[0]
         # Recover the top 23 mantissa bits (>> 29), keeping sign + signaling bit.
         bits = ((dbits >> 63) << 31) | _F32_EXP | ((dbits >> 29) & _F32_MANT)
         if (bits & _F32_MANT) == 0:
@@ -69,7 +71,8 @@ def _pack_f32_bits(value: float) -> int:
             bits |= 0x00400000
         return bits
     try:
-        return int(_U32.unpack(_F32.pack(value))[0])
+        narrowed: int = _U32.unpack(_F32.pack(value))[0]
+        return narrowed
     except OverflowError:
         # Cold: only an out-of-fp32-range magnitude gets here. float() re-raises
         # for a value that is not even a double (a huge int), which is what the
@@ -77,8 +80,21 @@ def _pack_f32_bits(value: float) -> int:
         return _F32_EXP | (0x80000000 if float(value) < 0.0 else 0)
 
 
+# The bit-level fp32 helpers above exist for NaN alone: only a NaN payload has
+# to survive the trip through a Python ``float`` unchanged (§4.6/§6.5). Every
+# other value converts exactly through ``struct``'s own ``f`` code, in ONE call
+# rather than the unpack->pack->unpack round trip the bit path costs — and
+# whether a value is a NaN is answered by the conversion itself (``v != v``),
+# so the fast path needs no test of its own before it runs.
+
+
 def pack_f32(value: float) -> bytes:
     """Pack a single fp32 value to 4 little-endian bytes."""
+    if value == value:  # not NaN: struct narrows exactly, except on overflow
+        try:
+            return _F32.pack(value)
+        except OverflowError:
+            pass
     return _U32.pack(_pack_f32_bits(value))
 
 
@@ -89,18 +105,25 @@ def pack_f64(value: float) -> bytes:
 
 def unpack_f32(data: bytes) -> float:
     """Decode a single little-endian fp32 value from 4 bytes."""
-    return _unpack_f32_bits(_U32.unpack(data)[0])
+    value: float = _F32.unpack(data)[0]
+    if value != value:  # NaN: re-derive it from the raw bits, payload intact
+        return _unpack_f32_bits(_U32.unpack(data)[0])
+    return value
 
 
 def unpack_f64(data: bytes) -> float:
     """Decode a single little-endian fp64 value from 8 bytes."""
-    return float(_F64.unpack(data)[0])
+    value: float = _F64.unpack(data)[0]
+    return value
 
 
 def unpack_f32_array(data: bytes, count: int) -> list[float]:
     """Decode ``count`` little-endian fp32 values (NaN-bit-preserving)."""
+    values = list(struct.unpack(f"<{count}f", data))
+    if not any(v != v for v in values):
+        return values
     bits = struct.unpack(f"<{count}I", data)
-    return [_unpack_f32_bits(b) for b in bits]
+    return [_unpack_f32_bits(b) if v != v else v for v, b in zip(values, bits)]
 
 
 def unpack_f64_array(data: bytes, count: int) -> list[float]:
@@ -110,6 +133,11 @@ def unpack_f64_array(data: bytes, count: int) -> list[float]:
 
 def pack_f32_array(values: list[float]) -> bytes:
     """Encode a list of fp32 values (NaN-bit-preserving), little-endian."""
+    if not any(v != v for v in values):
+        try:
+            return struct.pack(f"<{len(values)}f", *values)
+        except OverflowError:
+            pass
     return struct.pack(f"<{len(values)}I", *[_pack_f32_bits(v) for v in values])
 
 

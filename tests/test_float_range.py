@@ -106,3 +106,20 @@ def test_saturated_value_round_trips():
     assert dec.float32() == float("inf")
     dec.next()
     assert dec.read_float32_array() == [float("-inf")]
+
+
+def test_pure_array_saturates_only_the_out_of_range_elements():
+    """An fp32 array that mixes an out-of-fp32-range magnitude with ordinary
+    values: the oversized one saturates to ±inf and the rest are untouched.
+
+    A whole-array narrowing has to give the same bytes as a per-element one, so
+    the array codec may take a bulk path only where every element survives it.
+    """
+    enc = PyEncoder()
+    enc.write_float32_array(1, [1.0, 1e300, -2.0, -1e300])
+    payload = enc.getvalue()[-16:].hex()
+    assert payload == "0000803f" + "0000807f" + "000000c0" + "000080ff"
+
+    na = NativeEncoder()
+    na.write_float32_array(1, [1.0, 1e300, -2.0, -1e300])
+    assert na.getvalue() == enc.getvalue()

@@ -19,6 +19,8 @@ from __future__ import annotations
 import io
 
 import pytest
+from vectors import DECODER_ENGINES as ENGINES
+from vectors import uvarint
 
 from sofab import (
     Encoder,
@@ -27,15 +29,6 @@ from sofab import (
     SofaLimitError,
     SofaStateError,
 )
-from sofab.decoder import Decoder as PyDecoder
-
-ENGINES = [pytest.param(PyDecoder, id="pure")]
-try:  # the native accelerator is optional; skip that half where it is absent
-    from sofab._speedups import Decoder as NativeDecoder
-except ImportError:  # pragma: no cover - pure-Python-only install
-    pass
-else:
-    ENGINES.append(pytest.param(NativeDecoder, id="native"))
 
 BIG = "x" * 2000
 
@@ -45,13 +38,7 @@ def _dec(engine, data, **kw):
 
 
 def _uvarint(x: int) -> list[int]:
-    out = []
-    while True:
-        b = x & 0x7F
-        x >>= 7
-        out.append(b | 0x80 if x else b)
-        if not x:
-            return out
+    return list(uvarint(x))
 
 
 # --- a declared field is exempt (§6.2.1 "MUST NOT be applied") ---------------

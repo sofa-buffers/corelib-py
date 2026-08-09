@@ -817,24 +817,22 @@ class Decoder:
     def float32(self) -> float:
         """Consume the current fixlen field as a 32-bit IEEE-754 float.
 
-        Raises :class:`SofaStateError` if the field is not an fp32 fixlen, or
-        :class:`SofaDecodeError` if its payload is not 4 bytes.
+        Raises :class:`SofaStateError` if the field is not an fp32 fixlen. The
+        payload is necessarily 4 bytes: §4.6's width rule is settled at the
+        length header by :meth:`next`, which is where §5.2 wants that INVALID
+        verdict reached — before any payload read, so it outranks a truncation
+        behind it. Re-deciding the width here could only restate a check no
+        input can reach (the native engine does not carry one either).
         """
-        data = self._take_fixlen(FixlenSubtype.FP32)
-        if len(data) != 4:  # pragma: no cover - header validates width eagerly (see next())
-            raise SofaDecodeError("fp32 payload must be 4 bytes")
-        return _core.unpack_f32(data)
+        return _core.unpack_f32(self._take_fixlen(FixlenSubtype.FP32))
 
     def float64(self) -> float:
         """Consume the current fixlen field as a 64-bit IEEE-754 float.
 
-        Raises :class:`SofaStateError` if the field is not an fp64 fixlen, or
-        :class:`SofaDecodeError` if its payload is not 8 bytes.
+        Raises :class:`SofaStateError` if the field is not an fp64 fixlen; the
+        payload is necessarily 8 bytes (see :meth:`float32`).
         """
-        data = self._take_fixlen(FixlenSubtype.FP64)
-        if len(data) != 8:  # pragma: no cover - header validates width eagerly (see next())
-            raise SofaDecodeError("fp64 payload must be 8 bytes")
-        return _core.unpack_f64(data)
+        return _core.unpack_f64(self._take_fixlen(FixlenSubtype.FP64))
 
     def fixlen_len(self) -> int:
         """Return the current fixlen field's payload byte length without consuming it.

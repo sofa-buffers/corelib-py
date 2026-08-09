@@ -19,20 +19,11 @@ from __future__ import annotations
 import io
 
 import pytest
+from vectors import DECODER_ENGINES as ENGINES
 
 from sofab import zigzag_decode, zigzag_encode
 from sofab._varint import encode_varint
-from sofab.decoder import Decoder as PyDecoder
 from sofab.types import SofaDecodeError, SofaIncompleteError, WireType
-
-try:  # the native accelerator is optional — the pure engine is always tested
-    from sofab._speedups import Decoder as NativeDecoder
-except ImportError:  # pragma: no cover - only when the extension is not built
-    NativeDecoder = None
-
-ENGINES = [pytest.param(PyDecoder, id="pure")]
-if NativeDecoder is not None:
-    ENGINES.append(pytest.param(NativeDecoder, id="native"))
 
 # Field id 1, as an unsigned scalar and as an unsigned array of one element.
 _U_SCALAR = bytes([(1 << 3) | WireType.UNSIGNED])

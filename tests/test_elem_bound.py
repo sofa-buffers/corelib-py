@@ -19,34 +19,16 @@ from __future__ import annotations
 import io
 
 import pytest
+from vectors import DECODER_ENGINES as ENGINES
+from vectors import uvarint as _varint
+from vectors import zzvarint as _zz
 
-from sofab.decoder import Decoder as PyDecoder
 from sofab.types import SofaDecodeError, SofaIncompleteError
-
-_speedups = pytest.importorskip("sofab._speedups", reason="native extension not built")
-
-ENGINES = [pytest.param(PyDecoder, id="pure"), pytest.param(_speedups.Decoder, id="native")]
 
 # id 0, unsigned array -> header (0 << 3) | 3
 # id 1, signed array   -> header (1 << 3) | 4
 U_HDR = bytes([(0 << 3) | 3])
 S_HDR = bytes([(1 << 3) | 4])
-
-
-def _varint(x: int) -> bytes:
-    out = bytearray()
-    while True:
-        b = x & 0x7F
-        x >>= 7
-        if not x:
-            out.append(b)
-            return bytes(out)
-        out.append(b | 0x80)
-
-
-def _zz(x: int) -> bytes:
-    """One ZigZag-encoded signed element on the wire."""
-    return _varint((x << 1) ^ (x >> 63))
 
 
 def _uarray(values: list[int]) -> bytes:

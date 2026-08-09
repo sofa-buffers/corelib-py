@@ -14,18 +14,12 @@ call, so every chunk boundary in the message becomes a suspension point.
 
 from __future__ import annotations
 
-import json
 import struct
-from pathlib import Path
 
 import pytest
-from vectors import FULL_SCALE_EXPECTED
+from vectors import FULL_SCALE_EXPECTED, VECTORS
 
 from sofab import Decoder, Encoder, SofaIncompleteError, WireType
-
-VECTORS = json.loads(
-    (Path(__file__).resolve().parents[1] / "assets" / "test_vectors.json").read_text()
-)["vectors"]
 
 
 class Feeder:

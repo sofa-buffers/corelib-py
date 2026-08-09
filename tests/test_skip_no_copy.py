@@ -26,22 +26,9 @@ import tracemalloc
 from typing import Any, Callable
 
 import pytest
-from vectors import ChunkReader, reader
+from vectors import ENGINE_PAIRS, ChunkReader, reader
 
-from sofab.decoder import Decoder as PyDecoder
-from sofab.encoder import Encoder as PyEncoder
-
-try:  # the native accelerator is optional
-    from sofab import _speedups
-
-    _ENGINES = [
-        pytest.param(PyEncoder, PyDecoder, id="python"),
-        pytest.param(_speedups.Encoder, _speedups.Decoder, id="native"),
-    ]
-except ImportError:  # pragma: no cover - exercised only on a pure-Python build
-    _ENGINES = [pytest.param(PyEncoder, PyDecoder, id="python")]
-
-ENGINES = pytest.mark.parametrize(("Encoder", "Decoder"), _ENGINES)
+ENGINES = pytest.mark.parametrize(("Encoder", "Decoder"), ENGINE_PAIRS)
 
 # Big enough that a copy of it dwarfs the decoder's own bookkeeping, small
 # enough to stay comfortable in CI.

@@ -26,39 +26,18 @@ separate copies of the hold-back logic, so both have to be proven.
 from __future__ import annotations
 
 import pytest
+from vectors import ENCODER_ENGINES
+from vectors import uvarint as _varint
 
-from sofab.encoder import Encoder as PyEncoder
 from sofab.types import MAX_DEPTH
 
-_ENGINES = [pytest.param(PyEncoder, id="python")]
-try:  # pragma: no cover - depends on whether the extension was built
-    from sofab._speedups import Encoder as NativeEncoder
-
-    _ENGINES.append(pytest.param(NativeEncoder, id="native"))
-except ImportError:  # pragma: no cover
-    pass
-
-engine = pytest.mark.parametrize("Encoder", _ENGINES)
+engine = pytest.mark.parametrize("Encoder", ENCODER_ENGINES)
 
 
 def _encode(Encoder, fn) -> bytes:
     enc = Encoder()
     fn(enc)
     return enc.getvalue()
-
-
-def _varint(value: int) -> bytes:
-    """Independent varint encoder, so an expected byte string can be built for a
-    nesting depth whose sequence headers no longer fit in one byte."""
-    out = bytearray()
-    while True:
-        b = value & 0x7F
-        value >>= 7
-        if value:
-            out.append(b | 0x80)
-        else:
-            out.append(b)
-            return bytes(out)
 
 
 # --- the seven framing tests -------------------------------------------------
