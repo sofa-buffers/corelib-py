@@ -1769,6 +1769,21 @@ cdef class Decoder:
         self._pos = pos + n
         return out
 
+    cdef int _skip_exact(self, Py_ssize_t n) except -1:
+        # Consume n bytes without building the object holding them: §5.2 makes a
+        # skip pure consumption, so it must not pay for a copy of a payload it
+        # discards. Same sourcing and same suspension as _read_exact, mirroring
+        # Decoder._skip_exact in the pure engine — the bytes stay buffered on the
+        # slow path (the resume contract replays them), only the copy is gone.
+        cdef Py_ssize_t pos = self._pos
+        if pos + n <= self._n:
+            self._pos = pos + n
+            return 0
+        if not self._need(n):
+            raise self._suspend("truncated payload")
+        self._pos += n
+        return 0
+
     cdef list _read_varints(
         self, Py_ssize_t count, bint zigzag, bint bounded, int64_t lo, int64_t hi
     ):
@@ -2085,11 +2100,11 @@ cdef class Decoder:
         if kind == _PEND_SCALAR:
             self._varint()
         elif kind == _PEND_FIXLEN:
-            self._read_exact(<Py_ssize_t>self._pend_size)
+            self._skip_exact(<Py_ssize_t>self._pend_size)
         elif kind == _PEND_VARRAY:
             self._skip_varints(<Py_ssize_t>self._pend_count)
         elif kind == _PEND_FARRAY:
-            self._read_exact(self._farray_nbytes(self._pend_count, self._pend_size))
+            self._skip_exact(self._farray_nbytes(self._pend_count, self._pend_size))
         else:  # _PEND_LIMIT — a skip still buffers the payload, so the cap binds it
             raise SofaLimitError(self._limit_msg)
         # Cleared only now: had the value run out mid-skip, the field has to stay
