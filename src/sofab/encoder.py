@@ -54,6 +54,7 @@ from . import _core
 from ._varint import encode_varint, zigzag_encode
 from .types import (
     ARRAY_MAX,
+    FIXLEN_MAX,
     ID_MAX,
     MAX_DEPTH,
     MIN_OUTPUT_BUFFER,
@@ -509,7 +510,20 @@ class Encoder:
 
     def write_bytes(self, field_id: SupportsIndex,
                     data: bytes | bytearray | memoryview) -> None:
-        """Write a raw byte blob as a fixlen field (BLOB subtype)."""
+        """Write a raw byte blob as a fixlen field (BLOB subtype).
+
+        A blob longer than :data:`sofab.FIXLEN_MAX` is refused with
+        :class:`SofaRangeError` (see :meth:`_write_fixlen`) — on the *declared*
+        length, before the copy, so an oversized payload is never duplicated
+        just to be rejected.
+        """
+        if not self._begin():
+            return
+        n = len(data)
+        if n > FIXLEN_MAX:
+            self._fail(SofaRangeError(
+                f"fixlen payload of {n} bytes exceeds FIXLEN_MAX={FIXLEN_MAX}"))
+            return
         self._write_fixlen(field_id, bytes(data), FixlenSubtype.BLOB)
 
     def _write_fixlen(self, field_id: SupportsIndex, data: bytes,
@@ -517,8 +531,20 @@ class Encoder:
         if not self._begin():
             return
         try:
+            n = len(data)
+            # §6.2: FIXLEN_MAX is a format-wide ceiling, so a longer payload
+            # could only be framed by a fixlen word (§4.6, length range
+            # 0..2,147,483,647) that every conformant decoder rejects — this
+            # port's own included. Refusing it here is §6.3's InvalidArgument;
+            # emitting it would hand the caller an unreadable message while
+            # reporting success (the encode-side form of §5.1). The check
+            # precedes the field header, so a refused field leaves nothing
+            # behind on the wire.
+            if n > FIXLEN_MAX:
+                raise SofaRangeError(
+                    f"fixlen payload of {n} bytes exceeds FIXLEN_MAX={FIXLEN_MAX}")
             self._header(field_id, WireType.FIXLEN)
-            self._emit_varint((len(data) << 3) | subtype)
+            self._emit_varint((n << 3) | subtype)
             self._put(data)
         except SofaError as exc:
             self._fail(exc)

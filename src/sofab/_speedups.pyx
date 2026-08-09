@@ -1261,6 +1261,18 @@ cdef class Encoder:
         self._write_fixlen_raw(field_id, <const unsigned char*>utf8, <size_t>n, _ST_STRING)
 
     def write_bytes(self, object field_id, object data):
+        if not self._begin():
+            return
+        # Screen the blob on its declared length before the copy (§6.2
+        # FIXLEN_MAX): a payload that is about to be refused is not worth
+        # duplicating first. _write_fixlen_bytes re-checks the materialised
+        # length, which is what actually reaches the wire. Mirrors the
+        # pure-Python Encoder.write_bytes.
+        cdef Py_ssize_t n = len(data)
+        if n > <Py_ssize_t>_FIXLEN_MAX:
+            self._fail(SofaRangeError(
+                "fixlen payload of %d bytes exceeds FIXLEN_MAX=%d" % (n, _FIXLEN_MAX)))
+            return
         cdef bytes b = bytes(data)
         self._write_fixlen_bytes(field_id, b, _ST_BLOB)
 
@@ -1269,6 +1281,14 @@ cdef class Encoder:
         if not self._begin():
             return 0
         try:
+            # §6.2: FIXLEN_MAX is a format-wide ceiling — a longer payload could
+            # only be framed by a fixlen word (§4.6) every conformant decoder
+            # rejects, so it is InvalidArgument (§6.3) here rather than an
+            # unreadable message reported as success (§5.1). Before the header,
+            # so a refused field leaves nothing behind.
+            if n > <size_t>_FIXLEN_MAX:
+                raise SofaRangeError(
+                    "fixlen payload of %d bytes exceeds FIXLEN_MAX=%d" % (n, _FIXLEN_MAX))
             self._header(field_id, _WT_FIXLEN)
             self._emit_varint((<uint64_t>n << 3) | <uint64_t>subtype)
             self._put(data, n)
@@ -1281,6 +1301,9 @@ cdef class Encoder:
             return 0
         cdef Py_ssize_t n = PyBytes_GET_SIZE(data)
         try:
+            if n > <Py_ssize_t>_FIXLEN_MAX:  # §6.2 — see _write_fixlen_raw
+                raise SofaRangeError(
+                    "fixlen payload of %d bytes exceeds FIXLEN_MAX=%d" % (n, _FIXLEN_MAX))
             self._header(field_id, _WT_FIXLEN)
             self._emit_varint((<uint64_t>n << 3) | <uint64_t>subtype)
             self._put(<const unsigned char*>PyBytes_AS_STRING(data), <size_t>n)
