@@ -1,21 +1,61 @@
-"""Varint + zigzag codec unit tests."""
+"""Varint (§4.1) + ZigZag (§4.2) codec tests, driven through the live codecs.
+
+There are exactly **two** varint decoders in this package — the pure engine
+inlines the codec into its cursor loops (``sofab.decoder``: ``_varint`` for a
+scalar, ``_read_varints`` for array elements) and the accelerator has its own in
+C (``sofab._speedups``). Nothing else may decode a varint: a third, test-only
+copy would have to be kept in sync by hand and would let a §4.1 rule pass here
+while the shipped paths silently disagree with it (issue #75).
+
+So every decode case below runs through a real ``Decoder``, on both engines, and
+on *both* inlined loops — the scalar path and the array-element path, which
+carry the 64-bit bound separately. Only the encoder half is a shared helper
+(``sofab._varint.encode_varint``, used by ``Encoder``), and it is unit-tested as
+such.
+"""
 
 from __future__ import annotations
+
+import io
 
 import pytest
 
 from sofab import zigzag_decode, zigzag_encode
-from sofab._varint import decode_varint, encode_varint
-from sofab.types import SofaDecodeError, SofaIncompleteError
+from sofab._varint import encode_varint
+from sofab.decoder import Decoder as PyDecoder
+from sofab.types import SofaDecodeError, SofaIncompleteError, WireType
+
+try:  # the native accelerator is optional — the pure engine is always tested
+    from sofab._speedups import Decoder as NativeDecoder
+except ImportError:  # pragma: no cover - only when the extension is not built
+    NativeDecoder = None
+
+ENGINES = [pytest.param(PyDecoder, id="pure")]
+if NativeDecoder is not None:
+    ENGINES.append(pytest.param(NativeDecoder, id="native"))
+
+# Field id 1, as an unsigned scalar and as an unsigned array of one element.
+_U_SCALAR = bytes([(1 << 3) | WireType.UNSIGNED])
+_U_ARRAY = bytes([(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01])
 
 
-def _reader(data: bytes):
-    it = iter(data)
+def _read_scalar(engine, body: bytes) -> int:
+    dec = engine(io.BytesIO(_U_SCALAR + body))
+    dec.next()
+    return dec.unsigned()
 
-    def read_byte():
-        return next(it, None)
 
-    return read_byte
+def _read_element(engine, body: bytes) -> int:
+    dec = engine(io.BytesIO(_U_ARRAY + body))
+    dec.next()
+    return dec.read_unsigned_array()[0]
+
+
+#: The two live decode paths, by the way they reach the codec.
+PATHS = [pytest.param(_read_scalar, id="scalar"), pytest.param(_read_element, id="element")]
+
+
+# --- the encoder half (a real shared helper) ---------------------------------
 
 
 @pytest.mark.parametrize(
@@ -33,9 +73,78 @@ def test_encode_varint(value, expected):
     assert encode_varint(value) == bytes(expected)
 
 
+def test_varint_module_carries_no_second_decoder():
+    """The module holds the *encode* half only.
+
+    A decoder here would be a third copy of the codec (issue #75): the two that
+    ship inline theirs, so anything decoding in this module is by construction
+    unreachable from the API and can drift from them unnoticed.
+    """
+    import sofab._varint as v
+
+    assert not [name for name in vars(v) if "decode" in name and "zigzag" not in name]
+
+
+# --- the decode half, through the live paths ---------------------------------
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("path", PATHS)
 @pytest.mark.parametrize("value", [0, 1, 127, 128, 300, (1 << 32), (1 << 63), (1 << 64) - 1])
-def test_varint_roundtrip(value):
-    assert decode_varint(_reader(encode_varint(value))) == value
+def test_varint_roundtrip(engine, path, value):
+    assert path(engine, encode_varint(value)) == value
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("path", PATHS)
+def test_decode_truncated_is_incomplete(engine, path):
+    # Bytes ending mid-varint (continuation set, no terminator) is INCOMPLETE
+    # (§5.2), NOT malformed — SofaIncompleteError is not a SofaDecodeError, so
+    # `except SofaDecodeError` must not catch it.
+    with pytest.raises(SofaIncompleteError) as exc:
+        path(engine, bytes([0x80, 0x80]))  # never terminates
+    assert not isinstance(exc.value, SofaDecodeError)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("path", PATHS)
+def test_decode_overflow_raises(engine, path):
+    # 10 continuation bytes -> the shift reaches 64 with the continuation set.
+    with pytest.raises(SofaDecodeError):
+        path(engine, bytes([0xFF] * 10 + [0x01]))
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("path", PATHS)
+def test_decode_max_u64_is_accepted(engine, path):
+    # Control (issue #43): the valid 10-byte maximum whose 10th byte carries
+    # only bit 63 (0x01) still decodes to 2^64-1 — the overlong guard must not
+    # reject it.
+    assert path(engine, bytes([0xFF] * 9 + [0x01])) == (1 << 64) - 1
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("path", PATHS)
+@pytest.mark.parametrize(
+    "tenth",
+    [
+        0x02,  # the 65th bit set
+        0x7F,  # bits 64..69 set
+        0x03,  # bit 63 (valid) plus the 65th bit
+    ],
+)
+def test_decode_overlong_10th_byte_high_bits_rejected(engine, path, tenth):
+    # Regression (issue #43, Crucible F-0016): a 10-byte varint whose 10th byte
+    # sets any bit above bit 63 is an overlong (>64-bit) varint and must be
+    # rejected as INVALID — never silently narrowed by `& MASK64` on return.
+    with pytest.raises(SofaDecodeError):
+        path(engine, bytes([0xFF] * 9 + [tenth]))
+    # And an outright too-long (11th continuation byte) varint is also INVALID.
+    with pytest.raises(SofaDecodeError):
+        path(engine, bytes([0xFF] * 10 + [0x7F]))
+
+
+# --- ZigZag ------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("value", [0, 1, -1, 2, -2, 42, -42, (1 << 63) - 1, -(1 << 63)])
@@ -45,46 +154,3 @@ def test_zigzag_roundtrip(value):
 
 def test_zigzag_known_mapping():
     assert [zigzag_encode(v) for v in (0, -1, 1, -2, 2)] == [0, 1, 2, 3, 4]
-
-
-def test_decode_truncated_is_incomplete():
-    # Bytes ending mid-varint (continuation set, no terminator) is INCOMPLETE
-    # (§7), NOT malformed — SofaIncompleteError is not a SofaDecodeError, so
-    # `except SofaDecodeError` must not catch it.
-    with pytest.raises(SofaIncompleteError) as exc:
-        decode_varint(_reader(bytes([0x80, 0x80])))  # never terminates
-    assert not isinstance(exc.value, SofaDecodeError)
-
-
-def test_decode_overflow_raises():
-    # 10 continuation bytes -> shift reaches 64 with continuation set
-    with pytest.raises(SofaDecodeError):
-        decode_varint(_reader(bytes([0xFF] * 10 + [0x01])))
-
-
-def test_decode_max_u64_is_accepted():
-    # Control (issue #43): the valid 10-byte maximum whose 10th byte carries
-    # only bit 63 (0x01) still decodes to 2^64-1 — the overlong guard must not
-    # reject it.
-    data = bytes([0xFF] * 9 + [0x01])
-    assert decode_varint(_reader(data)) == (1 << 64) - 1
-
-
-@pytest.mark.parametrize(
-    "tenth",
-    [
-        0x02,  # the 65th bit set
-        0x7F,  # bits 64..69 set
-        0x03,  # bit 63 (valid) plus the 65th bit
-    ],
-)
-def test_decode_overlong_10th_byte_high_bits_rejected(tenth):
-    # Regression (issue #43, Crucible F-0016): a 10-byte varint whose 10th byte
-    # sets any bit above bit 63 is an overlong (>64-bit) varint and must be
-    # rejected as INVALID — never silently narrowed by `& MASK64` on return.
-    data = bytes([0xFF] * 9 + [tenth])
-    with pytest.raises(SofaDecodeError):
-        decode_varint(_reader(data))
-    # And an outright too-long (11th continuation byte) varint is also INVALID.
-    with pytest.raises(SofaDecodeError):
-        decode_varint(_reader(bytes([0xFF] * 10 + [0x7F])))
