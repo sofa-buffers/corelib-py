@@ -545,6 +545,14 @@ cdef int _MAX_DEPTH = 255
 # _put splits every atomic unit at any byte boundary; it binds only a buffer
 # installed together with a flush sink. Mirrors types.MIN_OUTPUT_BUFFER.
 cdef Py_ssize_t _MIN_OUTPUT_BUFFER = MIN_OUTPUT_BUFFER
+# Size of the scratch buffer the convenience constructors install (S5.1
+# "unbounded schema" shape). One allocation per encoder, made at construction and
+# never resized -- the encoder drains it through its sink whenever it fills, so
+# what an encode holds is this constant and not the message. Module-level (not
+# only cdef) so it is readable as sofab._speedups._SCRATCH_SIZE, and it must
+# equal sofab.encoder._SCRATCH_SIZE: both engines bound memory the same way.
+_SCRATCH_SIZE = 1024
+cdef Py_ssize_t _SCRATCH_SIZE_C = _SCRATCH_SIZE
 # Largest value representable in a Py_ssize_t — a fixlen-array payload larger
 # than this cannot be satisfied by any real buffer, so it is treated as a
 # truncated (unsatisfiable) read rather than being cast to a negative size.
@@ -844,21 +852,26 @@ cdef inline list _as_float_list(object values):
 cdef class Encoder:
     """Native encoder — see :class:`sofab.encoder.Encoder` for the full contract.
 
-    Two construction models, byte-identical to the pure-Python encoder:
+    One buffer-ownership model, byte-identical to the pure-Python encoder: the
+    encoder writes into a **fixed** buffer and drains it through a flush sink,
+    and never grows a buffer (CORELIB_PLAN S5.1).
 
-    * ``Encoder(writer=None, sticky=False)`` — Go-style growable buffer; bytes
-      accumulate in an internal C buffer drained to ``writer`` on :meth:`flush`
-      (or read back via :meth:`getvalue`).
-    * ``Encoder.over_buffer(buffer, offset, flush)`` — Rust/C-style; writes into
+    * ``Encoder.over_buffer(buffer, offset, flush)`` — the primitive: writes into
       a caller-owned ``bytearray``, draining through ``flush`` when it fills.
+    * ``Encoder(writer=None, sticky=False)`` — the same over a scratch buffer of
+      ``_SCRATCH_SIZE`` bytes installed with a sink, which forwards to
+      ``writer.write`` or, with no writer, appends into the result
+      :meth:`getvalue` hands back.
     """
 
-    # growable (in-memory) mode
-    cdef unsigned char* _out
-    cdef size_t _len
-    cdef size_t _cap
-    # fixed-buffer mode
-    cdef object _fixed_obj          # the caller's bytearray (keeps it alive)
+    # output buffer (always installed: the convenience constructors install a
+    # scratch buffer, over_buffer the caller's)
+    cdef object _fixed_obj          # the bytearray being written into (keeps it alive)
+    # The convenience constructors' scratch: one fixed block, allocated at
+    # construction and never resized (S5.1 -- an output buffer is never grown).
+    # Raw C memory rather than a bytearray because nothing outside the encoder
+    # ever sees it; a caller's buffer arrives through buffer_set as _fixed_obj.
+    cdef unsigned char* _scratch
     cdef unsigned char* _fixed_ptr
     cdef size_t _fixed_cap
     cdef size_t _cursor
@@ -867,9 +880,15 @@ cdef class Encoder:
     # cursor) or merely copied it and returned (resume at 0) -- CORELIB_PLAN S5.1.
     cdef uint64_t _installs
     cdef object _flush_sink
-    cdef bint _is_fixed
     # shared
     cdef object _writer
+    # The in-memory model's growing *result* -- the message getvalue() returns,
+    # not a buffer the encoder writes into. A list of the drained chunks, joined
+    # by getvalue(); None until the first drain, so a message that fits in the
+    # scratch never needs one, and None throughout for the writer/over_buffer
+    # forms, which retain nothing.
+    cdef bint _in_memory
+    cdef list _result
     cdef bint _sticky
     cdef object _error
     cdef int _depth
@@ -888,17 +907,16 @@ cdef class Encoder:
     cdef int _pcap
 
     def __cinit__(self):
-        self._out = NULL
-        self._len = 0
-        self._cap = 0
         self._fixed_obj = None
+        self._scratch = NULL
         self._fixed_ptr = NULL
         self._fixed_cap = 0
         self._cursor = 0
         self._installs = 0
         self._flush_sink = None
-        self._is_fixed = False
         self._writer = None
+        self._in_memory = False
+        self._result = None
         self._sticky = False
         self._error = None
         self._depth = 0
@@ -907,13 +925,40 @@ cdef class Encoder:
         self._pcap = 0
 
     def __init__(self, writer=None, *, bint sticky=False):
+        # S5.1 "unbounded schema" shape: a fixed scratch buffer installed *with*
+        # a sink. The corelib grows no output buffer -- with a writer nothing is
+        # retained at all, and with none the sink appends into the result
+        # getvalue() hands back.
         self._writer = writer
         self._sticky = sticky
+        # With no writer the sink is the result the encoder hands back -- the
+        # "growing result" S5.1 names for the unbounded shape, which is the
+        # message and not a buffer written into. _drain allocates it.
+        self._in_memory = writer is None
+        # The one allocation, made here and never resized. Installed exactly as
+        # buffer_set would: the checks it makes are constants here (offset 0 into
+        # a buffer of _SCRATCH_SIZE >= MIN_OUTPUT_BUFFER).
+        if self._scratch != NULL:        # __init__ called twice: no leak
+            free(self._scratch)
+        self._scratch = <unsigned char*>malloc(<size_t>_SCRATCH_SIZE_C)
+        if self._scratch == NULL:
+            raise MemoryError()
+        self._fixed_ptr = self._scratch
+        self._fixed_cap = <size_t>_SCRATCH_SIZE_C
+        self._cursor = 0
+        self._installs = 1
+
+    cdef inline bint _has_sink(self):
+        # Whether a flush can occur -- i.e. whether the installed buffer is a
+        # sink-installed one, which is what MIN_OUTPUT_BUFFER binds (S5.1). All
+        # three shapes of sink count: the caller's callback, the writer, and the
+        # in-memory result.
+        return self._in_memory or self._writer is not None or self._flush_sink is not None
 
     def __dealloc__(self):
-        if self._out != NULL:
-            free(self._out)
-            self._out = NULL
+        if self._scratch != NULL:
+            free(self._scratch)
+            self._scratch = NULL
         if self._pending != NULL:
             free(self._pending)
             self._pending = NULL
@@ -923,6 +968,7 @@ cdef class Encoder:
     def over_buffer(cls, bytearray buffer, int offset=0, flush=None, *, bint sticky=False):
         cdef Encoder self = cls.__new__(cls)
         self._writer = None
+        self._result = None
         self._flush_sink = flush
         self._sticky = sticky
         self.buffer_set(buffer, offset)
@@ -938,7 +984,7 @@ cdef class Encoder:
         # no flush can occur and no minimum applies -- the buffer holds the message
         # or reports buffer-full -- which is what keeps a caller sizing from a
         # generated MAX_SIZE exact, down to a zero-byte remainder.
-        if self._flush_sink is not None and size - <Py_ssize_t>offset < _MIN_OUTPUT_BUFFER:
+        if size - <Py_ssize_t>offset < _MIN_OUTPUT_BUFFER and self._has_sink():
             raise SofaRangeError(
                 "a buffer installed with a flush sink needs at least "
                 "MIN_OUTPUT_BUFFER=%d usable byte(s), got %d"
@@ -947,7 +993,6 @@ cdef class Encoder:
         self._fixed_ptr = <unsigned char*>PyByteArray_AS_STRING(buffer)
         self._fixed_cap = <size_t>size
         self._cursor = <size_t>offset
-        self._is_fixed = True
         # The offset belongs to this installation, not to the buffer (S5.1): it is
         # consumed once, and re-installing is what re-arms it for the next packet.
         self._installs += 1
@@ -958,29 +1003,24 @@ cdef class Encoder:
     def error(self):
         return self._error
 
-    cdef inline int _ensure(self, size_t extra) except -1:
-        # grow-mode capacity guarantee
-        cdef size_t need = self._len + extra
-        cdef size_t newcap
-        if need <= self._cap:
-            return 0
-        newcap = self._cap * 2 if self._cap else 64
-        while newcap < need:
-            newcap *= 2
-        self._out = <unsigned char*>realloc(self._out, newcap)
-        if self._out == NULL:
-            raise MemoryError()
-        self._cap = newcap
-        return 0
-
     cdef int _put(self, const unsigned char* data, size_t n) except -1:
-        # Append n raw bytes, honouring whichever output mode is active.
+        # Write n raw bytes into the output buffer, draining through the sink
+        # whenever it fills. A run longer than the whole buffer is split across
+        # drains: that is what makes MIN_OUTPUT_BUFFER == 1 hold (S5.1).
         cdef size_t pos = 0
         cdef size_t take
-        if not self._is_fixed:
-            self._ensure(n)
-            memcpy(self._out + self._len, data, n)
-            self._len += n
+        if self._in_memory and n >= self._fixed_cap:
+            # A divisible run at least as long as the whole buffer, in the model
+            # whose sink is the result: hand it over as its own chunk instead of
+            # copying it through the buffer a bufferful at a time. Draining first
+            # is what keeps the wire order.
+            if self._cursor:
+                self._drain()
+            if self._result is None:
+                self._result = [PyBytes_FromStringAndSize(<char*>data, <Py_ssize_t>n)]
+            else:
+                PyList_Append(self._result,
+                              PyBytes_FromStringAndSize(<char*>data, <Py_ssize_t>n))
             return 0
         while pos < n:
             if self._cursor >= self._fixed_cap:
@@ -1001,24 +1041,42 @@ cdef class Encoder:
         # install a replacement before returning, and that installation's offset is
         # the cursor -- resetting to 0 here would drop the header room it just
         # reserved and overwrite it with payload (CORELIB_PLAN S5.1).
-        cdef uint64_t installs = self._installs
-        if self._flush_sink is None:
+        cdef uint64_t installs
+        cdef bytes snapshot
+        if self._in_memory:
+            # The sink is the result the encoder hands back: the drained bytes are
+            # kept as a chunk for getvalue() to join, which costs one copy here and
+            # none there (b"".join of a single chunk returns it unchanged). The
+            # buffer is never taken, so the cursor resumes at 0.
+            snapshot = PyBytes_FromStringAndSize(
+                <char*>self._fixed_ptr, <Py_ssize_t>self._cursor)
+            if self._result is None:
+                self._result = [snapshot]
+            else:
+                PyList_Append(self._result, snapshot)
+            self._cursor = 0
+            return 0
+        if self._writer is None and self._flush_sink is None:
             raise SofaBufferError("encoder buffer full")
-        self._flush_sink(PyBytes_FromStringAndSize(<char*>self._fixed_ptr, <Py_ssize_t>self._cursor))
+        installs = self._installs
+        snapshot = PyBytes_FromStringAndSize(<char*>self._fixed_ptr, <Py_ssize_t>self._cursor)
+        if self._writer is not None:
+            self._writer.write(snapshot)
+        else:
+            self._flush_sink(snapshot)
         if self._installs == installs:
             self._cursor = 0
         return 0
 
     cdef inline int _emit_varint(self, uint64_t value) except -1:
-        # The hot path. Grow-mode writes straight into the C buffer; fixed-mode
-        # encodes to a small stack scratch and hands it to the chunk-aware _put.
-        #
-        # Ten bytes of room is all _varint_put ever needs, so the capacity check
+        # The hot path. With a whole varint's room left the value is encoded
+        # straight into the output buffer; on its last bytes it goes through a
+        # stack scratch and the chunk-aware _put, which splits it across the
+        # drain. Ten bytes is all _varint_put ever needs, so the room check
         # happens once per value rather than once per byte.
         cdef unsigned char scratch[10]
-        if not self._is_fixed:
-            self._ensure(10)
-            self._len += <size_t>_varint_put(self._out + self._len, value)
+        if self._cursor + 10 <= self._fixed_cap:
+            self._cursor += <size_t>_varint_put(self._fixed_ptr + self._cursor, value)
             return 0
         else:
             self._put(scratch, <size_t>_varint_put(scratch, value))
@@ -1099,25 +1157,31 @@ cdef class Encoder:
         return 0
 
     def bytes_used(self):
-        return <object>self._cursor if self._is_fixed else <object>self._len
+        # Bytes standing in the output buffer: written since it was installed and
+        # not yet drained. The buffer is fixed, so this never exceeds its size --
+        # it is not the length of the message.
+        return <object>self._cursor
 
     def flush(self):
-        cdef size_t used
-        if self._is_fixed:
-            used = self._cursor
-            if self._flush_sink is not None and used:
-                self._drain()
-            return <object>used
-        used = self._len
-        if self._writer is not None and used:
-            self._writer.write(PyBytes_FromStringAndSize(<char*>self._out, <Py_ssize_t>self._len))
-            self._len = 0
+        cdef size_t used = self._cursor
+        if used and self._has_sink():
+            self._drain()
         return <object>used
 
     def getvalue(self):
-        if self._is_fixed:
+        # Only the in-memory model retains the message: with a writer the bytes
+        # have been handed over, and over a caller's buffer they are in it, so
+        # returning an undrained tail would be partial output dressed up as a
+        # whole message (S5.1).
+        if not self._in_memory:
             raise SofaStateError("getvalue() is only valid for the in-memory model")
-        return PyBytes_FromStringAndSize(<char*>self._out, <Py_ssize_t>self._len)
+        if self._result is None:        # never drained: the message is the prefix
+            return PyBytes_FromStringAndSize(
+                <char*>self._fixed_ptr, <Py_ssize_t>self._cursor)
+        if not self._cursor:            # fully drained (the usual case, after flush())
+            return b"".join(self._result)
+        return b"".join(self._result + [PyBytes_FromStringAndSize(
+            <char*>self._fixed_ptr, <Py_ssize_t>self._cursor)])
 
     # --- scalars ------------------------------------------------------------
 
@@ -1272,17 +1336,18 @@ cdef class Encoder:
             self._emit_varint((<uint64_t>elem_size << 3) | <uint64_t>subtype)
             if count == 0:
                 return 0
-            # Pack directly into the output for the common grow-mode path.
-            if not self._is_fixed:
-                self._ensure(<size_t>(count * elem_size))
-                region = self._out + self._len
+            # Pack the whole payload straight into the output buffer when it
+            # fits in the room left; otherwise element by element, which drains
+            # as it goes (and may cross into a buffer the sink installs).
+            if self._cursor + <size_t>(count * elem_size) <= self._fixed_cap:
+                region = self._fixed_ptr + self._cursor
                 if elem_size == 4:
                     for i in range(count):
                         _pack_f32(_AsDouble(PyList_GET_ITEM(seq, i)), region + i * 4)
                 else:
                     for i in range(count):
                         _pack_f64(_AsDouble(PyList_GET_ITEM(seq, i)), region + i * 8)
-                self._len += <size_t>(count * elem_size)
+                self._cursor += <size_t>(count * elem_size)
             else:
                 if elem_size == 4:
                     for i in range(count):
