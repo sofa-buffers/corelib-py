@@ -1453,6 +1453,12 @@ cdef class Decoder:
     cdef int _pend_subtype
     cdef uint64_t _pend_count
     cdef uint64_t _pend_size
+    # Resume transaction (§5.2): _keep is the buffer offset the call in flight
+    # started at, _floor is -1 or the compaction floor a multi-field walk pins,
+    # _keep_cur_wtype the current-field wire type as of _keep. See _arm/_suspend.
+    cdef Py_ssize_t _keep
+    cdef Py_ssize_t _floor
+    cdef int _keep_cur_wtype
 
     def __cinit__(self, reader, *, int chunk_size=65536,
                   max_array_count=None, max_string_len=None, max_blob_len=None):
@@ -1470,34 +1476,96 @@ cdef class Decoder:
         self._cur_wtype = -1
         self._spill = None
         self._pk = _PEND_NONE
+        self._keep = 0
+        self._floor = -1
+        self._keep_cur_wtype = -1
 
     cdef inline void _rebind(self, bytes newbuf):
         self._buf = newbuf
         self._p = <const unsigned char*>PyBytes_AS_STRING(newbuf)
         self._n = PyBytes_GET_SIZE(newbuf)
 
+    # --- resume transactions (CORELIB_PLAN §5.2) ----------------------------
+    #
+    # Mirrors Decoder._suspend in the pure engine — see the long comment there.
+    # Running out of bytes mid-construct is INCOMPLETE, a first-class outcome the
+    # caller answers with more bytes, so every public call is all-or-nothing: on
+    # the suspension path the cursor goes back to where the call started and the
+    # bytes already parsed stay buffered, so re-issuing the call re-parses the
+    # construct from its first byte. The pending value / depth / current field
+    # are committed only after the construct's last byte is in hand, which is why
+    # the rewind is a cursor (plus the current wire type, which _next_field
+    # publishes before the varints that trail a fixlen/array header). INVALID is
+    # terminal and is deliberately not rewound.
+
+    cdef inline void _arm(self):
+        self._keep = self._pos
+        self._keep_cur_wtype = self._cur_wtype
+
+    cdef object _suspend(self, msg):
+        # _keep tracks buffer compaction in _need, so it names the call's start
+        # byte in the current buffer.
+        self._pos = self._keep
+        self._cur_wtype = self._keep_cur_wtype
+        return SofaIncompleteError(msg)
+
     # --- byte sourcing ------------------------------------------------------
 
     cdef bint _need(self, Py_ssize_t n) except -1:
         # Ensure at least n bytes available at _pos, refilling from the reader.
+        # Everything the reader hands over is kept: on failure the bytes read so
+        # far stay buffered, which is what makes a suspension non-destructive.
         cdef bytes data
         cdef bytes buf
-        if self._n - self._pos >= n:
+        cdef bytearray acc
+        cdef Py_ssize_t pos = self._pos
+        cdef Py_ssize_t base
+        cdef Py_ssize_t want
+        cdef Py_ssize_t req
+        if self._n - pos >= n:
             return True
-        if self._pos:
-            buf = self._buf[self._pos:]
-        else:
-            buf = self._buf
-        self._pos = 0
-        while PyBytes_GET_SIZE(buf) < n:
-            data = self._read(self._chunk)
+        # Compaction may only drop what can never be read again. With a resume
+        # transaction open that floor is the transaction's start, not the
+        # cursor: the bytes in between belong to the construct being parsed and
+        # a suspension has to be able to replay them (§5.2).
+        base = self._keep if self._floor < 0 else self._floor
+        buf = self._buf
+        if base:
+            buf = buf[base:]
+            pos -= base
+            self._keep -= base
+            if self._floor > 0:
+                self._floor -= base
+        want = pos + n
+        if PyBytes_GET_SIZE(buf) < want:
+            req = want - PyBytes_GET_SIZE(buf)
+            if req < <Py_ssize_t>self._chunk:
+                req = <Py_ssize_t>self._chunk
+            data = self._read(req)
             if not data:
                 self._rebind(buf)
-                self._pos = 0
+                self._pos = pos
                 return False
             buf = buf + data if PyBytes_GET_SIZE(buf) else data
+            if PyBytes_GET_SIZE(buf) < want:
+                # More than one read needed: accumulate in a bytearray from here,
+                # since repeated bytes+bytes would make a chunk-fed large payload
+                # quadratic. (One read is the common case and stays a plain
+                # concatenation — often not even that, on the first fill.)
+                acc = bytearray(buf)
+                while <Py_ssize_t>len(acc) < want:
+                    req = want - <Py_ssize_t>len(acc)
+                    if req < <Py_ssize_t>self._chunk:
+                        req = <Py_ssize_t>self._chunk
+                    data = self._read(req)
+                    if not data:
+                        self._rebind(bytes(acc))
+                        self._pos = pos
+                        return False
+                    acc += data
+                buf = bytes(acc)
         self._rebind(buf)
-        self._pos = 0
+        self._pos = pos
         return True
 
     cdef inline uint64_t _varint(self) except? 0xDEAD:
@@ -1525,7 +1593,7 @@ cdef class Decoder:
         cdef int room
         if pos >= n:
             if not self._need(1):
-                raise SofaIncompleteError("truncated varint")
+                raise self._suspend("truncated varint")
             p = self._p
             pos = self._pos
             n = self._n
@@ -1540,7 +1608,7 @@ cdef class Decoder:
             if pos >= n:
                 self._pos = pos
                 if not self._need(1):
-                    raise SofaIncompleteError("truncated varint")
+                    raise self._suspend("truncated varint")
                 p = self._p
                 pos = self._pos
                 n = self._n
@@ -1563,30 +1631,21 @@ cdef class Decoder:
                 raise SofaDecodeError("overlong varint")
 
     cdef bytes _read_exact(self, Py_ssize_t n):
+        # The slow path accumulates inside the buffer (via _need) rather than in
+        # a local, so a payload that stops halfway is still buffered when the
+        # truncation is reported and the next attempt continues from it (§5.2).
         cdef Py_ssize_t pos = self._pos
         cdef bytes out
-        cdef bytearray acc
-        cdef bytes data
         if pos + n <= self._n:
             out = self._buf[pos:pos + n]
             self._pos = pos + n
             return out
-        acc = bytearray(self._buf[pos:])
-        self._rebind(b"")
-        self._pos = 0
-        cdef int want
-        while <Py_ssize_t>len(acc) < n:
-            want = self._chunk
-            if want < n - <Py_ssize_t>len(acc):
-                want = <int>(n - <Py_ssize_t>len(acc))
-            data = self._read(want)
-            if not data:
-                raise SofaIncompleteError("truncated payload")
-            acc += data
-        if <Py_ssize_t>len(acc) > n:
-            self._rebind(bytes(acc[n:]))
-            self._pos = 0
-        return bytes(acc[:n])
+        if not self._need(n):
+            raise self._suspend("truncated payload")
+        pos = self._pos
+        out = self._buf[pos:pos + n]
+        self._pos = pos + n
+        return out
 
     cdef list _read_varints(
         self, Py_ssize_t count, bint zigzag, bint bounded, int64_t lo, int64_t hi
@@ -1701,12 +1760,14 @@ cdef class Decoder:
         cdef uint64_t length_header, length, count, elem_header, elem_size
         cdef int subtype
 
+        self._arm()   # opens this field's resume transaction (§5.2)
+
         if self._pk != _PEND_NONE:
             self._skip_pending()
 
         if self._pos >= self._n and not self._need(1):
             if self._depth != 0:
-                raise SofaIncompleteError("truncated: unbalanced sequence")
+                raise self._suspend("truncated: unbalanced sequence")
             self._cur_wtype = -1
             return None
 
@@ -1840,9 +1901,9 @@ cdef class Decoder:
         # runs the reader dry.
         cdef uint64_t total = count * elem_size
         if elem_size != 0 and total // elem_size != count:
-            raise SofaIncompleteError("truncated payload")
+            raise self._suspend("truncated payload")
         if total > _SSIZE_MAX:
-            raise SofaIncompleteError("truncated payload")
+            raise self._suspend("truncated payload")
         return <Py_ssize_t>total
 
     cdef bytes _read_farray_payload(self, uint64_t count, uint64_t elem_size, uint64_t width):
@@ -1860,7 +1921,6 @@ cdef class Decoder:
 
     cdef int _skip_pending(self) except -1:
         cdef int kind = self._pk
-        self._pk = _PEND_NONE
         if kind == _PEND_SCALAR:
             self._varint()
         elif kind == _PEND_FIXLEN:
@@ -1869,26 +1929,69 @@ cdef class Decoder:
             self._skip_varints(<Py_ssize_t>self._pend_count)
         else:  # _PEND_FARRAY
             self._read_exact(self._farray_nbytes(self._pend_count, self._pend_size))
+        # Cleared only now: had the value run out mid-skip, the field has to stay
+        # pending so the retry skips it again from its first byte (§5.2).
+        self._pk = _PEND_NONE
         return 0
 
     def skip(self):
+        self._arm()
+        self._skip()
+
+    cdef int _skip(self) except -1:
         cdef int target
+        cdef int depth, cur_wtype, pk, pend_wtype, pend_subtype
+        cdef uint64_t pend_count, pend_size
+        cdef object cur
         if self._cur_wtype == _WT_SEQUENCE_START:
-            target = self._depth - 1
-            while self._depth > target:
-                if self._next_field() is None:
-                    raise SofaIncompleteError("truncated sequence")
-            return
+            # Walking a whole sequence spans many fields, so unlike every other
+            # call this one moves the field state — and lets _next_field re-arm
+            # _keep — before it can suspend. _floor pins the refill path's
+            # compaction at the first byte *inside* the sequence for the
+            # duration, and the field state is put back here, so a re-issued
+            # skip() replays the whole sequence (§5.2).
+            self._floor = self._pos
+            depth = self._depth
+            cur = self._cur
+            cur_wtype = self._cur_wtype
+            pk = self._pk
+            pend_wtype = self._pend_wtype
+            pend_subtype = self._pend_subtype
+            pend_count = self._pend_count
+            pend_size = self._pend_size
+            target = depth - 1
+            try:
+                while self._depth > target:
+                    if self._next_field() is None:
+                        raise self._suspend("truncated sequence")
+            except SofaIncompleteError:
+                self._pos = self._floor
+                self._keep = self._floor
+                self._depth = depth
+                self._cur = cur
+                self._cur_wtype = cur_wtype
+                self._pk = pk
+                self._pend_wtype = pend_wtype
+                self._pend_subtype = pend_subtype
+                self._pend_count = pend_count
+                self._pend_size = pend_size
+                raise
+            finally:
+                self._floor = -1
+            return 0
         if self._pk != _PEND_NONE:
             self._skip_pending()
+        return 0
 
     # --- scalar reads -------------------------------------------------------
 
     cdef uint64_t _take_scalar(self, int wtype) except? 0xDEAD:
         if self._pk != _PEND_SCALAR or self._pend_wtype != wtype:
             raise SofaStateError("no matching scalar value for the current field")
-        self._pk = _PEND_NONE
-        return self._varint()
+        self._arm()
+        cdef uint64_t value = self._varint()
+        self._pk = _PEND_NONE   # committed only once the value is in hand (§5.2)
+        return value
 
     def unsigned(self):
         return PyLong_FromUnsignedLongLong(self._take_scalar(_WT_UNSIGNED))
@@ -1900,12 +2003,15 @@ cdef class Decoder:
         return self._take_scalar(_WT_UNSIGNED) != 0
 
     cdef bytes _take_fixlen(self, int subtype):
+        cdef bytes data
         if self._pk != _PEND_FIXLEN:
             raise SofaStateError("current field is not a fixlen value")
         if self._pend_subtype != subtype:
             raise SofaStateError("fixlen subtype does not match the requested read")
-        self._pk = _PEND_NONE
-        return self._read_exact(<Py_ssize_t>self._pend_size)
+        self._arm()
+        data = self._read_exact(<Py_ssize_t>self._pend_size)
+        self._pk = _PEND_NONE   # committed only once the payload is in hand
+        return data
 
     cdef const unsigned char* _take_fixlen_ptr(self, int subtype, Py_ssize_t n) except NULL:
         # Fixlen payload as a pointer instead of a ``bytes``. When the payload is
@@ -1918,14 +2024,18 @@ cdef class Decoder:
             raise SofaStateError("current field is not a fixlen value")
         if self._pend_subtype != subtype:
             raise SofaStateError("fixlen subtype does not match the requested read")
-        self._pk = _PEND_NONE
         cdef const unsigned char* p
         if self._n - self._pos >= n:
+            self._pk = _PEND_NONE
             self._spill = None
             p = self._p + self._pos
             self._pos += n
             return p
+        # Payload not (yet) buffered: this can suspend, so it runs inside a
+        # resume transaction (§5.2).
+        self._arm()
         self._spill = self._read_exact(n)
+        self._pk = _PEND_NONE   # committed only once the payload is in hand
         return <const unsigned char*>PyBytes_AS_STRING(self._spill)
 
     def float32(self):
@@ -1973,47 +2083,71 @@ cdef class Decoder:
     # --- array reads --------------------------------------------------------
 
     cdef uint64_t _take_varray(self, int wtype) except? 0xDEAD:
+        # Validates the pending array and returns its count. The pending value is
+        # cleared by the caller only once the payload has actually been decoded,
+        # so a suspension leaves the array re-readable from element one (§5.2).
         if self._pk != _PEND_VARRAY or self._pend_wtype != wtype:
             raise SofaStateError("current field is not a matching varint array")
-        self._pk = _PEND_NONE
         return self._pend_count
 
     def read_unsigned_array(self, elem_max=None):
         # elem_max is the field's declared element width; see the pure engine's
         # Decoder.read_unsigned_array for what it buys (§7.1/§5.2, #267).
         cdef uint64_t count = self._take_varray(_WT_ARRAY_UNSIGNED)
+        cdef list out
+        self._arm()
         if elem_max is None:
-            return self._read_varints(<Py_ssize_t>count, False, False, 0, 0)
-        return self._read_varints(
-            <Py_ssize_t>count, False, True, 0, <int64_t>elem_max
-        )
+            out = self._read_varints(<Py_ssize_t>count, False, False, 0, 0)
+        else:
+            out = self._read_varints(
+                <Py_ssize_t>count, False, True, 0, <int64_t>elem_max
+            )
+        self._pk = _PEND_NONE   # committed only once the payload is in hand
+        return out
 
     def read_signed_array(self, elem_min=None, elem_max=None):
         cdef uint64_t count = self._take_varray(_WT_ARRAY_SIGNED)
+        cdef list out
+        self._arm()
         if elem_max is None:
-            return self._read_varints(<Py_ssize_t>count, True, False, 0, 0)
-        return self._read_varints(
-            <Py_ssize_t>count, True, True, <int64_t>elem_min, <int64_t>elem_max
-        )
+            out = self._read_varints(<Py_ssize_t>count, True, False, 0, 0)
+        else:
+            out = self._read_varints(
+                <Py_ssize_t>count, True, True, <int64_t>elem_min, <int64_t>elem_max
+            )
+        self._pk = _PEND_NONE   # committed only once the payload is in hand
+        return out
 
     cdef _take_farray(self, int subtype):
+        # Like _take_varray, the pending value is cleared by the caller only
+        # after the payload has been read (§5.2).
         if self._pk != _PEND_FARRAY:
             raise SofaStateError("current field is not a fixlen array")
         if self._pend_subtype != subtype:
             raise SofaStateError("fixlen-array subtype does not match the requested read")
-        self._pk = _PEND_NONE
         return self._pend_count, self._pend_size
 
-    def read_float32_array(self):
+    cdef bytes _take_farray_payload(self, int subtype, uint64_t width):
+        # Validate the pending fixlen array, then read its payload inside a
+        # resume transaction: an array whose payload has not fully arrived stays
+        # pending and re-readable from its first payload byte (§5.2).
         cdef uint64_t count, elem_size
-        count, elem_size = self._take_farray(_ST_FP32)
+        cdef bytes data
+        count, elem_size = self._take_farray(subtype)
+        self._arm()
+        data = self._read_farray_payload(count, elem_size, width)
+        self._pk = _PEND_NONE   # committed only once the payload is in hand
+        return data
+
+    def read_float32_array(self):
         # Consume the payload the fixlen_word claims (count * elem_size bytes),
         # then require it to be exactly count*4 — i.e. the element width must be
         # 4 for an fp32 array. Without this an elem_size != 4 (e.g. 0) leaves the
         # buffer shorter than the count*4 bytes the fixed-width unpack loop reads,
         # a heap over-read (SIGSEGV under boundscheck=False). The pure path is
         # implicitly guarded by struct.unpack demanding an exact-size buffer.
-        cdef bytes data = self._read_farray_payload(count, elem_size, 4)
+        cdef bytes data = self._take_farray_payload(_ST_FP32, 4)
+        cdef uint64_t count = <uint64_t>PyBytes_GET_SIZE(data) // 4
         cdef const unsigned char* p = <const unsigned char*>PyBytes_AS_STRING(data)
         cdef list out = PyList_New(<Py_ssize_t>count)
         cdef Py_ssize_t i
@@ -2025,11 +2159,10 @@ cdef class Decoder:
         return out
 
     def read_float64_array(self):
-        cdef uint64_t count, elem_size
-        count, elem_size = self._take_farray(_ST_FP64)
         # See read_float32_array: the element width must be 8 for an fp64 array,
         # or the count*8-byte unpack loop over-reads a shorter buffer.
-        cdef bytes data = self._read_farray_payload(count, elem_size, 8)
+        cdef bytes data = self._take_farray_payload(_ST_FP64, 8)
+        cdef uint64_t count = <uint64_t>PyBytes_GET_SIZE(data) // 8
         cdef const unsigned char* p = <const unsigned char*>PyBytes_AS_STRING(data)
         cdef list out = PyList_New(<Py_ssize_t>count)
         cdef Py_ssize_t i
