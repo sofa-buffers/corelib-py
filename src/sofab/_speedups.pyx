@@ -851,6 +851,10 @@ cdef class Encoder:
     cdef unsigned char* _fixed_ptr
     cdef size_t _fixed_cap
     cdef size_t _cursor
+    # Installation counter: bumped by every buffer_set, so _drain can tell whether
+    # the sink took the buffer (installed a replacement, whose offset is the new
+    # cursor) or merely copied it and returned (resume at 0) -- CORELIB_PLAN S5.1.
+    cdef uint64_t _installs
     cdef object _flush_sink
     cdef bint _is_fixed
     # shared
@@ -880,6 +884,7 @@ cdef class Encoder:
         self._fixed_ptr = NULL
         self._fixed_cap = 0
         self._cursor = 0
+        self._installs = 0
         self._flush_sink = None
         self._is_fixed = False
         self._writer = None
@@ -920,6 +925,9 @@ cdef class Encoder:
         self._fixed_cap = <size_t>PyByteArray_GET_SIZE(buffer)
         self._cursor = <size_t>offset
         self._is_fixed = True
+        # The offset belongs to this installation, not to the buffer (S5.1): it is
+        # consumed once, and re-installing is what re-arms it for the next packet.
+        self._installs += 1
 
     # --- error / output plumbing --------------------------------------------
 
@@ -965,10 +973,17 @@ cdef class Encoder:
         return 0
 
     cdef int _drain(self) except -1:
+        # A sink that returns without installing a buffer *copied* it: the active
+        # buffer stays active and encoding resumes at 0. A sink that *took* it must
+        # install a replacement before returning, and that installation's offset is
+        # the cursor -- resetting to 0 here would drop the header room it just
+        # reserved and overwrite it with payload (CORELIB_PLAN S5.1).
+        cdef uint64_t installs = self._installs
         if self._flush_sink is None:
             raise SofaBufferError("encoder buffer full")
         self._flush_sink(PyBytes_FromStringAndSize(<char*>self._fixed_ptr, <Py_ssize_t>self._cursor))
-        self._cursor = 0
+        if self._installs == installs:
+            self._cursor = 0
         return 0
 
     cdef inline int _emit_varint(self, uint64_t value) except -1:

@@ -96,6 +96,7 @@ class Encoder:
         self._fixed: memoryview | None = None
         self._cap = 0
         self._cursor = 0
+        self._installs = 0
         self._flush_sink: FlushSink | None = None
         self._sticky = sticky
         self._error: SofaError | None = None
@@ -137,6 +138,7 @@ class Encoder:
         self._fixed = None
         self._cap = 0
         self._cursor = 0
+        self._installs = 0
         self._flush_sink = flush
         self._sticky = sticky
         self._error = None
@@ -152,12 +154,22 @@ class Encoder:
         ``bufferSet``: typically called from inside the flush sink to hand the
         encoder a fresh buffer so encoding continues without interruption.
         ``offset`` bytes are reserved at the front (e.g. for a framing header).
+
+        The offset belongs to *this installation*, not to the buffer
+        (CORELIB_PLAN §5.1): the cursor starts at ``offset`` and the offset is
+        then consumed, so a later flush the sink returns from without installing
+        anything resumes at 0. Re-installing — even the *same* buffer — is what
+        re-arms the reservation, which is how a sink gets fresh header room in
+        every flushed unit rather than only in the first.
         """
         if not 0 <= offset < len(buffer):
             raise SofaRangeError("offset must be within the buffer")
         self._fixed = memoryview(buffer)
         self._cap = len(buffer)
         self._cursor = offset
+        # Counted so _drain can tell whether the sink took the buffer (installed
+        # a replacement) or merely copied it and returned.
+        self._installs += 1
 
     # --- error / output handling --------------------------------------------
 
@@ -185,8 +197,9 @@ class Encoder:
                 self._drain()
                 mv = self._fixed
                 cap = self._cap
-                # Defensive: _drain either raises (no sink) or resets the cursor
-                # to 0, so a still-full buffer here is unreachable in practice.
+                # Defensive: _drain either raises (no sink) or leaves the cursor
+                # inside the buffer — at 0, or at the offset a sink installed,
+                # which buffer_set bounds — so a still-full buffer is unreachable.
                 if self._cursor >= cap:  # pragma: no cover
                     raise SofaBufferError("encoder buffer full")
             take = min(cap - self._cursor, n - pos)
@@ -197,8 +210,16 @@ class Encoder:
     def _drain(self) -> None:
         if self._flush_sink is None:
             raise SofaBufferError("encoder buffer full")
+        # CORELIB_PLAN §5.1 "what a returning flush callback leaves behind": a sink
+        # that returns without installing a buffer *copied*, so the active buffer
+        # stays active and encoding resumes at 0. A sink that *took* the buffer must
+        # install a replacement before returning, and that installation's offset is
+        # the new cursor — resetting to 0 here would silently drop the header room it
+        # just reserved and overwrite it with payload in every packet but the first.
+        installs = self._installs
         self._flush_sink(bytes(self._fixed[0 : self._cursor]))  # type: ignore[index]
-        self._cursor = 0
+        if self._installs == installs:
+            self._cursor = 0
 
     def bytes_used(self) -> int:
         """Bytes written to the current buffer since construction/last flush."""

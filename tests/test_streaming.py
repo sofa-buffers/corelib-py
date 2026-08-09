@@ -52,6 +52,71 @@ def test_encode_through_tiny_scratch_buffer_matches_oneshot():
     assert bytes(collected) == expected
 
 
+def _stream_with_reserved_header(enc_cls, cap: int, offset: int, filler: int = 0xEE):
+    """Encode ``build_full_scale`` through ``cap``-byte buffers whose sink *takes*
+    the buffer it was handed and installs a replacement reserving ``offset`` bytes
+    of framing room (CORELIB_PLAN §5.1 take-and-replace). Returns the packets.
+    """
+    packets: list[bytes] = []
+    enc = None
+
+    def sink(chunk: bytes) -> None:
+        packets.append(bytes(chunk))
+        enc.buffer_set(bytearray([filler]) * cap, offset)
+
+    enc = enc_cls.over_buffer(bytearray([filler]) * cap, offset, sink)
+    build_full_scale(enc)
+    enc.flush()
+    return packets
+
+
+def _assert_every_packet_reserves(packets, offset: int, expected: bytes, filler: int = 0xEE):
+    """Every flushed unit must begin at the offset its installation asked for, and
+    the payloads behind those reservations must concatenate to the one-shot bytes."""
+    head = bytes([filler]) * offset
+    for i, packet in enumerate(packets):
+        assert packet[:offset] == head, f"packet {i} lost its {offset}-byte reservation"
+    assert b"".join(p[offset:] for p in packets) == expected
+
+
+def test_buffer_set_from_sink_reserves_its_offset_in_every_packet():
+    """§5.1: "the start offset belongs to the installation, not to the buffer" —
+    a sink that re-arms the reservation on every flush gets header room in *every*
+    packet, not just the first.
+
+    The drain used to reset the cursor to 0 unconditionally *after* the sink had
+    run, throwing away the offset the sink had just installed, so every packet
+    after the first started at byte 0 and the sink's framing header would clobber
+    payload bytes with nothing reported.
+    """
+    ref = Encoder()
+    build_full_scale(ref)
+    expected = ref.getvalue()
+
+    for cap, offset in ((16, 4), (32, 1), (64, 8), (11, 1)):
+        packets = _stream_with_reserved_header(Encoder, cap, offset)
+        assert len(packets) > 1, "buffer too large to force a mid-stream flush"
+        _assert_every_packet_reserves(packets, offset, expected)
+
+
+def test_sink_returning_without_installing_resumes_at_zero():
+    """The other half of the same rule: the offset is *consumed* by its
+    installation, so a copying sink that returns without installing anything
+    resumes at 0 — the reservation is not re-armed behind its back."""
+    ref = Encoder()
+    build_full_scale(ref)
+    expected = ref.getvalue()
+
+    collected = bytearray()
+    buf = bytearray(b"\xee" * 16)
+    enc = Encoder.over_buffer(buf, 4, collected.extend)
+    build_full_scale(enc)
+    enc.flush()
+    # First unit carries the one-time reservation; everything after it is payload.
+    assert bytes(collected[:4]) == b"\xee" * 4
+    assert bytes(collected[4:]) == expected
+
+
 def test_reserve_offset_left_untouched_then_flushed():
     # With offset=4 and no overflow, flush emits the reserved bytes + payload.
     buf = bytearray(64)
