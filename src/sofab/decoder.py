@@ -963,14 +963,14 @@ class Decoder:
         """
         count, elem_size = self._take_farray(FixlenSubtype.FP32)
         self._keep = self._pos
+        # ``elem_size`` is necessarily 4 here: §4.8's width rule is settled at
+        # the fixlen_word by ``next()``, which is where §5.2 wants that INVALID
+        # verdict reached — before any payload read, so it outranks a truncation
+        # behind it. The payload is therefore exactly ``count * 4`` bytes or this
+        # read raises, and re-deciding the width afterwards could only restate a
+        # check no input can reach (issue #75).
         data = self._read_exact(self._farray_nbytes(count, elem_size))
         self._pending = None  # committed only once the payload is in hand (§5.2)
-        # The fixlen_word must declare a 4-byte element width for fp32; reject a
-        # mismatch as malformed instead of letting struct.unpack raise a raw
-        # struct.error (which would leak an implementation detail and diverge
-        # from the native engine, which raises SofaDecodeError here).
-        if len(data) != count * 4:
-            raise SofaDecodeError("fixlen-array element width does not match its subtype")
         return _core.unpack_f32_array(data, count)
 
     def read_float64_array(self) -> list[float]:
@@ -980,9 +980,7 @@ class Decoder:
         """
         count, elem_size = self._take_farray(FixlenSubtype.FP64)
         self._keep = self._pos
+        # ``elem_size`` is necessarily 8 here; see read_float32_array.
         data = self._read_exact(self._farray_nbytes(count, elem_size))
         self._pending = None  # committed only once the payload is in hand (§5.2)
-        # fp64 elements are 8 bytes wide; see read_float32_array.
-        if len(data) != count * 8:
-            raise SofaDecodeError("fixlen-array element width does not match its subtype")
         return _core.unpack_f64_array(data, count)

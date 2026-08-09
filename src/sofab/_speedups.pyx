@@ -2082,19 +2082,6 @@ cdef class Decoder:
             raise self._suspend("truncated payload")
         return <Py_ssize_t>total
 
-    cdef bytes _read_farray_payload(self, uint64_t count, uint64_t elem_size, uint64_t width):
-        # Read a fixlen array's on-wire payload and verify its element width
-        # matches the subtype (4 for fp32, 8 for fp64) before any fixed-width
-        # unpack. The returned buffer is guaranteed to be exactly count*width
-        # bytes, so an unpack loop reading width bytes per element stays in
-        # bounds. A width mismatch is a malformed fixlen_word -> SofaDecodeError
-        # (an empty array, count == 0, carries no payload and so cannot mismatch,
-        # matching the pure path).
-        cdef bytes data = self._read_exact(self._farray_nbytes(count, elem_size))
-        if <uint64_t>PyBytes_GET_SIZE(data) != count * width:
-            raise SofaDecodeError("fixlen-array element width does not match its subtype")
-        return data
-
     cdef int _skip_pending(self) except -1:
         cdef int kind = self._pk
         if kind == _PEND_SCALAR:
@@ -2320,7 +2307,7 @@ cdef class Decoder:
             raise SofaStateError("fixlen-array subtype does not match the requested read")
         return self._pend_count, self._pend_size
 
-    cdef bytes _take_farray_payload(self, int subtype, uint64_t width):
+    cdef bytes _take_farray_payload(self, int subtype):
         # Validate the pending fixlen array, then read its payload inside a
         # resume transaction: an array whose payload has not fully arrived stays
         # pending and re-readable from its first payload byte (§5.2).
@@ -2328,18 +2315,19 @@ cdef class Decoder:
         cdef bytes data
         count, elem_size = self._take_farray(subtype)
         self._arm()
-        data = self._read_farray_payload(count, elem_size, width)
+        data = self._read_exact(self._farray_nbytes(count, elem_size))
         self._pk = _PEND_NONE   # committed only once the payload is in hand
         return data
 
     def read_float32_array(self):
-        # Consume the payload the fixlen_word claims (count * elem_size bytes),
-        # then require it to be exactly count*4 — i.e. the element width must be
-        # 4 for an fp32 array. Without this an elem_size != 4 (e.g. 0) leaves the
-        # buffer shorter than the count*4 bytes the fixed-width unpack loop reads,
-        # a heap over-read (SIGSEGV under boundscheck=False). The pure path is
-        # implicitly guarded by struct.unpack demanding an exact-size buffer.
-        cdef bytes data = self._take_farray_payload(_ST_FP32, 4)
+        # The element width is settled at the fixlen_word by next() — §4.8 fixes
+        # it to 4 for fp32 and §5.2 wants that INVALID verdict before any payload
+        # read — so a pending fp32 array always has elem_size == 4 and the
+        # payload read below yields exactly count*4 bytes or raises. Re-checking
+        # the width here could only restate a decision no input can reach (issue
+        # #75). The unpack loop stays in bounds regardless: it derives its
+        # element count from the buffer it actually holds, never from the wire.
+        cdef bytes data = self._take_farray_payload(_ST_FP32)
         cdef uint64_t count = <uint64_t>PyBytes_GET_SIZE(data) // 4
         cdef const unsigned char* p = <const unsigned char*>PyBytes_AS_STRING(data)
         cdef list out = PyList_New(<Py_ssize_t>count)
@@ -2352,9 +2340,9 @@ cdef class Decoder:
         return out
 
     def read_float64_array(self):
-        # See read_float32_array: the element width must be 8 for an fp64 array,
-        # or the count*8-byte unpack loop over-reads a shorter buffer.
-        cdef bytes data = self._take_farray_payload(_ST_FP64, 8)
+        # See read_float32_array: an fp64 array's element width is 8, settled at
+        # the fixlen_word.
+        cdef bytes data = self._take_farray_payload(_ST_FP64)
         cdef uint64_t count = <uint64_t>PyBytes_GET_SIZE(data) // 8
         cdef const unsigned char* p = <const unsigned char*>PyBytes_AS_STRING(data)
         cdef list out = PyList_New(<Py_ssize_t>count)
