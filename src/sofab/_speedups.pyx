@@ -449,6 +449,7 @@ from .types import (
     FIXLEN_MAX,
     ID_MAX,
     MAX_DEPTH,
+    MIN_OUTPUT_BUFFER,
     SIGNED_MAX,
     SIGNED_MIN,
     UNSIGNED_MAX,
@@ -540,6 +541,10 @@ cdef uint64_t _ID_MAX = <uint64_t>0x7FFFFFFF
 cdef uint64_t _ARRAY_MAX = <uint64_t>0x7FFFFFFF
 cdef uint64_t _FIXLEN_MAX = <uint64_t>0x7FFFFFFF
 cdef int _MAX_DEPTH = 255
+# The smallest streaming output buffer this port accepts (S5.1). It is 1 because
+# _put splits every atomic unit at any byte boundary; it binds only a buffer
+# installed together with a flush sink. Mirrors types.MIN_OUTPUT_BUFFER.
+cdef Py_ssize_t _MIN_OUTPUT_BUFFER = MIN_OUTPUT_BUFFER
 # Largest value representable in a Py_ssize_t — a fixlen-array payload larger
 # than this cannot be satisfied by any real buffer, so it is treated as a
 # truncated (unsatisfiable) read rather than being cast to a negative size.
@@ -924,11 +929,23 @@ cdef class Encoder:
         return self
 
     def buffer_set(self, bytearray buffer, int offset=0):
-        if not (0 <= offset < PyByteArray_GET_SIZE(buffer)):
+        cdef Py_ssize_t size = PyByteArray_GET_SIZE(buffer)
+        if not (0 <= <Py_ssize_t>offset <= size):
             raise SofaRangeError("offset must be within the buffer")
+        # MIN_OUTPUT_BUFFER (S5.1) binds a buffer installed *with* a flush sink,
+        # here and at every mid-stream set, so an unusable buffer is refused where
+        # it is handed over rather than partway through a message. Without a sink
+        # no flush can occur and no minimum applies -- the buffer holds the message
+        # or reports buffer-full -- which is what keeps a caller sizing from a
+        # generated MAX_SIZE exact, down to a zero-byte remainder.
+        if self._flush_sink is not None and size - <Py_ssize_t>offset < _MIN_OUTPUT_BUFFER:
+            raise SofaRangeError(
+                "a buffer installed with a flush sink needs at least "
+                "MIN_OUTPUT_BUFFER=%d usable byte(s), got %d"
+                % (_MIN_OUTPUT_BUFFER, size - <Py_ssize_t>offset))
         self._fixed_obj = buffer
         self._fixed_ptr = <unsigned char*>PyByteArray_AS_STRING(buffer)
-        self._fixed_cap = <size_t>PyByteArray_GET_SIZE(buffer)
+        self._fixed_cap = <size_t>size
         self._cursor = <size_t>offset
         self._is_fixed = True
         # The offset belongs to this installation, not to the buffer (S5.1): it is

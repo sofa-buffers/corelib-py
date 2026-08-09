@@ -261,6 +261,22 @@ never provides a value buffer.**
   drains to the writer. `Encoder.over_buffer` is caller-owned and bounded: you
   provide a fixed `bytearray`, it writes in place via a `memoryview` and flushes
   to the sink + reuses the buffer when full.
+* **`MIN_OUTPUT_BUFFER` is `1`, and it applies to a buffer installed *with* a
+  sink.** `sofab.MIN_OUTPUT_BUFFER` is the smallest output buffer this port
+  accepts for **streaming**: one byte, because the encoder splits every atomic
+  unit — a header varint, a `fixlen_word`, an element count, a scalar, one
+  float — at any byte boundary, so a one-byte scratch buffer already yields
+  exactly the one-shot bytes. `Encoder.over_buffer(buf, offset, flush)` and every
+  mid-stream `buffer_set(buf, offset)` that carries a flush sink require
+  `len(buf) - offset >= MIN_OUTPUT_BUFFER` and raise `SofaRangeError` right
+  there — where the buffer is handed over, never partway through a message.
+  A buffer installed **without** a sink is subject to no minimum: no flush can
+  occur, so the buffer simply holds the message or reports `SofaBufferError`, and
+  sizing it from a generated `MAX_SIZE` stays exact — a message that encodes to
+  two bytes encodes into a two-byte `bytearray`. There is no pass-through: a
+  `string`/`blob` run is copied into the output buffer like any other output, and
+  every flush hands the sink a `bytes` snapshot of that buffer's prefix — a sink
+  may retain what it receives without pinning caller memory.
 * **The start offset belongs to the installation, not to the buffer.** A flush
   sink states what it did by what it does before returning. Returning **without**
   installing anything means it *copied* the bytes it was handed: the same buffer

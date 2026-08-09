@@ -161,8 +161,13 @@ def test_sticky_records_but_does_not_raise_for_each_writer():
 
 
 def test_buffer_set_offset_out_of_range_raises():
-    with pytest.raises(SofaRangeError):
-        Encoder.over_buffer(bytearray(8), offset=8)  # offset == len is invalid
+    for offset in (-1, 9):  # before the front / past the end
+        with pytest.raises(SofaRangeError):
+            Encoder.over_buffer(bytearray(8), offset=offset)
+    # offset == len is *in* range: it is a zero-byte buffer, and a buffer
+    # installed without a sink is subject to no minimum (CORELIB_PLAN §5.1) —
+    # see tests/test_streaming.py for the MIN_OUTPUT_BUFFER rules.
+    Encoder.over_buffer(bytearray(8), offset=8)
 
 
 def test_fixed_buffer_full_without_sink_raises():
