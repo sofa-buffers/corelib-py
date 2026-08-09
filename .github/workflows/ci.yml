@@ -35,13 +35,64 @@ jobs:
       - name: Install package and tooling
         run: python -m pip install -e . pytest ruff mypy
 
+      - name: Assert the native accelerator was built
+        # setup.py marks the extension `optional=True` so a compiler-less host
+        # still installs — which means a failed compile only prints a warning and
+        # installs the pure-Python build. Every native-gated test is behind
+        # `pytest.importorskip`, so without this gate a broken accelerator would
+        # skip itself out of the run and leave the leg green with the parity
+        # tests (and half the coverage) silently gone. CORELIB_PLAN §12.1 step 5
+        # wants the full suite run, not the part that still imports.
+        run: |
+          python -c "import sofab, sys; sys.exit(0 if sofab.IMPL == 'native' else f'native accelerator missing: sofab.IMPL == {sofab.IMPL!r}')"
+
       - name: Lint (ruff)
         run: ruff check src/sofab tests
 
       - name: Type-check (mypy)
         run: mypy --strict src/sofab
 
+      - name: Test (native engine)
+        env:
+          SOFAB_REQUIRE_ENGINE: native
+        run: pytest
+
+      - name: Test (pure-Python engine)
+        # Both engines ship, so both are run: the native↔pure parity tests only
+        # pin the two to each other and cannot stand in for either alone.
+        # SOFAB_REQUIRE_ENGINE makes each run assert which engine it got, so
+        # neither can vanish from CI unnoticed (tests/test_engine_guard.py).
+        env:
+          SOFAB_PUREPYTHON: '1'
+          SOFAB_REQUIRE_ENGINE: python
+        run: pytest
+
+  fallback:
+    name: Pure-Python fallback install (no native build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+
+      - name: Install without the native accelerator
+        # The install a host without a C compiler gets. The README promises this
+        # fallback works, so CI builds and tests it instead of assuming it.
+        env:
+          SOFAB_DISABLE_NATIVE: '1'
+        run: python -m pip install -e . pytest
+
+      - name: Assert the pure-Python fallback is active
+        run: |
+          python -c "import sofab, sys; sys.exit(0 if sofab.IMPL == 'python' else f'expected the pure-Python fallback: sofab.IMPL == {sofab.IMPL!r}')"
+
       - name: Test
+        env:
+          SOFAB_REQUIRE_ENGINE: python
         run: pytest
 
   coverage:
@@ -72,6 +123,7 @@ jobs:
         # coverage.py.
         env:
           SOFAB_PUREPYTHON: '1'
+          SOFAB_REQUIRE_ENGINE: python
         run: pytest --cov=sofab --cov-report=term-missing
 
       - name: Compute coverage badge data

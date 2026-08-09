@@ -489,6 +489,21 @@ pytest                       # whichever engine is active (native if built)
 SOFAB_PUREPYTHON=1 pytest    # force the pure-Python engine
 ```
 
+That optionality has a sharp edge: a failed compile *removes* every native test
+(they are gated on importing `sofab._speedups`) instead of failing one, so a run
+can stay green with the accelerator — and the native↔pure parity tests — gone.
+`SOFAB_REQUIRE_ENGINE=native|python` closes it, by making the run assert that
+`sofab.IMPL` is the engine it claims to be exercising:
+
+```bash
+SOFAB_REQUIRE_ENGINE=native pytest                    # fails if the accelerator is missing
+SOFAB_PUREPYTHON=1 SOFAB_REQUIRE_ENGINE=python pytest  # the fallback engine, pinned
+```
+
+CI runs the full suite twice on every supported Python — once per engine, each
+pinned that way — and adds a leg installed with `SOFAB_DISABLE_NATIVE=1` that
+proves the compiler-less install still passes.
+
 ## Benchmarks
 
 `bench/perfbench.py` runs the standard workloads; `bench/compare_protobuf.py`
