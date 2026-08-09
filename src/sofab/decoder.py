@@ -62,6 +62,11 @@ _SCALAR = 0
 _FIXLEN = 1
 _VARRAY = 2
 _FARRAY = 3
+# A pending value a receiver-side cap has rejected (§6.2.1). The real pending
+# tuple is parked inside it — ``(_LIMIT, message, pending)`` — so the rejection
+# can still be waived by :meth:`Decoder.schema_bounded` and so a peek can read
+# through it. Every consume path re-raises it; see ``_pending_error``.
+_LIMIT = 4
 
 # Wire-type members indexed by their integer value, so the per-field hot path
 # can recover the enum member by index (``_WT[wtype]``) instead of paying the
@@ -104,12 +109,16 @@ class Decoder:
         ``max_array_count`` / ``max_string_len`` / ``max_blob_len`` are optional
         **receiver-side** decode limits: a field whose wire-declared array count
         or fixlen string/blob length exceeds the configured cap is rejected with
-        :class:`SofaLimitError` at header-decode time — *before* any allocation
-        or payload buffering, so a hostile claim fails even if the payload never
-        arrives. ``None`` (the default) means "no limit" — today's behaviour. The
-        limits are policy, not schema: the generator bakes the configured values
-        into generated code and passes them here; this runtime only enforces them
-        and never invents a default cap of its own.
+        :class:`SofaLimitError`. The verdict is reached at the count/length
+        header — *before* any allocation or payload buffering, so a hostile claim
+        fails even if the payload never arrives — and is raised by the call that
+        would consume the field (a typed read, :meth:`skip`, or the auto-skip in
+        the following :meth:`next`), which is what leaves room for
+        :meth:`schema_bounded` in between. ``None`` (the default) means "no
+        limit". The limits are policy, not schema: the generator bakes the
+        configured values into generated code and passes them here; this runtime
+        only enforces them and never invents a default cap of its own, and it
+        never applies one to a field the caller declares schema-bounded (§6.2.1).
         """
         self._read = reader.read
         self._chunk = chunk_size
@@ -506,50 +515,55 @@ class Decoder:
                 raise SofaDecodeError("fp32 fixlen length must be 4")
             if subtype == FixlenSubtype.FP64 and length != 8:
                 raise SofaDecodeError("fp64 fixlen length must be 8")
-            # Receiver-configured limits (policy, not malformation): reject an
-            # oversize string/blob here — before its payload is read or buffered.
-            if (
-                subtype == FixlenSubtype.STRING
-                and self._max_string_len is not None
-                and length > self._max_string_len
-            ):
-                raise SofaLimitError(
-                    f"string length {length} exceeds max_string_len {self._max_string_len}"
-                )
-            if (
-                subtype == FixlenSubtype.BLOB
-                and self._max_blob_len is not None
-                and length > self._max_blob_len
-            ):
-                raise SofaLimitError(
-                    f"blob length {length} exceeds max_blob_len {self._max_blob_len}"
-                )
             self._cur = Field(
                 field_id, WireType.FIXLEN, size=length, subtype=FixlenSubtype(subtype)
             )
-            self._pending = (_FIXLEN, subtype, length)
+            pending: tuple[Any, ...] = (_FIXLEN, subtype, length)
+            # Receiver-configured caps (policy, not malformation): the verdict on
+            # an oversize string/blob is reached here, on the length word alone —
+            # before its payload is read or buffered, which is where §6.2.1 wants
+            # it — and parked on the pending value rather than raised. Nothing is
+            # read or allocated until the field is consumed, and every consume
+            # path raises it (``_pending_error``), so deferring the raise by one
+            # call costs the protection nothing; what it buys is the window
+            # §6.2.1 requires, in which the caller can declare the field
+            # schema-bounded and take the cap off it (:meth:`schema_bounded`).
+            if subtype == FixlenSubtype.STRING:
+                cap = self._max_string_len
+                if cap is not None and length > cap:
+                    pending = (
+                        _LIMIT,
+                        f"string length {length} exceeds max_string_len {cap}",
+                        pending,
+                    )
+            elif subtype == FixlenSubtype.BLOB:
+                cap = self._max_blob_len
+                if cap is not None and length > cap:
+                    pending = (
+                        _LIMIT,
+                        f"blob length {length} exceeds max_blob_len {cap}",
+                        pending,
+                    )
+            self._pending = pending
             return self._cur
 
         if wtype == WireType.ARRAY_UNSIGNED or wtype == WireType.ARRAY_SIGNED:
             count = self._varint()
             if count < 0 or count > ARRAY_MAX:
                 raise SofaDecodeError(f"array count {count} out of range")
-            if self._max_array_count is not None and count > self._max_array_count:
-                raise SofaLimitError(
-                    f"array count {count} exceeds max_array_count {self._max_array_count}"
-                )
             self._cur = Field(field_id, _WT[wtype], count=count)
-            self._pending = (_VARRAY, wtype, count)
+            pending = (_VARRAY, wtype, count)
+            # Parked, not raised — see the fixlen branch above (§6.2.1).
+            cap = self._max_array_count
+            if cap is not None and count > cap:
+                pending = (_LIMIT, f"array count {count} exceeds max_array_count {cap}", pending)
+            self._pending = pending
             return self._cur
 
         # wtype == ARRAY_FIXLEN
         count = self._varint()
         if count < 0 or count > ARRAY_MAX:
             raise SofaDecodeError(f"array count {count} out of range")
-        if self._max_array_count is not None and count > self._max_array_count:
-            raise SofaLimitError(
-                f"array count {count} exceeds max_array_count {self._max_array_count}"
-            )
         # §4.8: a fixlen array ALWAYS carries its fixlen_word (the shared element
         # subtype/width), even when empty — so read it unconditionally to recover
         # the true subtype. A zero-count array simply has no payload after it.
@@ -576,8 +590,58 @@ class Decoder:
             size=elem_size,
             subtype=FixlenSubtype(subtype),
         )
-        self._pending = (_FARRAY, subtype, count, elem_size)
+        pending = (_FARRAY, subtype, count, elem_size)
+        # Parked, not raised — see the fixlen branch above (§6.2.1).
+        cap = self._max_array_count
+        if cap is not None and count > cap:
+            pending = (_LIMIT, f"array count {count} exceeds max_array_count {cap}", pending)
+        self._pending = pending
         return self._cur
+
+    def schema_bounded(self) -> None:
+        """Declare that the **schema** bounds the size of the field :meth:`next`
+        most recently returned — a ``count:`` on an array, a ``maxlen:`` on a
+        string or blob — so the receiver-side caps (``max_array_count`` /
+        ``max_string_len`` / ``max_blob_len``) are not applied to it.
+
+        CORELIB_PLAN §6.2.1 requires exactly that: a cap is *capacity* the
+        deployment is willing to commit where the **sender** picks the size
+        freely, and it "MUST NOT be applied to a field the schema already
+        bounds". There the schema bound governs, and an over-bound value is
+        `INVALID` (:class:`SofaDecodeError`, MESSAGE_SPEC §7.1) rather than the
+        cap's :class:`SofaLimitError`, which §6.3 says is "never raised for a
+        field the schema bounds".
+
+        Only the schema knows, so only the caller can answer — generated code
+        calls this on exactly the fields whose declaration bounds them, right
+        before the typed read. Declaring is therefore a **promise to enforce**:
+        with the cap off, nothing else stands between an untrusted length word
+        and the allocation it implies, so the caller must reject a count/length
+        past its declared bound itself (:meth:`fixlen_len` gives the wire byte
+        length for that, without consuming the field).
+
+        The declaration covers the current field only — the next :meth:`next`
+        starts an undeclared, and therefore capped, field again — and it is a
+        no-op on a field no cap has rejected, so it is safe to call
+        unconditionally. A :class:`sofab.Visitor` driven by :meth:`drive` can
+        call it from ``on_field``, which is reached before the typed read.
+        """
+        pending = self._pending
+        if pending is not None and pending[0] == _LIMIT:
+            self._pending = pending[2]
+
+    @staticmethod
+    def _pending_error(pending: tuple[Any, ...] | None, msg: str) -> Exception:
+        """Build the exception a mismatched pending value deserves: the parked
+        receiver-cap rejection (§6.2.1) when one is what is standing in the way,
+        and the caller's state error otherwise.
+
+        Reached only from paths that have already found the pending kind wrong,
+        so the ordinary read costs nothing for it.
+        """
+        if pending is not None and pending[0] == _LIMIT:
+            return SofaLimitError(pending[1])
+        return SofaStateError(msg)
 
     # --- skipping -----------------------------------------------------------
 
@@ -605,8 +669,10 @@ class Decoder:
             self._read_exact(pending[2])
         elif kind == _VARRAY:
             self._skip_varints(pending[2])
-        else:  # _FARRAY
+        elif kind == _FARRAY:
             self._read_exact(self._farray_nbytes(pending[2], pending[3]))
+        else:  # _LIMIT — a skip still buffers the payload, so the cap binds it
+            raise SofaLimitError(pending[1])
         # Cleared only now: had the value run out mid-skip, the field has to
         # stay pending so the retry skips it again from its first byte (§5.2).
         self._pending = None
@@ -718,7 +784,7 @@ class Decoder:
     def _take_fixlen(self, subtype: FixlenSubtype) -> bytes:
         pending = self._pending
         if pending is None or pending[0] != _FIXLEN:
-            raise SofaStateError("current field is not a fixlen value")
+            raise self._pending_error(pending, "current field is not a fixlen value")
         if pending[1] != subtype:
             raise SofaStateError("fixlen subtype does not match the requested read")
         self._keep = self._pos
@@ -764,6 +830,15 @@ class Decoder:
         """
         pending = self._pending
         if pending is None or pending[0] != _FIXLEN:
+            # A parked receiver-cap rejection (§6.2.1) keeps the real pending
+            # value inside it, and this peek reads nothing and allocates
+            # nothing — so it answers through the wrapper. That is deliberate:
+            # this is the length generated code measures the SCHEMA bound
+            # against, and that bound's INVALID outranks the cap (§7.1), so it
+            # must be decidable whether or not :meth:`schema_bounded` has been
+            # called yet.
+            if pending is not None and pending[0] == _LIMIT and pending[2][0] == _FIXLEN:
+                return int(pending[2][2])
             raise SofaStateError("current field is not a fixlen value")
         return int(pending[2])
 
@@ -797,7 +872,7 @@ class Decoder:
         """
         pending = self._pending
         if pending is None or pending[0] != _VARRAY or pending[1] != wtype:
-            raise SofaStateError("current field is not a matching varint array")
+            raise self._pending_error(pending, "current field is not a matching varint array")
         return int(pending[2])
 
     def read_unsigned_array(self, elem_max: int | None = None) -> list[int]:
@@ -850,7 +925,7 @@ class Decoder:
     def _take_farray(self, subtype: FixlenSubtype) -> tuple[int, int]:
         pending = self._pending
         if pending is None or pending[0] != _FARRAY:
-            raise SofaStateError("current field is not a fixlen array")
+            raise self._pending_error(pending, "current field is not a fixlen array")
         # §4.8: a fixlen array always carries its fixlen_word, so the subtype is
         # known even for a zero-count array — check it like any other read.
         if pending[1] != subtype:

@@ -130,6 +130,12 @@ class SofaLimitError(SofaError):
     :class:`SofaDecodeError` under :class:`SofaError`, **not** a subclass of it,
     so ``except SofaDecodeError`` does not catch it and differential fuzzing does
     not see a limit rejection as a conformance divergence from another engine.
+
+    It is raised only for a field the **schema** leaves unbounded: where the
+    schema states a ``count:``/``maxlen:`` the caller says so with
+    :meth:`sofab.Decoder.schema_bounded` and that bound governs instead, an
+    over-bound value being :class:`SofaDecodeError` (CORELIB_PLAN §6.2.1/§6.3,
+    MESSAGE_SPEC §7.1).
     """
 
 
