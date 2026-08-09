@@ -68,7 +68,7 @@ import sofab   # Encoder, Decoder, Visitor, wire-format types and limits
 | Reserve-offset | `Encoder.over_buffer(buf, offset=…)` leaves room at the front of the buffer for a lower-layer protocol header; a sink calling `buffer_set(buf, offset)` re-arms that room for **every** flushed packet. |
 | Sparse sequences | `write_sequence_begin_lazy` holds a sequence header back until the sequence receives content, so a sequence-typed field equal to its declared default is **omitted** rather than framed empty (MESSAGE_SPEC §2) — decided in one forward pass, without buffering the sub-message. `write_sequence_end` drops a contentless sequence; `write_sequence_end_keep` forces the frame out where presence itself carries meaning — a wrapper-array **element** is still always framed, even when all-default, because element presence is what carries a dynamic array's length (§5.1). |
 | Typed | Fully type-annotated with a `py.typed` marker (PEP 561); clean under `mypy --strict`. |
-| Forward/backward compatible | Unknown fields are consumed with `skip()`. |
+| Forward/backward compatible | Unknown fields are consumed with `skip()` — *consumed*, not copied: the payload is stepped over, never materialized. |
 
 ## Usage
 
@@ -318,6 +318,15 @@ never provides a value buffer.**
   exact wire byte length **without** consuming it, so a caller can bound the
   field against a schema `maxlen` before reading — no re-encoding a decoded
   `str` just to measure it.
+* **Decode: a value you don't want costs nothing to get rid of.** `skip()` — and
+  the auto-skip `next()` performs over an unconsumed value — walks a string,
+  blob or fixlen-array payload by advancing the cursor, so nothing is allocated
+  for bytes that are being discarded (CORELIB_PLAN §5.2: a skip *consumes*).
+  Skipping a 1 MiB blob already in the buffer is a pointer bump, not a 1 MiB
+  copy. The bytes are still **buffered** when the payload straddles a refill —
+  a suspended skip has to be replayable from its first byte, and `skip()` over a
+  sequence replays the whole walk — so what a skip saves is the copy, not the
+  window: the memory held is still one field (one sequence for a sequence skip).
 * **Encode: one ownership model — the output buffer is fixed, and never grows.**
   CORELIB_PLAN §5.1 forbids a corelib to allocate an output buffer or to grow
   one, so there is a single mechanism here with three ways to reach it, not two

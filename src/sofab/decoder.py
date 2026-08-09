@@ -308,6 +308,28 @@ class Decoder:
         self._pos = end
         return buf[pos:end]
 
+    def _skip_exact(self, n: int) -> None:
+        """Consume the next ``n`` bytes without materialising them (§5.2: a skip
+        *consumes and discards*; it must not pay for a copy of what it throws
+        away). Same sourcing and same suspension as :meth:`_read_exact` — only
+        the result object is missing.
+
+        The bytes are still buffered on the slow path, because they are not free
+        to drop: a suspension has to be able to replay the skipped construct from
+        its first byte, and ``skip()`` over a sequence replays a whole nested
+        walk (see ``_floor``). Retention is therefore the resume contract's,
+        while the copy was pure waste — this drops the copy and keeps the
+        contract, so nothing observable changes."""
+        buf = self._buf
+        pos = self._pos
+        end = pos + n
+        if end <= len(buf):
+            self._pos = end
+            return
+        if not self._need(n):
+            raise self._suspend("truncated payload")
+        self._pos += n
+
     def _read_varints(
         self,
         count: int,
@@ -666,11 +688,11 @@ class Decoder:
         if kind == _SCALAR:
             self._varint()
         elif kind == _FIXLEN:
-            self._read_exact(pending[2])
+            self._skip_exact(pending[2])
         elif kind == _VARRAY:
             self._skip_varints(pending[2])
         elif kind == _FARRAY:
-            self._read_exact(self._farray_nbytes(pending[2], pending[3]))
+            self._skip_exact(self._farray_nbytes(pending[2], pending[3]))
         else:  # _LIMIT — a skip still buffers the payload, so the cap binds it
             raise SofaLimitError(pending[1])
         # Cleared only now: had the value run out mid-skip, the field has to
