@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """SofaBuffers Python — performance tools.
 
-Mirrors `bench/c/bench.c`, `corelib-rs/benches/bench.rs` and
-`corelib-go/cmd/perfbench`: the same four workloads, with identical field ids,
-types and values, so the numbers line up across languages. Two complementary
-views:
+Implements BENCH_SPEC (the cross-language benchmark specification): the same
+workloads on the same data, measured the same way and printed in the same
+grammar as `corelib-rs/benches/bench.rs`, `bench/c/bench.c` and
+`corelib-go/cmd/perfbench`, so the numbers line up across languages. Three
+views, one per tool BENCH_SPEC requires:
 
-  * ``time`` — throughput in **MB/s** on *this* machine. A "speedtest" for the
-    library on the current host, measured against process CPU time over a ~1s
-    loop per workload (MB = 1e6 bytes).
+  * ``bench`` (alias ``time``) — throughput in **MB/s** on *this* machine. A
+    "speedtest" for the library on the current host, measured against process
+    CPU time over a ~1s loop per workload (MB = 1e6 bytes).
 
   * ``perf`` — per-op cost (CPU time/op in ns + MB/s) for the shared 12-field
     "perf" message, in the same format as the C/C++/Rust/… per-op tools. CPython
@@ -21,20 +22,29 @@ views:
     that is independent of the CPU clock speed and OS scheduler (see that
     script for how the fixed startup cost is cancelled out).
 
-Workloads: ``encode_u64_array``, ``encode_typical``, ``decode_u64_array``,
-``decode_typical``.
+Workloads (the keys of :data:`WORKLOADS`, in the order ``bench`` prints them)::
+
+    encode_u64_array   encode_typical   encode_blob_oneshot
+    encode_blob_stream encode_composite
+    decode_u64_array   decode_typical   decode_blob
+    decode_composite   decode_composite_skip
 
 Usage:
-    python bench/perfbench.py time
+    python bench/perfbench.py bench
     python bench/perfbench.py perf
     python bench/perfbench.py encode_typical 1000
+
+``SOFAB_BENCH_SECONDS`` shortens the per-workload measurement loop (default
+``1.0``); it exists for the format test, not for reportable numbers.
 """
 
 from __future__ import annotations
 
 import io
+import os
 import sys
 import time
+from typing import Callable
 
 from sofab import IMPL, Decoder, Encoder, WireType
 
@@ -42,6 +52,18 @@ N = 1000
 GOLDEN = 0x9E3779B97F4A7C15
 MASK64 = (1 << 64) - 1
 ARR16 = [10, 20, 30, 40]
+
+#: Payload size of the ``blob 1MB`` message, and its encoded size: a 1-byte
+#: field header, a 4-byte fixlen word and the payload (BENCH_SPEC). Both are
+#: parity checks across ports.
+BLOB_N = 1_000_000
+BLOB_ENCODED = 1_000_005
+
+#: The fixed buffer/chunk size the streaming blob rows are driven with — the
+#: same 4096 on every port, so the rows stay comparable (BENCH_SPEC). It is not
+#: this port's own buffer size and has nothing to do with MIN_OUTPUT_BUFFER,
+#: which is at most 20 and therefore always satisfied here.
+STREAM_BUFFER = 4096
 
 
 def make_src() -> list[int]:
@@ -123,6 +145,296 @@ def decode_typical(data: bytes) -> int:
     return acc
 
 
+# ---- blob 1MB (BENCH_SPEC "blob 1MB") ---------------------------------------
+#
+# One field, id 1, type blob, declared *without* maxlen — the point being that
+# the message is larger than any buffer a caller could pre-size from the schema.
+# blob rather than string on purpose: a megabyte of UTF-8 would put the §6.4
+# validator in the measurement and dominate it. This workload measures buffer
+# handling.
+
+
+def make_blob() -> bytes:
+    """``b[i] = (i * GOLDEN) & 0xFF`` for i in 0..999_999.
+
+    Built from one 256-byte period rather than a million-iteration loop: the low
+    byte of ``i * GOLDEN`` depends only on ``i & 0xFF`` (arithmetic mod 256), so
+    the sequence repeats every 256 indices. Identical bytes, and cheap enough
+    that the setup does not dominate a Callgrind run. ``tests/test_bench_spec``
+    checks it against the literal formula over the whole million.
+    """
+    period = bytes(((i * GOLDEN) & 0xFF) for i in range(256))
+    return (period * (BLOB_N // 256 + 1))[:BLOB_N]
+
+
+class _DiscardSink:
+    """A flush sink that consumes and discards (BENCH_SPEC).
+
+    It must not accumulate the bytes and must not do I/O: an accumulator would
+    add to the streaming row a copy the one-shot row never pays, and I/O is not
+    deterministic under Callgrind. XOR-ing one byte per call is the minimum that
+    keeps the call from being elided.
+
+    It returns without installing a buffer, which is §5.1's "the sink copied":
+    the active buffer stays active and the encoder resumes at 0 — i.e. this is
+    the copy path, with pass-through *not* granted (this port implements no
+    pass-through at all, so BENCH_SPEC's optional third blob row is omitted
+    rather than printed as a placeholder).
+    """
+
+    __slots__ = ("xor",)
+
+    def __init__(self) -> None:
+        self.xor = 0
+
+    def __call__(self, chunk: bytes) -> None:
+        self.xor ^= chunk[0]
+
+
+class _ChunkReader:
+    """Feeds a decoder in fixed-size chunks, however much it asks for.
+
+    The cap is the point: :class:`~sofab.Decoder` requests as much as the
+    construct in flight still needs, so without a cap here a "streaming" decode
+    of a megabyte would be handed the megabyte in one read and measure nothing
+    of the refill path.
+    """
+
+    __slots__ = ("_data", "_pos", "_chunk")
+
+    def __init__(self, data: bytes, chunk: int) -> None:
+        self._data = data
+        self._pos = 0
+        self._chunk = chunk
+
+    def read(self, n: int) -> bytes:
+        take = n if n < self._chunk else self._chunk
+        end = self._pos + take
+        out = self._data[self._pos : end]
+        self._pos += len(out)
+        return out
+
+
+def encode_blob_oneshot(enc: Encoder, blob: bytes) -> int:
+    """The floor: one contiguous write into a caller buffer, no sink, no flush."""
+    enc.write_bytes(1, blob)
+    return enc.bytes_used()
+
+
+def encode_blob_stream(enc: Encoder, blob: bytes) -> int:
+    """The same bytes through ~245 flushes of a 4096-byte caller buffer."""
+    enc.write_bytes(1, blob)
+    return enc.flush()
+
+
+def decode_blob(data: bytes) -> int:
+    dec = Decoder(_ChunkReader(data, STREAM_BUFFER), chunk_size=STREAM_BUFFER)
+    acc = 0
+    while (f := dec.next()) is not None:
+        if f.type == WireType.FIXLEN:
+            payload = dec.bytes()
+            acc += len(payload) + payload[0]
+        else:
+            dec.skip()
+    return acc
+
+
+# ---- composite (BENCH_SPEC "composite") -------------------------------------
+#
+# The other datasets are flat: every field present, every array a compact scalar
+# array, one sequence one level deep, every id a one-byte header. This one
+# exercises the paths that leaves unrun — a wrapper array (a header per element,
+# MESSAGE_SPEC §5.1, with element ids straddling the one-byte header boundary),
+# a non-ASCII string through the §6.4 validator, nesting at depth 3, a field the
+# encoder must *omit* (the hold-back's discard path), and a two-byte field
+# header.
+
+COMPOSITE_ITEMS = [f"item-{i}" for i in range(64)]
+COMPOSITE_TEXT = "aä€𝄞" * 32  # 320 UTF-8 bytes: 1-, 2-, 3- and 4-byte sequences
+
+#: Encoded size of the composite message — the parity check across ports, as
+#: the perf message's 170 is.
+COMPOSITE_ENCODED = 956
+
+
+def encode_composite(enc: Encoder) -> None:
+    # 1: string array in wrapper form — one field header per element, element id
+    #    = 0-based array index (§5.1). Ids 0..15 are one-byte headers, 16..63
+    #    two-byte ones.
+    enc.write_sequence_begin_lazy(1)
+    for i, item in enumerate(COMPOSITE_ITEMS):
+        enc.write_string(i, item)
+    enc.write_sequence_end()
+    # 2: non-ASCII string, through the UTF-8 validator.
+    enc.write_string(2, COMPOSITE_TEXT)
+    # 3: { 1: { 1: { 1: unsigned 7 } }, 2: signed -1 } — depth 3, so the lazy
+    #    hold-back run grows past the single level typical/perf reach.
+    enc.write_sequence_begin_lazy(3)
+    enc.write_sequence_begin_lazy(1)
+    enc.write_sequence_begin_lazy(1)
+    enc.write_unsigned(1, 7)
+    enc.write_sequence_end()
+    enc.write_sequence_end()
+    enc.write_signed(2, -1)
+    enc.write_sequence_end()
+    # 4: a struct equal to its declared default. Every child is then equal to its
+    #    own default and is omitted, so the sequence never receives content and
+    #    write_sequence_end discards the held-back frame (MESSAGE_SPEC §2) — the
+    #    one field in the suite the encoder is required to *not* write.
+    enc.write_sequence_begin_lazy(4)
+    enc.write_sequence_end()
+    # 130: the only two-byte field header in the suite — (130 << 3) | 0.
+    enc.write_unsigned(130, 0xDEADBEEF)
+
+
+def encode_composite_msg() -> bytes:
+    enc = Encoder()
+    encode_composite(enc)
+    enc.flush()
+    return enc.getvalue()
+
+
+def _decode_seq(dec: Decoder) -> int:
+    """Read one open sequence to its end, recursing into nested ones."""
+    acc = 0
+    while (g := dec.next()) is not None and g.type != WireType.SEQUENCE_END:
+        if g.type == WireType.SEQUENCE_START:
+            acc += _decode_seq(dec)
+        elif g.type == WireType.UNSIGNED:
+            acc += dec.unsigned()
+        elif g.type == WireType.SIGNED:
+            acc += dec.signed() & MASK64
+        elif g.type == WireType.FIXLEN:
+            acc += len(dec.string())
+        else:
+            dec.skip()
+    return acc
+
+
+def decode_composite(data: bytes) -> int:
+    """Whole message, all fields read."""
+    dec = Decoder(io.BytesIO(data))
+    acc = 0
+    while (f := dec.next()) is not None:
+        if f.type == WireType.SEQUENCE_START:
+            acc += _decode_seq(dec)
+        elif f.type == WireType.UNSIGNED:
+            acc += dec.unsigned()
+        elif f.type == WireType.FIXLEN:
+            acc += len(dec.string())
+        else:
+            dec.skip()
+    return acc
+
+
+def decode_composite_skip(data: bytes) -> int:
+    """Same bytes, every field and sub-sequence skipped — the path a router or a
+    filter runs: walk the message, materialize nothing. ``skip()`` on a sequence
+    start consumes the whole sub-tree."""
+    dec = Decoder(io.BytesIO(data))
+    n = 0
+    while dec.next() is not None:
+        dec.skip()
+        n += 1
+    return n
+
+
+# ---- workload registry ------------------------------------------------------
+#
+# One definition of each workload, shared by the throughput loop and the
+# Callgrind rep runner, so the two can never drift apart. A builder does all the
+# setup — message building, buffer allocation — and returns the body to measure
+# plus the encoded size the MB/s figure is computed from. Setup is excluded from
+# the timed loop, and is identical at both Callgrind rep counts, so the
+# subtraction cancels it exactly.
+
+Body = Callable[[], int]
+Workload = Callable[[], "tuple[Body, int]"]
+
+
+def _w_encode_u64_array() -> tuple[Callable[[], int], int]:
+    src = make_src()
+    nbytes = len(encode_u64_array(src))
+    return (lambda: len(encode_u64_array(src))), nbytes
+
+
+def _w_encode_typical() -> tuple[Callable[[], int], int]:
+    nbytes = len(encode_typical_msg())
+    return (lambda: len(encode_typical_msg())), nbytes
+
+
+def _w_encode_blob_oneshot() -> tuple[Callable[[], int], int]:
+    blob = make_blob()
+    # Sized by hand, not from a generated MAX_SIZE: this schema is unbounded, so
+    # its MAX_SIZE would be the configured ceiling rather than a size the message
+    # cannot exceed. No sink, so no minimum applies to the buffer and the
+    # message has to fit exactly.
+    buf = bytearray(BLOB_ENCODED)
+    return (lambda: encode_blob_oneshot(Encoder.over_buffer(buf), blob)), BLOB_ENCODED
+
+
+def _w_encode_blob_stream() -> tuple[Callable[[], int], int]:
+    blob = make_blob()
+    buf = bytearray(STREAM_BUFFER)
+    sink = _DiscardSink()
+    return (lambda: encode_blob_stream(Encoder.over_buffer(buf, 0, sink), blob)), BLOB_ENCODED
+
+
+def _w_encode_composite() -> tuple[Callable[[], int], int]:
+    nbytes = len(encode_composite_msg())
+    buf = bytearray(nbytes)
+
+    def body() -> int:
+        enc = Encoder.over_buffer(buf)
+        encode_composite(enc)
+        return enc.bytes_used()
+
+    return body, nbytes
+
+
+def _w_decode_u64_array() -> tuple[Callable[[], int], int]:
+    data = encode_u64_array(make_src())
+    return (lambda: decode_u64_array(data)), len(data)
+
+
+def _w_decode_typical() -> tuple[Callable[[], int], int]:
+    data = encode_typical_msg()
+    return (lambda: decode_typical(data)), len(data)
+
+
+def _w_decode_blob() -> tuple[Callable[[], int], int]:
+    enc = Encoder()
+    enc.write_bytes(1, make_blob())
+    enc.flush()
+    data = enc.getvalue()
+    return (lambda: decode_blob(data)), len(data)
+
+
+def _w_decode_composite() -> tuple[Callable[[], int], int]:
+    data = encode_composite_msg()
+    return (lambda: decode_composite(data)), len(data)
+
+
+def _w_decode_composite_skip() -> tuple[Callable[[], int], int]:
+    data = encode_composite_msg()
+    return (lambda: decode_composite_skip(data)), len(data)
+
+
+#: ``key -> (BENCH_SPEC row label, builder)``, in the order the rows print.
+WORKLOADS: dict[str, tuple[str, Workload]] = {
+    "encode_u64_array": ("encode: u64 array (1000)", _w_encode_u64_array),
+    "encode_typical": ("encode: typical message", _w_encode_typical),
+    "encode_blob_oneshot": ("encode: blob 1MB one-shot", _w_encode_blob_oneshot),
+    "encode_blob_stream": ("encode: blob 1MB streaming", _w_encode_blob_stream),
+    "encode_composite": ("encode: composite", _w_encode_composite),
+    "decode_u64_array": ("decode: u64 array (1000)", _w_decode_u64_array),
+    "decode_typical": ("decode: typical message", _w_decode_typical),
+    "decode_blob": ("decode: blob 1MB", _w_decode_blob),
+    "decode_composite": ("decode: composite", _w_decode_composite),
+    "decode_composite_skip": ("decode: composite skip-all", _w_decode_composite_skip),
+}
+
+
 # ---- throughput (MB/s) ------------------------------------------------------
 #
 # The clock is read once per *batch*, not once per operation: a
@@ -133,6 +445,11 @@ def decode_typical(data: bytes) -> int:
 # measures. Calibration doubles as extra warmup.
 
 BATCH_SECONDS = 0.01  # clock cost lands under ~0.01% of a batch
+
+#: Length of the measurement loop, in CPU seconds. BENCH_SPEC's ~1s; the
+#: environment override exists so the format test can run the whole table in a
+#: fraction of a second, and never for a number anyone reports.
+LOOP_SECONDS = float(os.environ.get("SOFAB_BENCH_SECONDS", "1.0"))
 
 
 def _calibrate_batch(body) -> int:
@@ -147,39 +464,35 @@ def _calibrate_batch(body) -> int:
         batch *= 2
 
 
-def measure(body, msg_bytes: int) -> float:
-    """Run ``body`` for ~1s of CPU time (after a warmup) → MB/s (MB = 1e6)."""
+def _loop(body) -> tuple[int, float]:
+    """Run ``body`` (after a warmup) for ~LOOP_SECONDS of CPU time →
+    (iterations, elapsed CPU seconds)."""
     body()  # warmup
     batch = _calibrate_batch(body)
     t0 = time.process_time()
     iters = 0
     el = 0.0
-    while el < 1.0:
+    while el < LOOP_SECONDS:
         for _ in range(batch):
             body()
         iters += batch
         el = time.process_time() - t0
+    return iters, el
+
+
+def measure(body, msg_bytes: int) -> float:
+    """Run ``body`` for ~1s of CPU time (after a warmup) → MB/s (MB = 1e6)."""
+    iters, el = _loop(body)
     return msg_bytes * iters / el / 1e6
 
 
 def run_timed() -> None:
-    src = make_src()
-    u64 = encode_u64_array(src)
-    typ = encode_typical_msg()
-    ba, bt = len(u64), len(typ)
-
-    enc_u64 = measure(lambda: encode_u64_array(src), ba)
-    enc_typ = measure(encode_typical_msg, bt)
-    dec_u64 = measure(lambda: decode_u64_array(u64), ba)
-    dec_typ = measure(lambda: decode_typical(typ), bt)
-
     print(f"=== SofaBuffers Python throughput (CPU time, MB/s) [engine: {IMPL}] ===")
     print(f"{'Workload':<26} {'MB/s':>12}")
     print(f"{'--------':<26} {'----':>12}")
-    print(f"{'encode: u64 array (1000)':<26} {enc_u64:>12.2f}")
-    print(f"{'encode: typical message':<26} {enc_typ:>12.2f}")
-    print(f"{'decode: u64 array (1000)':<26} {dec_u64:>12.2f}")
-    print(f"{'decode: typical message':<26} {dec_typ:>12.2f}")
+    for label, build in WORKLOADS.values():
+        body, nbytes = build()
+        print(f"{label:<26} {measure(body, nbytes):>12.2f}")
     print("\nMB = 1e6 bytes. ~1s CPU-time loop per workload.")
 
 
@@ -262,16 +575,7 @@ def decode_perf(data: bytes) -> int:
 
 def measure_perop(body, msg_bytes: int) -> tuple[int, float, float]:
     """Run ``body`` for ~1s CPU time → (iterations, ns/op, MB/s)."""
-    body()  # warmup
-    batch = _calibrate_batch(body)
-    t0 = time.process_time()
-    iters = 0
-    el = 0.0
-    while el < 1.0:
-        for _ in range(batch):
-            body()
-        iters += batch
-        el = time.process_time() - t0
+    iters, el = _loop(body)
     return iters, el / iters * 1e9, msg_bytes * iters / el / 1e6
 
 
@@ -303,36 +607,15 @@ def run_perf() -> None:
 
 
 def run_workload(name: str, reps: int) -> None:
-    src = make_src()
-    sink = 0
-    nbytes = 0
-
-    if name == "encode_u64_array":
-        nbytes = len(encode_u64_array(src))  # setup: learn size (cancels out)
-        out = b""
-        for _ in range(reps):
-            out = encode_u64_array(src)
-        sink = len(out)
-    elif name == "encode_typical":
-        nbytes = len(encode_typical_msg())
-        out = b""
-        for _ in range(reps):
-            out = encode_typical_msg()
-        sink = len(out)
-    elif name == "decode_u64_array":
-        data = encode_u64_array(src)
-        nbytes = len(data)
-        for _ in range(reps):
-            sink += decode_u64_array(data)
-    elif name == "decode_typical":
-        data = encode_typical_msg()
-        nbytes = len(data)
-        for _ in range(reps):
-            sink += decode_typical(data)
-    else:
+    entry = WORKLOADS.get(name)
+    if entry is None:
         print(f"unknown workload: {name}", file=sys.stderr)
+        print(f"known: {' '.join(WORKLOADS)}", file=sys.stderr)
         raise SystemExit(2)
-
+    body, nbytes = entry[1]()  # setup — excluded, and identical at every rep count
+    sink = 0
+    for _ in range(reps):
+        sink += body()
     # to stderr so it doesn't pollute Callgrind's stdout capture
     print(f"sink={sink} bytes={nbytes} reps={reps}", file=sys.stderr)
 
@@ -341,7 +624,7 @@ def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(__doc__, file=sys.stderr)
         return 2
-    if argv[1] == "time":
+    if argv[1] in ("bench", "time"):  # "bench" is BENCH_SPEC's name for the tool
         run_timed()
         return 0
     if argv[1] == "perf":
