@@ -57,7 +57,7 @@ import sofab   # Encoder, Decoder, Visitor, wire-format types and limits
 
 | Goal | How |
 |------|-----|
-| Streaming **out** | `Encoder` writes to any binary stream (file, socket, `BytesIO`), so a message can exceed RAM and stream straight to the wire. |
+| Streaming **out** | `Encoder` writes into a **fixed** buffer and drains it to any binary stream (file, socket, `BytesIO`) as the message is written — never after it — so a message can exceed RAM and stream straight to the wire. |
 | Streaming **in** | `Decoder` is a pull parser over any `read(n)` reader; `next()` returns one field header at a time, never materializing the whole message. A call that runs out of bytes reports `SofaIncompleteError` **without consuming anything**, so it can simply be re-issued when more arrive. |
 | Native speed, zero runtime deps | The hot path ships as an optional Cython accelerator (`sofab._speedups`); when it can't be built it falls back to pure Python. No runtime third-party deps either way. |
 | Runs everywhere | With no compiler or wheel, `pip` still installs a working pure-Python build (`py3-none-any`). Native and pure paths are byte-for-byte identical — falling back changes only speed. |
@@ -90,11 +90,24 @@ enc.write_string(3, "hi")
 data = enc.getvalue()
 ```
 
+`Encoder()` writes into a fixed 1 KiB scratch buffer and appends each bufferful
+to the result it hands back — it never grows a buffer mid-message (see [Memory
+handling](#memory-handling)). Pass a writer (anything with `write(bytes)`) and
+the same bufferfuls go there instead, as they are produced:
+
+```python
+with open("msg.sofab", "wb") as fh:
+    enc = Encoder(fh)                 # streams out; nothing accumulates
+    enc.write_unsigned(1, 42)
+    enc.flush()                       # push the tail
+```
+
 ### Serialize stream
 
-`Encoder.over_buffer` writes into a small fixed scratch buffer and calls a flush
-sink whenever it fills, so an arbitrarily large message streams out through bounded
-memory:
+`Encoder.over_buffer` is the same mechanism over a buffer **you** supply: it
+writes in place and calls a flush sink whenever the buffer fills, so an
+arbitrarily large message streams out through however much memory you chose to
+give it:
 
 ```python
 from sofab import Encoder
@@ -104,6 +117,17 @@ enc = Encoder.over_buffer(bytearray(16), offset=0, flush=out.extend)  # tiny buf
 for i in range(1_000_000):
     enc.write_unsigned(i % 128, i)
 enc.flush()                                                  # push the tail
+```
+
+With **no** sink the buffer is all the encoder gets: it holds the message or
+reports `SofaBufferError`. That is the shape generated code uses when the schema
+bounds the message — allocate `MAX_SIZE`, encode in one pass, no flush possible:
+
+```python
+buf = bytearray(Point.MAX_SIZE)
+enc = Encoder.over_buffer(buf, offset=0)
+point._marshal(enc)
+wire = memoryview(buf)[: enc.bytes_used()]   # no copy
 ```
 
 ### Deserialize
@@ -256,11 +280,32 @@ never provides a value buffer.**
   exact wire byte length **without** consuming it, so a caller can bound the
   field against a schema `maxlen` before reading — no re-encoding a decoded
   `str` just to measure it.
-* **Encode.** Two ownership models. The default `Encoder()` / `Encoder(writer)`
-  owns a growable `bytearray` — `getvalue()` hands back a copy, or `flush()`
-  drains to the writer. `Encoder.over_buffer` is caller-owned and bounded: you
-  provide a fixed `bytearray`, it writes in place via a `memoryview` and flushes
-  to the sink + reuses the buffer when full.
+* **Encode: one ownership model — the output buffer is fixed, and never grows.**
+  CORELIB_PLAN §5.1 forbids a corelib to allocate an output buffer or to grow
+  one, so there is a single mechanism here with three ways to reach it, not two
+  competing models:
+  * `Encoder.over_buffer(buf, offset, flush)` is the primitive and the only
+    caller-supplied form: it writes in place through a `memoryview`, drains to
+    the sink when full and reuses the buffer — or, **without** a sink, holds the
+    message or reports `SofaBufferError`. That is the shape generated code uses
+    for a schema whose `MAX_SIZE` bounds the message.
+  * `Encoder(writer)` installs a **1 KiB scratch buffer with a sink** that
+    forwards each bufferful to `writer.write` — §5.1's "unbounded schema" shape.
+    A 100 MB message costs 1 KiB of encoder memory, and the bytes leave *while*
+    the message is written, not at `flush()`. Nothing is retained, so
+    `getvalue()` raises `SofaStateError`: returning the undrained tail would be
+    partial output dressed up as a whole message.
+  * `Encoder()` is the same scratch buffer with the sink appending into the
+    *result* — the message `getvalue()` hands back, joined from the drained
+    chunks (a message that fits in the scratch is never chunked at all, and a
+    `string`/`blob` run longer than the buffer becomes one chunk rather than
+    being copied through it). What grows is the message being returned, not a
+    buffer being written into: `bytes_used()` never exceeds 1 KiB.
+
+  The scratch is one allocation per encoder, made at construction and never
+  resized. §5.1 puts even that in the generated layer, which knows the schema —
+  a caller who wants zero library allocation supplies the buffer with
+  `over_buffer`.
 * **`MIN_OUTPUT_BUFFER` is `1`, and it applies to a buffer installed *with* a
   sink.** `sofab.MIN_OUTPUT_BUFFER` is the smallest output buffer this port
   accepts for **streaming**: one byte, because the encoder splits every atomic

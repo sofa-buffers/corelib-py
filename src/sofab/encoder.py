@@ -1,13 +1,29 @@
 """SofaBuffers encoder (``OStream`` equivalent).
 
-Two construction models, mirroring the ecosystem:
+**One buffer-ownership model** (CORELIB_PLAN §5.1): the encoder writes into a
+**fixed** output buffer and drains it through a flush sink when that buffer
+fills. It never grows or reallocates the buffer it writes into — "what was
+handed over is what gets written". Three construction shapes express that one
+model:
 
-* ``Encoder(writer)`` / ``Encoder()`` — Go-style. Bytes accumulate in an
-  internal buffer; ``flush()`` drains them to ``writer`` (if given). With no
-  writer the encoder is an in-memory buffer — read it with :meth:`getvalue`.
-* ``Encoder.over_buffer(buf, offset, flush)`` — Rust/C/Java-style. Writes into
-  a fixed caller buffer, reserving ``offset`` bytes at the front for a
-  lower-layer header, draining via the ``flush`` sink when full.
+* ``Encoder.over_buffer(buf, offset, flush)`` — the primitive, and the only one
+  that takes a caller-supplied buffer. Writes into ``buf``, reserving ``offset``
+  bytes at the front for a lower-layer header, draining via the ``flush`` sink
+  when full; *without* a sink a full buffer reports :class:`SofaBufferError`,
+  which is the shape a caller sizes from a generated ``MAX_SIZE``.
+* ``Encoder(writer)`` — the same primitive over a scratch buffer of
+  :data:`_SCRATCH_SIZE` bytes installed **with** a sink that forwards to
+  ``writer.write``. This is §5.1's "unbounded schema" shape, so a message of any
+  size streams out through bounded memory *as it is written*, rather than
+  accumulating until :meth:`Encoder.flush`.
+* ``Encoder()`` — the same again, with the sink appending into the *result* the
+  encoder hands back from :meth:`Encoder.getvalue`. What grows there is the
+  message being returned, not a buffer the encoder writes into.
+
+The scratch buffer of the latter two is one allocation, made once at
+construction and never resized; §5.1 puts even that in the generated layer,
+which knows the schema — so generated code that can bound its message should
+prefer ``over_buffer`` with a ``MAX_SIZE``-sized buffer and no sink.
 
 Sequences are framed **lazily**: :meth:`Encoder.write_sequence_begin_lazy` holds
 the header back until the sequence receives content, so a sequence-typed field
@@ -52,6 +68,19 @@ from .types import (
     WireType,
 )
 
+#: Size of the scratch buffer the convenience constructors install (CORELIB_PLAN
+#: §5.1 "unbounded schema" shape). One allocation per encoder, made once at
+#: construction and never resized — the encoder drains it through its sink
+#: whenever it fills, so the memory an encode holds is this constant and not the
+#: message. A kibibyte is large enough that the drain is amortized to nothing
+#: (one sink call per ~1 kB of output) and small enough to stay off the cost of
+#: a per-message encoder.
+_SCRATCH_SIZE = 1024
+
+#: Bytes a varint can occupy (§4.1), and therefore the room the in-place
+#: fast path in :meth:`Encoder._emit_varint` requires before it writes.
+_VARINT_MAX = 10
+
 FlushSink = Callable[[bytes], None]
 Writer = object  # anything with .write(bytes)
 
@@ -84,20 +113,31 @@ class Encoder:
     """Encodes SofaBuffers fields to a byte stream."""
 
     def __init__(self, writer: Writer | None = None, *, sticky: bool = False) -> None:
-        """Create a Go-style encoder backed by an internal growable buffer.
+        """Create an encoder over a scratch buffer the library installs for you.
 
-        Bytes accumulate in memory; :meth:`flush` drains them to ``writer`` (any
-        object with ``write(bytes)``) if one is given, otherwise read them back
-        with :meth:`getvalue`. Pass ``sticky=True`` to latch the first error
-        instead of raising on every call (inspect it via :attr:`error`).
+        This is §5.1's "unbounded schema" shape: a **fixed** buffer of
+        :data:`_SCRATCH_SIZE` bytes installed **with** a flush sink, never a
+        buffer that grows. With ``writer`` (any object with ``write(bytes)``) the
+        sink forwards to it, so the message streams out while it is written and
+        the encoder holds at most one scratch buffer of it; with no writer the
+        sink appends into the result :meth:`getvalue` hands back.
+
+        Pass ``sticky=True`` to latch the first error instead of raising on every
+        call (inspect it via :attr:`error`).
+
+        A caller that wants to own the buffer — the conformant shape for
+        generated code, which knows the schema — uses :meth:`over_buffer`
+        instead.
         """
         self._writer = writer
-        self._buf = bytearray()
-        # fixed-buffer mode (unused here):
-        self._fixed: memoryview | None = None
-        self._cap = 0
+        # The in-memory model's sink is the *result* it hands back — the "growing
+        # result" §5.1 names for the unbounded shape, which is the message, not a
+        # buffer the encoder writes into. It is the list of drained chunks
+        # :meth:`getvalue` joins, and it stays ``None`` until the first drain: a
+        # message that fits in the scratch buffer never allocates one at all.
+        self._in_memory = writer is None
+        self._result: list[bytes] | None = None
         self._cursor = 0
-        self._installs = 0
         self._flush_sink: FlushSink | None = None
         self._sticky = sticky
         self._error: SofaError | None = None
@@ -112,6 +152,23 @@ class Encoder:
         # so there is no fixed window and no eager-framing fallback), and an encoder
         # that never opens a sequence never allocates it at all.
         self._pending: list[int] | None = None
+        # The one allocation, made here and never resized. Installed exactly as
+        # :meth:`buffer_set` would (the checks it makes are constants here: a
+        # zero offset into a buffer of _SCRATCH_SIZE >= MIN_OUTPUT_BUFFER).
+        scratch = bytearray(_SCRATCH_SIZE)
+        self._fixed = memoryview(scratch)
+        self._fixed_ba = scratch
+        self._cap = _SCRATCH_SIZE
+        self._installs = 1
+
+    def _has_sink(self) -> bool:
+        """Whether a flush can occur — i.e. whether the installed buffer is a
+        sink-installed one, which is what :data:`~sofab.MIN_OUTPUT_BUFFER` binds
+        (§5.1). All three shapes of sink count: the caller's callback, the
+        writer, and the in-memory result."""
+        return (
+            self._in_memory or self._writer is not None or self._flush_sink is not None
+        )
 
     @classmethod
     def over_buffer(
@@ -139,8 +196,8 @@ class Encoder:
         """
         self = cls.__new__(cls)
         self._writer = None
-        self._buf = bytearray()
-        self._fixed = None
+        self._in_memory = False
+        self._result = None
         self._cap = 0
         self._cursor = 0
         self._installs = 0
@@ -179,12 +236,17 @@ class Encoder:
         if not 0 <= offset <= len(buffer):
             raise SofaRangeError("offset must be within the buffer")
         usable = len(buffer) - offset
-        if self._flush_sink is not None and usable < MIN_OUTPUT_BUFFER:
+        if usable < MIN_OUTPUT_BUFFER and self._has_sink():
             raise SofaRangeError(
                 f"a buffer installed with a flush sink needs at least "
                 f"MIN_OUTPUT_BUFFER={MIN_OUTPUT_BUFFER} usable byte(s), got {usable}"
             )
         self._fixed = memoryview(buffer)
+        # The same storage under both views: the memoryview for slice writes
+        # (twice as fast as a bytearray's, and it cannot resize the caller's
+        # buffer by accident), the bytearray for the single-byte writes of the
+        # inlined varint loops (a third faster than the memoryview's).
+        self._fixed_ba = buffer
         self._cap = len(buffer)
         self._cursor = offset
         # Counted so _drain can tell whether the sink took the buffer (installed
@@ -199,8 +261,20 @@ class Encoder:
         return self._error
 
     def _put(self, data: bytes) -> None:
-        if self._fixed is None:
-            self._buf += data
+        n = len(data)
+        if self._in_memory and n >= self._cap:
+            # A divisible run at least as long as the whole buffer, in the model
+            # whose sink is the result: hand it over as its own chunk instead of
+            # copying it through the buffer a bufferful at a time. Every caller
+            # passes a fresh, immutable ``bytes`` (an encoded ``str``, a copied
+            # blob, a packed float array), so the result may keep it as-is, and
+            # draining first is what keeps the wire order.
+            if self._cursor:
+                self._drain()
+            if self._result is None:
+                self._result = [data]
+            else:
+                self._result.append(data)
             return
         # Hoisted for the common no-drain path, but they must be re-read after any
         # drain: the flush sink may call buffer_set() to hand back a *different*
@@ -211,7 +285,6 @@ class Encoder:
         mv = self._fixed
         cap = self._cap
         pos = 0
-        n = len(data)
         while pos < n:
             if self._cursor >= cap:
                 self._drain()
@@ -228,7 +301,19 @@ class Encoder:
             pos += take
 
     def _drain(self) -> None:
-        if self._flush_sink is None:
+        if self._in_memory:
+            # The sink is the result the encoder hands back: the drained bytes are
+            # kept as a chunk for :meth:`getvalue` to join, which costs one copy
+            # here and none there (``b"".join`` of a single chunk returns it
+            # unchanged). The buffer is never taken, so the cursor resumes at 0.
+            chunk = bytes(self._fixed[0 : self._cursor])
+            if self._result is None:
+                self._result = [chunk]
+            else:
+                self._result.append(chunk)
+            self._cursor = 0
+            return
+        if self._writer is None and self._flush_sink is None:
             raise SofaBufferError("encoder buffer full")
         # CORELIB_PLAN §5.1 "what a returning flush callback leaves behind": a sink
         # that returns without installing a buffer *copied*, so the active buffer
@@ -237,49 +322,69 @@ class Encoder:
         # the new cursor — resetting to 0 here would silently drop the header room it
         # just reserved and overwrite it with payload in every packet but the first.
         installs = self._installs
-        self._flush_sink(bytes(self._fixed[0 : self._cursor]))  # type: ignore[index]
+        snapshot = bytes(self._fixed[0 : self._cursor])
+        if self._writer is not None:
+            self._writer.write(snapshot)  # type: ignore[attr-defined]
+        else:
+            self._flush_sink(snapshot)  # type: ignore[misc]
         if self._installs == installs:
             self._cursor = 0
 
     def bytes_used(self) -> int:
-        """Bytes written to the current buffer since construction/last flush."""
-        return self._cursor if self._fixed is not None else len(self._buf)
+        """Bytes standing in the output buffer, i.e. written since it was
+        installed and not yet drained.
+
+        The buffer is fixed, so this never exceeds its size — for the
+        convenience models, :data:`_SCRATCH_SIZE`. It is *not* the length of the
+        message: bytes already drained to the writer/sink are no longer here.
+        """
+        return self._cursor
 
     def flush(self) -> int:
         """Drain buffered bytes to the writer / flush sink; return the count."""
-        if self._fixed is not None:
-            used = self._cursor
-            if self._flush_sink is not None and used:
-                self._drain()
-            return used
-        used = len(self._buf)
-        if self._writer is not None and used:
-            self._writer.write(bytes(self._buf))  # type: ignore[attr-defined]
-            self._buf.clear()
+        used = self._cursor
+        if used and self._has_sink():
+            self._drain()
         return used
 
     def getvalue(self) -> bytes:
-        """Return the accumulated bytes (in-memory writer model only)."""
-        if self._fixed is not None:
+        """Return the encoded message (in-memory model only).
+
+        Only ``Encoder()`` retains one: with a writer the bytes have already
+        been handed over, and with :meth:`over_buffer` they are in the caller's
+        buffer — returning the undrained tail of either would be partial output
+        dressed up as a whole message (CORELIB_PLAN §5.1), so both raise
+        :class:`SofaStateError`.
+        """
+        if not self._in_memory:
             raise SofaStateError("getvalue() is only valid for the in-memory model")
-        return bytes(self._buf)
+        chunks = self._result
+        if chunks is None:  # never drained: the message is the buffer prefix
+            return bytes(self._fixed[0 : self._cursor])
+        if not self._cursor:  # fully drained (the usual case, after flush())
+            return b"".join(chunks)
+        return b"".join([*chunks, bytes(self._fixed[0 : self._cursor])])
 
     # --- internal write helpers ---------------------------------------------
 
     def _emit_varint(self, value: int) -> None:
-        """Append a varint straight into the in-memory buffer with no
-        intermediate ``bytes`` object (the hot path). Fixed-buffer mode falls
-        back to the shared codec + the chunk-aware ``_put``."""
-        if self._fixed is None:
-            buf = self._buf
-            while True:
-                b = value & 0x7F
+        """Write a varint into the output buffer (the hot path).
+
+        With a whole varint's room left it is encoded straight into the buffer,
+        with no intermediate ``bytes`` object; on the last few bytes of the
+        buffer it goes through the shared codec and the chunk-aware
+        :meth:`_put`, which splits it across the drain. Both paths produce the
+        same bytes — the split is what ``MIN_OUTPUT_BUFFER == 1`` asserts.
+        """
+        cursor = self._cursor
+        if cursor + _VARINT_MAX <= self._cap:
+            buf = self._fixed_ba
+            while value >= 0x80:
+                buf[cursor] = (value & 0x7F) | 0x80
+                cursor += 1
                 value >>= 7
-                if value:
-                    buf.append(b | 0x80)
-                else:
-                    buf.append(b)
-                    return
+            buf[cursor] = value
+            self._cursor = cursor + 1
         else:
             self._put(encode_varint(value))
 
@@ -435,27 +540,45 @@ class Encoder:
         try:
             seq = list(values)
             self._array_header(field_id, WireType.ARRAY_UNSIGNED, len(seq))
-            if self._fixed is None:
-                # Hot path: the varint codec is inlined over the whole array so
-                # each element costs a loop iteration rather than a Python call.
-                buf = self._buf
+            # Hot path: the varint codec is inlined over the whole array so each
+            # element costs a loop iteration rather than a Python call, and the
+            # cursor lives in a local until the loop ends or has to drain. The
+            # view and capacity are re-read after every drain — a sink may
+            # install a different buffer (see _put).
+            buf = self._fixed_ba
+            limit = self._cap - _VARINT_MAX   # last cursor an inline varint fits at
+            cursor = self._cursor
+            try:
                 for v in seq:
                     if not isinstance(v, int):
                         v = _as_int(v, "unsigned array value")
                     if v < 0 or v > UNSIGNED_MAX:
                         raise SofaRangeError(f"unsigned array value {v} out of range")
+                    if cursor > limit:
+                        # Too close to the end for the inline path: _put splits
+                        # the element across the drain and may land in a fresh
+                        # buffer, so everything it touches is re-read after it.
+                        self._cursor = cursor
+                        try:
+                            self._put(encode_varint(v))
+                        finally:
+                            # Whatever _put reached is authoritative, including
+                            # when it failed partway: the outer finally must not
+                            # rewind the cursor over bytes it already wrote.
+                            cursor = self._cursor
+                        buf = self._fixed_ba
+                        limit = self._cap - _VARINT_MAX
+                        continue
                     while v >= 0x80:
-                        buf.append((v & 0x7F) | 0x80)
+                        buf[cursor] = (v & 0x7F) | 0x80
+                        cursor += 1
                         v >>= 7
-                    buf.append(v)
-            else:
-                emit = self._emit_varint
-                for v in seq:
-                    if not isinstance(v, int):
-                        v = _as_int(v, "unsigned array value")
-                    if v < 0 or v > UNSIGNED_MAX:
-                        raise SofaRangeError(f"unsigned array value {v} out of range")
-                    emit(v)
+                    buf[cursor] = v
+                    cursor += 1
+            finally:
+                # Also on the way out of a rejected element: what was written
+                # stays written, exactly as it did when the buffer was growable.
+                self._cursor = cursor
         except SofaError as exc:
             self._fail(exc)
 
@@ -473,26 +596,33 @@ class Encoder:
         try:
             seq = list(values)
             self._array_header(field_id, WireType.ARRAY_SIGNED, len(seq))
-            if self._fixed is None:
-                buf = self._buf   # see write_unsigned_array: codec inlined
+            buf = self._fixed_ba   # see write_unsigned_array: codec inlined
+            limit = self._cap - _VARINT_MAX
+            cursor = self._cursor
+            try:
                 for v in seq:
                     if not isinstance(v, int):
                         v = _as_int(v, "signed array value")
                     if v < SIGNED_MIN or v > SIGNED_MAX:
                         raise SofaRangeError(f"signed array value {v} out of range")
                     u = (v << 1) ^ (v >> 63)
+                    if cursor > limit:
+                        self._cursor = cursor
+                        try:
+                            self._put(encode_varint(u))
+                        finally:
+                            cursor = self._cursor   # see write_unsigned_array
+                        buf = self._fixed_ba
+                        limit = self._cap - _VARINT_MAX
+                        continue
                     while u >= 0x80:
-                        buf.append((u & 0x7F) | 0x80)
+                        buf[cursor] = (u & 0x7F) | 0x80
+                        cursor += 1
                         u >>= 7
-                    buf.append(u)
-            else:
-                emit = self._emit_varint
-                for v in seq:
-                    if not isinstance(v, int):
-                        v = _as_int(v, "signed array value")
-                    if v < SIGNED_MIN or v > SIGNED_MAX:
-                        raise SofaRangeError(f"signed array value {v} out of range")
-                    emit(zigzag_encode(v))
+                    buf[cursor] = u
+                    cursor += 1
+            finally:
+                self._cursor = cursor
         except SofaError as exc:
             self._fail(exc)
 
