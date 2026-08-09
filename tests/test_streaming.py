@@ -3,9 +3,26 @@ must match the one-shot path."""
 
 from __future__ import annotations
 
+import pytest
 from vectors import FULL_SCALE_EXPECTED, ChunkReader, build_full_scale
 
-from sofab import Decoder, Encoder, WireType
+import sofab
+from sofab import (
+    MIN_OUTPUT_BUFFER,
+    Decoder,
+    Encoder,
+    SofaBufferError,
+    SofaRangeError,
+    WireType,
+)
+from sofab.encoder import Encoder as PyEncoder
+
+try:  # the native accelerator is optional — exercise whichever engines exist
+    from sofab._speedups import Encoder as NativeEncoder
+except ImportError:  # pragma: no cover - pure-Python-only install
+    ENCODERS = [PyEncoder]
+else:
+    ENCODERS = [PyEncoder, NativeEncoder]
 
 
 def _walk_values(dec: Decoder):
@@ -38,18 +55,85 @@ def test_decode_one_byte_at_a_time_matches_oneshot():
     assert streamed == oneshot
 
 
-def test_encode_through_tiny_scratch_buffer_matches_oneshot():
+def test_min_output_buffer_is_declared_and_within_the_ceiling():
+    """CORELIB_PLAN §5.1: the port MUST expose a documented constant — the
+    smallest buffer it accepts for streaming — and the declaration MUST NOT
+    exceed 20. This port splits every atomic unit at any byte boundary, so the
+    value it may declare is 1."""
+    assert isinstance(MIN_OUTPUT_BUFFER, int)
+    assert 1 <= MIN_OUTPUT_BUFFER <= 20
+    assert "MIN_OUTPUT_BUFFER" in sofab.__all__
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("cap", [MIN_OUTPUT_BUFFER, 7])
+def test_encode_through_min_output_buffer_matches_oneshot(enc_cls, cap):
+    """§7.2 item 4: encode into a buffer of exactly ``MIN_OUTPUT_BUFFER`` bytes,
+    driving the sink repeatedly; the concatenation must be byte-identical to the
+    one-shot output. ``build_full_scale`` carries strings and blobs longer than
+    the buffer, so the divisible-run split is exercised too."""
     # one-shot reference
-    ref = Encoder()
+    ref = enc_cls()
     build_full_scale(ref)
     expected = ref.getvalue()
 
-    # stream through a 7-byte scratch buffer + flush sink
     collected = bytearray()
-    enc = Encoder.over_buffer(bytearray(7), offset=0, flush=collected.extend)
+    enc = enc_cls.over_buffer(bytearray(cap), offset=0, flush=collected.extend)
     build_full_scale(enc)
     enc.flush()
     assert bytes(collected) == expected
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_buffer_below_the_minimum_is_rejected_where_it_is_handed_over(enc_cls):
+    """§5.1: the minimum binds a buffer installed **with** a flush sink, at
+    installation and at every mid-stream buffer-set, and such a buffer is
+    rejected *where it is handed over* rather than partway through a message."""
+    usable = MIN_OUTPUT_BUFFER - 1  # one byte short of the floor
+    sink = bytearray().extend
+
+    with pytest.raises(SofaRangeError):
+        enc_cls.over_buffer(bytearray(usable), 0, sink)
+    # the same shortfall produced by the start offset rather than by the length
+    with pytest.raises(SofaRangeError):
+        enc_cls.over_buffer(bytearray(16), 16 - usable, sink)
+    # a mid-stream buffer-set is the same handover and rejects there too
+    enc = enc_cls.over_buffer(bytearray(16), 0, sink)
+    with pytest.raises(SofaRangeError):
+        enc.buffer_set(bytearray(16), 16 - usable)
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_undersized_buffer_without_a_sink_is_accepted(enc_cls):
+    """§5.1: "a buffer installed without a sink is subject to no minimum" — no
+    flush can occur, so the constant has nothing to say and the buffer either
+    holds the message or reports buffer-full.
+
+    The floor used to be applied to this population instead: ``buffer_set``
+    rejected ``offset == len(buffer)`` unconditionally, so a sink-less buffer
+    with zero usable bytes failed by accident while an undersized *sink*-backed
+    one was never checked against a stated rule.
+    """
+    usable = MIN_OUTPUT_BUFFER - 1
+
+    for buffer, offset in ((bytearray(usable), 0), (bytearray(16), 16 - usable)):
+        enc = enc_cls.over_buffer(buffer, offset)  # accepted: no sink
+        with pytest.raises(SofaBufferError):  # ...and reports buffer-full
+            enc.write_string(0, "x" * 64)
+        enc = enc_cls.over_buffer(bytearray(16), 0)
+        enc.buffer_set(buffer, offset)  # mid-stream, also unconstrained
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_message_sized_buffer_stays_exact_without_a_sink(enc_cls):
+    """§5.1: sizing from the generated ``MAX_SIZE`` stays exact — "a message that
+    encodes to two bytes may be encoded into a two-byte buffer on any port,
+    whatever that port declares"."""
+    buf = bytearray(2)
+    enc = enc_cls.over_buffer(buf, 0)
+    enc.write_unsigned(0, 42)
+    assert enc.bytes_used() == 2
+    assert bytes(buf) == b"\x00\x2a"
 
 
 def _stream_with_reserved_header(enc_cls, cap: int, offset: int, filler: int = 0xEE):

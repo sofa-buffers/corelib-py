@@ -31,6 +31,18 @@ ARRAY_MAX = 0x7FFF_FFFF
 #: nested sequences; a decoder rejects a message nesting deeper.
 MAX_DEPTH = 255
 
+#: Smallest output buffer this port accepts **for streaming** (CORELIB_PLAN
+#: §5.1). It is ``1`` because the encoder splits every atomic unit — a header
+#: varint, a ``fixlen_word``, an element count, a scalar, one float — at any byte
+#: boundary, so a one-byte scratch buffer already produces exactly the one-shot
+#: bytes. The declaration binds a buffer installed **with** a flush sink, at
+#: installation and at every mid-stream :meth:`~sofab.Encoder.buffer_set`:
+#: ``len(buffer) - offset`` must be at least this. A buffer installed **without**
+#: a sink is subject to no minimum — no flush can occur, so it simply holds the
+#: message or reports ``SofaBufferError``, and a caller sizing from a generated
+#: ``MAX_SIZE`` gets an exact fit.
+MIN_OUTPUT_BUFFER = 1
+
 #: 64-bit mask used by varint/zigzag wrap-around to match the C ``uint64_t``.
 MASK64 = (1 << 64) - 1
 

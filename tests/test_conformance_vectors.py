@@ -28,7 +28,15 @@ from pathlib import Path
 import pytest
 from vectors import ChunkReader
 
-from sofab import Decoder, Encoder, FixlenSubtype, SofaDecodeError, SofaRangeError, WireType
+from sofab import (
+    MIN_OUTPUT_BUFFER,
+    Decoder,
+    Encoder,
+    FixlenSubtype,
+    SofaDecodeError,
+    SofaRangeError,
+    WireType,
+)
 
 VECTORS_PATH = Path(__file__).resolve().parents[1] / "assets" / "test_vectors.json"
 _DATA = json.loads(VECTORS_PATH.read_text())
@@ -303,7 +311,10 @@ def test_vector_encode(vec):
         assert produced.hex() == vec["serialized"]["hex"]
 
 
-@pytest.mark.parametrize("buf_size", [1, 3, 7])
+# The smallest size is the port's declared MIN_OUTPUT_BUFFER (CORELIB_PLAN §5.1):
+# every vector must come out byte-identical through a buffer of exactly that many
+# bytes, which is what makes the declaration a measured value rather than a claim.
+@pytest.mark.parametrize("buf_size", [MIN_OUTPUT_BUFFER, 3, 7])
 @pytest.mark.parametrize("vec", VECTORS, ids=_IDS)
 def test_vector_chunked_encode(vec, buf_size):
     _check_requires(vec)

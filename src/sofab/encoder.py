@@ -40,6 +40,7 @@ from .types import (
     ARRAY_MAX,
     ID_MAX,
     MAX_DEPTH,
+    MIN_OUTPUT_BUFFER,
     SIGNED_MAX,
     SIGNED_MIN,
     UNSIGNED_MAX,
@@ -131,6 +132,10 @@ class Encoder:
         no ``flush`` sink a full buffer raises :class:`SofaBufferError`. Pass
         ``sticky=True`` to latch the first error instead of raising per call
         (inspect it via :attr:`error`).
+
+        With a ``flush`` sink the buffer must leave at least
+        :data:`~sofab.MIN_OUTPUT_BUFFER` bytes past ``offset``; without one there
+        is no minimum. See :meth:`buffer_set`, which enforces both.
         """
         self = cls.__new__(cls)
         self._writer = None
@@ -161,9 +166,24 @@ class Encoder:
         anything resumes at 0. Re-installing — even the *same* buffer — is what
         re-arms the reservation, which is how a sink gets fresh header room in
         every flushed unit rather than only in the first.
+
+        :data:`~sofab.MIN_OUTPUT_BUFFER` binds here, and only for a buffer that
+        is installed **with** a flush sink: ``len(buffer) - offset`` must be at
+        least that many bytes, checked at installation and at every mid-stream
+        set, so an unusable buffer is refused where it is handed over rather than
+        partway through a message. Without a sink no flush can occur and no
+        minimum applies — the buffer holds the message or reports
+        :class:`SofaBufferError` — which is what keeps a caller sizing from a
+        generated ``MAX_SIZE`` exact, down to a zero-byte remainder.
         """
-        if not 0 <= offset < len(buffer):
+        if not 0 <= offset <= len(buffer):
             raise SofaRangeError("offset must be within the buffer")
+        usable = len(buffer) - offset
+        if self._flush_sink is not None and usable < MIN_OUTPUT_BUFFER:
+            raise SofaRangeError(
+                f"a buffer installed with a flush sink needs at least "
+                f"MIN_OUTPUT_BUFFER={MIN_OUTPUT_BUFFER} usable byte(s), got {usable}"
+            )
         self._fixed = memoryview(buffer)
         self._cap = len(buffer)
         self._cursor = offset
