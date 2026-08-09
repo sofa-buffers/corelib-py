@@ -51,7 +51,13 @@ pip install sofa-buffers-corelib
 
 ```python
 import sofab   # Encoder, Decoder, Visitor, wire-format types and limits
+print(sofab.__version__)   # release of this runtime
 ```
+
+`sofab.__version__` is the release version of the runtime and is the *only*
+place it is written down: `pyproject.toml` declares the distribution version
+dynamic and reads it from there, so an install and an import always report the
+same string.
 
 ## Why this design
 

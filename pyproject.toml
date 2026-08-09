@@ -4,7 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sofa-buffers-corelib"
-version = "0.10.0"
+# Read from ``sofab.__version__`` (see [tool.setuptools.dynamic] below): the
+# release version lives in exactly one place, so what an install reports can
+# never drift from what an import reports.
+dynamic = ["version"]
 description = "SofaBuffers binary wire-format runtime — pure Python with an optional native (Cython) accelerator"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -26,6 +29,9 @@ Homepage = "https://github.com/sofa-buffers/corelib-py"
 # The optional C extension is declared in setup.py; keep package data (the
 # .pyx source and py.typed marker) in the wheel/sdist.
 zip-safe = false
+
+[tool.setuptools.dynamic]
+version = { attr = "sofab.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
