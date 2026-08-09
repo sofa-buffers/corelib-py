@@ -50,12 +50,10 @@ cimport cython
 
 from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize, PyBytes_GET_SIZE
 from cpython.bytearray cimport PyByteArray_AS_STRING, PyByteArray_GET_SIZE
-from cpython.exc cimport PyErr_Clear, PyErr_Occurred
-from cpython.float cimport PyFloat_AS_DOUBLE, PyFloat_CheckExact
-from cpython.list cimport PyList_Append, PyList_GET_ITEM, PyList_GET_SIZE, PyList_New, PyList_SET_ITEM
-from cpython.long cimport PyLong_CheckExact, PyLong_FromUnsignedLongLong, PyLong_FromLongLong
-from cpython.ref cimport Py_INCREF, PyObject
-from libc.stdint cimport uint8_t, uint32_t, uint64_t, int64_t
+from cpython.list cimport PyList_Append, PyList_GET_ITEM, PyList_GET_SIZE, PyList_New
+from cpython.long cimport PyLong_FromUnsignedLongLong, PyLong_FromLongLong
+from cpython.ref cimport PyObject
+from libc.stdint cimport uint32_t, uint64_t, int64_t
 from libc.stdlib cimport malloc, realloc, free
 from libc.string cimport memcpy
 
@@ -126,19 +124,37 @@ cdef extern from *:
 
     static int __sofab_digits_ok = 0;   /* set by the self-test at import time */
 
-    /* Magnitude as a uint64_t. Returns 0 (leaving no exception set) when the
-       value does not fit, which is exactly the format's unsigned domain. */
-    static int __sofab_u64_digits(PyObject *x, uint64_t *out) {
+    /* How many digits a 64-bit magnitude can occupy, and how many bits the most
+     * significant of them may carry. With PyLong_SHIFT == 30 that is 3 digits
+     * whose top one holds 4 bits; with 15 it is 5 digits, top one 4 bits. Both
+     * are compile-time constants, which is what lets the width test run ONCE per
+     * value instead of once per digit. */
+    #define __SOFAB_NDIG ((Py_ssize_t) ((64 + PyLong_SHIFT - 1) / PyLong_SHIFT))
+    #define __SOFAB_TOPBITS (64 - (__SOFAB_NDIG - 1) * PyLong_SHIFT)
+
+    /* |x| as a uint64_t, ignoring its sign. Returns 0 (leaving no exception set)
+       when the magnitude does not fit in 64 bits. */
+    static int __sofab_mag_digits(PyObject *x, uint64_t *out) {
         Py_ssize_t n = __sofab_ndigits(x);
         const digit *d = __sofab_digits(x);
         uint64_t v = 0;
-        if (__sofab_isneg(x)) return 0;
-        while (n-- > 0) {
-            if (v > (~(uint64_t) 0 >> PyLong_SHIFT)) return 0;
-            v = (v << PyLong_SHIFT) | (uint64_t) d[n];
+        /* Only the most significant digit can push the value past 64 bits, so
+           one test on the digit count settles the whole value and the
+           accumulate loop below carries no branch at all. */
+        if (n >= __SOFAB_NDIG) {
+            if (n > __SOFAB_NDIG) return 0;
+            if (((uint64_t) d[n - 1]) >> __SOFAB_TOPBITS) return 0;
         }
+        while (n-- > 0) v = (v << PyLong_SHIFT) | (uint64_t) d[n];
         *out = v;
         return 1;
+    }
+
+    /* Magnitude as a uint64_t. Returns 0 (leaving no exception set) when the
+       value does not fit, which is exactly the format's unsigned domain. */
+    static int __sofab_u64_digits(PyObject *x, uint64_t *out) {
+        if (__sofab_isneg(x)) return 0;
+        return __sofab_mag_digits(x, out);
     }
 
     static int __sofab_u64(PyObject *x, uint64_t *out) {
@@ -150,18 +166,25 @@ cdef extern from *:
         return 1;
     }
 
+    /* A field id, when it is one that needs no range test at all. A CPython
+       digit is 30 bits wide (15 on a narrow build), so a non-negative int of at
+       most one digit is always inside 0..ID_MAX — which is every id a schema
+       realistically uses. Anything else returns 0 and takes the general path. */
+    static int __sofab_small_id(PyObject *x, uint64_t *out) {
+        if (!__sofab_digits_ok || __sofab_isneg(x)) return 0;
+        switch (__sofab_ndigits(x)) {
+            case 0:  *out = 0; return 1;
+            case 1:  *out = (uint64_t) __sofab_digits(x)[0]; return 1;
+            default: return 0;
+        }
+    }
+
     static int __sofab_i64(PyObject *x, int64_t *out) {
         long long v;
         uint64_t mag;
         if (__sofab_digits_ok) {
             int neg = __sofab_isneg(x);
-            Py_ssize_t n = __sofab_ndigits(x);
-            const digit *d = __sofab_digits(x);
-            mag = 0;
-            while (n-- > 0) {
-                if (mag > (~(uint64_t) 0 >> PyLong_SHIFT)) return 0;
-                mag = (mag << PyLong_SHIFT) | (uint64_t) d[n];
-            }
+            if (!__sofab_mag_digits(x, &mag)) return 0;
             /* Two's complement: -2**63 is representable, +2**63 is not. */
             if (neg) {
                 if (mag > (uint64_t) 1 << 63) return 0;
@@ -266,6 +289,8 @@ cdef extern from *:
     # pending OverflowError. See __sofab_u64 below.
     bint _ToU64 "__sofab_u64" (PyObject*, uint64_t*) noexcept
     bint _ToI64 "__sofab_i64" (PyObject*, int64_t*) noexcept
+    # An id small enough that being an id is already proof it is in range.
+    bint _ToSmallId "__sofab_small_id" (PyObject*, uint64_t*) noexcept
     bint __sofab_digits_selftest()
 
 cdef extern from *:
@@ -439,6 +464,22 @@ cdef extern from "Python.h":
     # The str's own UTF-8 form (cached on the object), so encoding a string does
     # not allocate a ``bytes`` either.
     const char* PyUnicode_AsUTF8AndSize(object, Py_ssize_t*) except NULL
+    # --- element builders that stay at the C level ---------------------------
+    #
+    # The array decode loops build one Python object per element and put it
+    # straight into the result list. Spelled with the ordinary ``object``-typed
+    # declarations, every element additionally pays Cython's bookkeeping for the
+    # temporary that holds it: an incref for the borrowed ``PyList_SET_ITEM``
+    # signature and a decref when the temporary is reassigned on the next
+    # iteration. These spellings hand the fresh reference to the list directly —
+    # ``PyList_SET_ITEM`` *steals* it — so the round trip disappears and the
+    # element costs exactly one allocation.
+    PyObject* _NewU64 "PyLong_FromUnsignedLongLong" (uint64_t) except NULL
+    PyObject* _NewI64 "PyLong_FromLongLong" (int64_t) except NULL
+    PyObject* _NewF64 "PyFloat_FromDouble" (double) except NULL
+    void _SetItemSteal "PyList_SET_ITEM" (object, Py_ssize_t, PyObject*)
+    int _AppendBorrowed "PyList_Append" (object, PyObject*) except -1
+    void _DecRef "Py_DECREF" (PyObject*)
 
 # Wire-format constants, enums, the Field descriptor and the error classes all
 # live in the shared pure-Python ``types`` module — reuse them verbatim so the
@@ -800,9 +841,16 @@ cdef int64_t _i64_other(object value, int what) except? -0xDEAD:
 cdef inline uint64_t _id_arg(object field_id) except? 0xDEAD:
     # Field ids are 0..ID_MAX (2**31-1), so the *value* range is narrower than
     # what the converter itself rejects; the explicit bound stays, but on C ints.
+    # An ordinary id is a small non-negative int, and one CPython digit already
+    # proves that range — so the usual case reads a single digit and returns,
+    # with no 64-bit conversion and no comparison at all. This runs once per
+    # field write, which is the most repeated conversion the encoder performs.
     cdef int64_t r
     cdef object idx
+    cdef uint64_t small
     if _IsLong(<PyObject*>field_id):
+        if _ToSmallId(<PyObject*>field_id, &small):
+            return small
         if _ToI64(<PyObject*>field_id, &r):
             if r < 0 or r > <int64_t>_ID_MAX:
                 raise SofaRangeError("id %d out of range 0..%d" % (field_id, _ID_MAX))
@@ -1820,7 +1868,7 @@ cdef class Decoder:
         cdef _Varint v
         cdef uint64_t result
         cdef int64_t signed_val
-        cdef object item
+        cdef PyObject* item
         if prealloc > count:
             prealloc = count
         cdef list out = PyList_New(prealloc)
@@ -1843,18 +1891,22 @@ cdef class Decoder:
                 signed_val = _zigzag_decode(result)
                 if bounded and (signed_val < lo or signed_val > hi):
                     raise SofaDecodeError("array element outside declared width")
-                item = PyLong_FromLongLong(signed_val)
+                item = _NewI64(signed_val)
             else:
                 # hi is a NARROWED unsigned maximum (u32 at the widest), so it is
                 # never negative and the unsigned compare is exact.
                 if bounded and result > <uint64_t>hi:
                     raise SofaDecodeError("array element outside declared width")
-                item = PyLong_FromUnsignedLongLong(result)
+                item = _NewU64(result)
             if i < prealloc:
-                Py_INCREF(item)
-                PyList_SET_ITEM(out, i, item)
+                _SetItemSteal(out, i, item)      # steals the new reference
             else:
-                PyList_Append(out, item)
+                # Beyond the pre-sized prefix: append takes its own reference, so
+                # ours has to go — including when the append itself fails.
+                try:
+                    _AppendBorrowed(out, item)
+                finally:
+                    _DecRef(item)
             i += 1
         self._pos = pos
         return out
@@ -1897,6 +1949,7 @@ cdef class Decoder:
         cdef uint64_t fid
         cdef uint64_t length_header, length, count, elem_header, elem_size
         cdef int subtype
+        cdef object boxed, cap
 
         self._arm()   # opens this field's resume transaction (§5.2)
 
@@ -1960,8 +2013,10 @@ cdef class Decoder:
                 raise SofaDecodeError("fp32 fixlen length must be 4")
             if subtype == _ST_FP64 and length != 8:
                 raise SofaDecodeError("fp64 fixlen length must be 8")
-            self._cur = _mkfield(field_id, _WT[_WT_FIXLEN],
-                                 PyLong_FromUnsignedLongLong(length), _ZERO, _ST[subtype])
+            # One boxed length, reused: it is the Field's ``size`` and the value
+            # a configured cap is compared against and named in its message.
+            boxed = PyLong_FromUnsignedLongLong(length)
+            self._cur = _mkfield(field_id, _WT[_WT_FIXLEN], boxed, _ZERO, _ST[subtype])
             self._pk = _PEND_FIXLEN
             self._pend_subtype = subtype
             self._pend_size = length
@@ -1971,30 +2026,31 @@ cdef class Decoder:
             # value rather than raised, so the caller keeps the §6.2.1 window in
             # which it can declare the field schema-bounded and take the cap off
             # it. Every consume path raises it; see _park_limit / _pending_error.
-            if subtype == _ST_STRING and self._max_string_len is not None \
-                    and PyLong_FromUnsignedLongLong(length) > self._max_string_len:
-                self._park_limit("string length %d exceeds max_string_len %s"
-                                 % (PyLong_FromUnsignedLongLong(length), self._max_string_len))
-            elif subtype == _ST_BLOB and self._max_blob_len is not None \
-                    and PyLong_FromUnsignedLongLong(length) > self._max_blob_len:
-                self._park_limit("blob length %d exceeds max_blob_len %s"
-                                 % (PyLong_FromUnsignedLongLong(length), self._max_blob_len))
+            if subtype == _ST_STRING:
+                cap = self._max_string_len
+                if cap is not None and boxed > cap:
+                    self._park_limit("string length %d exceeds max_string_len %s"
+                                     % (boxed, cap))
+            elif subtype == _ST_BLOB:
+                cap = self._max_blob_len
+                if cap is not None and boxed > cap:
+                    self._park_limit("blob length %d exceeds max_blob_len %s"
+                                     % (boxed, cap))
             return self._cur
 
         if wtype == _WT_ARRAY_UNSIGNED or wtype == _WT_ARRAY_SIGNED:
             count = self._varint()
             if count > _ARRAY_MAX:
                 raise SofaDecodeError("array count %d out of range" % PyLong_FromUnsignedLongLong(count))
-            self._cur = _mkfield(field_id, _WT[wtype], _ZERO,
-                                 PyLong_FromUnsignedLongLong(count), _NONE)
+            boxed = PyLong_FromUnsignedLongLong(count)   # see the fixlen branch
+            self._cur = _mkfield(field_id, _WT[wtype], _ZERO, boxed, _NONE)
             self._pk = _PEND_VARRAY
             self._pend_wtype = wtype
             self._pend_count = count
             # Parked, not raised — see the fixlen branch above (§6.2.1).
-            if self._max_array_count is not None \
-                    and PyLong_FromUnsignedLongLong(count) > self._max_array_count:
-                self._park_limit("array count %d exceeds max_array_count %s"
-                                 % (PyLong_FromUnsignedLongLong(count), self._max_array_count))
+            cap = self._max_array_count
+            if cap is not None and boxed > cap:
+                self._park_limit("array count %d exceeds max_array_count %s" % (boxed, cap))
             return self._cur
 
         # wtype == _WT_ARRAY_FIXLEN
@@ -2019,18 +2075,17 @@ cdef class Decoder:
             raise SofaDecodeError("fp32 fixlen-array element size must be 4")
         if subtype == _ST_FP64 and elem_size != 8:
             raise SofaDecodeError("fp64 fixlen-array element size must be 8")
+        boxed = PyLong_FromUnsignedLongLong(count)      # see the fixlen branch
         self._cur = _mkfield(field_id, _WT[_WT_ARRAY_FIXLEN],
-                             PyLong_FromUnsignedLongLong(elem_size),
-                             PyLong_FromUnsignedLongLong(count), _ST[subtype])
+                             PyLong_FromUnsignedLongLong(elem_size), boxed, _ST[subtype])
         self._pk = _PEND_FARRAY
         self._pend_subtype = subtype
         self._pend_count = count
         self._pend_size = elem_size
         # Parked, not raised — see the fixlen branch above (§6.2.1).
-        if self._max_array_count is not None \
-                and PyLong_FromUnsignedLongLong(count) > self._max_array_count:
-            self._park_limit("array count %d exceeds max_array_count %s"
-                             % (PyLong_FromUnsignedLongLong(count), self._max_array_count))
+        cap = self._max_array_count
+        if cap is not None and boxed > cap:
+            self._park_limit("array count %d exceeds max_array_count %s" % (boxed, cap))
         return self._cur
 
     # --- receiver caps vs. schema bounds (§6.2.1) ---------------------------
@@ -2167,17 +2222,6 @@ cdef class Decoder:
     def bool(self):
         return self._take_scalar(_WT_UNSIGNED) != 0
 
-    cdef bytes _take_fixlen(self, int subtype):
-        cdef bytes data
-        if self._pk != _PEND_FIXLEN:
-            raise self._pending_error("current field is not a fixlen value")
-        if self._pend_subtype != subtype:
-            raise SofaStateError("fixlen subtype does not match the requested read")
-        self._arm()
-        data = self._read_exact(<Py_ssize_t>self._pend_size)
-        self._pk = _PEND_NONE   # committed only once the payload is in hand
-        return data
-
     cdef const unsigned char* _take_fixlen_ptr(self, int subtype, Py_ssize_t n) except NULL:
         # Fixlen payload as a pointer instead of a ``bytes``. When the payload is
         # already buffered — the ordinary case — the value can be built straight
@@ -2298,61 +2342,50 @@ cdef class Decoder:
         self._pk = _PEND_NONE   # committed only once the payload is in hand
         return out
 
-    cdef _take_farray(self, int subtype):
-        # Like _take_varray, the pending value is cleared by the caller only
-        # after the payload has been read (§5.2).
+    cdef bytes _take_farray_payload(self, int subtype):
+        # Validate the pending fixlen array, then read its payload inside a
+        # resume transaction: an array whose payload has not fully arrived stays
+        # pending and re-readable from its first payload byte (§5.2). Like
+        # _take_varray, the pending value is cleared only once the payload is in
+        # hand — the count and element width stay in the decoder's C fields
+        # rather than being handed back through a tuple nobody outlives.
+        cdef bytes data
         if self._pk != _PEND_FARRAY:
             raise self._pending_error("current field is not a fixlen array")
         if self._pend_subtype != subtype:
             raise SofaStateError("fixlen-array subtype does not match the requested read")
-        return self._pend_count, self._pend_size
-
-    cdef bytes _take_farray_payload(self, int subtype):
-        # Validate the pending fixlen array, then read its payload inside a
-        # resume transaction: an array whose payload has not fully arrived stays
-        # pending and re-readable from its first payload byte (§5.2).
-        cdef uint64_t count, elem_size
-        cdef bytes data
-        count, elem_size = self._take_farray(subtype)
         self._arm()
-        data = self._read_exact(self._farray_nbytes(count, elem_size))
+        data = self._read_exact(self._farray_nbytes(self._pend_count, self._pend_size))
         self._pk = _PEND_NONE   # committed only once the payload is in hand
         return data
 
-    def read_float32_array(self):
+    cdef list _read_farray(self, int subtype, Py_ssize_t width):
         # The element width is settled at the fixlen_word by next() — §4.8 fixes
-        # it to 4 for fp32 and §5.2 wants that INVALID verdict before any payload
-        # read — so a pending fp32 array always has elem_size == 4 and the
-        # payload read below yields exactly count*4 bytes or raises. Re-checking
-        # the width here could only restate a decision no input can reach (issue
-        # #75). The unpack loop stays in bounds regardless: it derives its
-        # element count from the buffer it actually holds, never from the wire.
-        cdef bytes data = self._take_farray_payload(_ST_FP32)
-        cdef uint64_t count = <uint64_t>PyBytes_GET_SIZE(data) // 4
+        # it to 4 for fp32 and 8 for fp64, and §5.2 wants that INVALID verdict
+        # before any payload read — so a pending array always matches ``width``
+        # and the payload read below yields exactly count*width bytes or raises.
+        # Re-checking the width here could only restate a decision no input can
+        # reach (issue #75). The unpack loop stays in bounds regardless: it
+        # derives its element count from the buffer it actually holds, never
+        # from the wire.
+        cdef bytes data = self._take_farray_payload(subtype)
         cdef const unsigned char* p = <const unsigned char*>PyBytes_AS_STRING(data)
-        cdef list out = PyList_New(<Py_ssize_t>count)
+        cdef Py_ssize_t count = PyBytes_GET_SIZE(data) // width
+        cdef list out = PyList_New(count)
         cdef Py_ssize_t i
-        cdef object item
-        for i in range(<Py_ssize_t>count):
-            item = float(_unpack_f32(p + i * 4))
-            Py_INCREF(item)
-            PyList_SET_ITEM(out, i, item)
+        if width == 4:
+            for i in range(count):
+                _SetItemSteal(out, i, _NewF64(_unpack_f32(p + i * 4)))
+        else:
+            for i in range(count):
+                _SetItemSteal(out, i, _NewF64(_unpack_f64(p + i * 8)))
         return out
 
+    def read_float32_array(self):
+        return self._read_farray(_ST_FP32, 4)
+
     def read_float64_array(self):
-        # See read_float32_array: an fp64 array's element width is 8, settled at
-        # the fixlen_word.
-        cdef bytes data = self._take_farray_payload(_ST_FP64)
-        cdef uint64_t count = <uint64_t>PyBytes_GET_SIZE(data) // 8
-        cdef const unsigned char* p = <const unsigned char*>PyBytes_AS_STRING(data)
-        cdef list out = PyList_New(<Py_ssize_t>count)
-        cdef Py_ssize_t i
-        cdef object item
-        for i in range(<Py_ssize_t>count):
-            item = float(_unpack_f64(p + i * 8))
-            Py_INCREF(item)
-            PyList_SET_ITEM(out, i, item)
-        return out
+        return self._read_farray(_ST_FP64, 8)
 
     # --- visitor driver -----------------------------------------------------
 

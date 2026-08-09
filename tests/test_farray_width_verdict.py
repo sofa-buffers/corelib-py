@@ -20,19 +20,10 @@ import struct
 from pathlib import Path
 
 import pytest
+from vectors import DECODER_ENGINES as ENGINES
 
 import sofab
-from sofab.decoder import Decoder as PyDecoder
 from sofab.types import FixlenSubtype, SofaDecodeError, SofaIncompleteError, WireType
-
-try:  # the native accelerator is optional — the pure engine is always tested
-    from sofab._speedups import Decoder as NativeDecoder
-except ImportError:  # pragma: no cover - only when the extension is not built
-    NativeDecoder = None
-
-ENGINES = [pytest.param(PyDecoder, id="pure")]
-if NativeDecoder is not None:
-    ENGINES.append(pytest.param(NativeDecoder, id="native"))
 
 # The two fixlen-array element kinds and the only width each may declare (§4.8).
 SUBTYPES = [

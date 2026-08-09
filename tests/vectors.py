@@ -9,10 +9,65 @@ interop with the reference implementation.
 from __future__ import annotations
 
 import io
+import json
 import struct
 import sys
+from pathlib import Path
+
+import pytest
 
 from sofab import Encoder
+from sofab.decoder import Decoder as PyDecoder
+from sofab.encoder import Encoder as PyEncoder
+
+# --- the shared conformance vectors -----------------------------------------
+
+#: ``assets/test_vectors.json`` — the shared set, copied verbatim from
+#: ``corelib-c-cpp``. Loaded once here rather than re-read and re-parsed by every
+#: suite that walks it.
+VECTORS_PATH = Path(__file__).resolve().parents[1] / "assets" / "test_vectors.json"
+VECTOR_DOC = json.loads(VECTORS_PATH.read_text())
+VECTORS = VECTOR_DOC["vectors"]
+
+# --- engine parametrisation --------------------------------------------------
+#
+# The native accelerator is optional by design (``setup.py`` marks the extension
+# ``optional=True``), so every engine-parametrised suite runs the pure engine
+# always and adds the native one when it is built. Spelling that once here keeps
+# the parameter ids identical everywhere and names them as ``sofab.IMPL`` does;
+# ``SOFAB_REQUIRE_ENGINE`` (see ``test_engine_guard``) is what stops a missing
+# accelerator from silently halving a run.
+
+try:  # pragma: no cover - depends on whether the extension was built
+    from sofab import _speedups as _native
+except ImportError:  # pragma: no cover - pure-Python-only install
+    _native = None  # type: ignore[assignment]
+
+#: ``pytest.param`` lists for the encoder class, the decoder class, and the pair.
+ENCODER_ENGINES = [pytest.param(PyEncoder, id="python")]
+DECODER_ENGINES = [pytest.param(PyDecoder, id="python")]
+ENGINE_PAIRS = [pytest.param(PyEncoder, PyDecoder, id="python")]
+if _native is not None:  # pragma: no cover - native-only branch
+    ENCODER_ENGINES.append(pytest.param(_native.Encoder, id="native"))
+    DECODER_ENGINES.append(pytest.param(_native.Decoder, id="native"))
+    ENGINE_PAIRS.append(pytest.param(_native.Encoder, _native.Decoder, id="native"))
+
+
+def uvarint(value: int) -> bytes:
+    """Encode ``value`` as a base-128 little-endian varint (§4.1)."""
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        out.append(byte | 0x80 if value else byte)
+        if not value:
+            return bytes(out)
+
+
+def zzvarint(value: int) -> bytes:
+    """One ZigZag-encoded signed value on the wire (§4.2)."""
+    return uvarint((value << 1) ^ (value >> 63))
+
 
 # IEEE-754 limits matching the C ``FLT_MAX`` / ``DBL_MAX``.
 FLT_MAX = struct.unpack("<f", b"\xff\xff\x7f\x7f")[0]

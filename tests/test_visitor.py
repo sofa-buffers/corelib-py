@@ -9,16 +9,12 @@ way the harness' ``skip_ids`` scenario does.
 from __future__ import annotations
 
 import io
-import json
-from pathlib import Path
 
 import pytest
+from vectors import VECTORS
 
 from sofab import Decoder, FixlenSubtype, Visitor, WireType
 
-VECTORS = json.loads(
-    (Path(__file__).resolve().parents[1] / "assets" / "test_vectors.json").read_text()
-)["vectors"]
 _IDS = [v["name"] for v in VECTORS]
 
 # Decode-side driver: it reads each vector's `serialized` hex, the dense

@@ -20,18 +20,10 @@ from __future__ import annotations
 import io
 
 import pytest
+from vectors import ENCODER_ENGINES as ENGINES
 
 from sofab.encoder import Encoder as PyEncoder
 from sofab.types import FIXLEN_MAX, FixlenSubtype, SofaRangeError, WireType
-
-try:  # the native accelerator is optional — the pure engine is always tested
-    from sofab._speedups import Encoder as NativeEncoder
-except ImportError:  # pragma: no cover - only when the extension is not built
-    NativeEncoder = None
-
-ENGINES = [pytest.param(PyEncoder, id="pure")]
-if NativeEncoder is not None:
-    ENGINES.append(pytest.param(NativeEncoder, id="native"))
 
 
 class OversizedBlob:

@@ -20,13 +20,12 @@ the full scenario matrix the harness mandates:
 from __future__ import annotations
 
 import io
-import json
 import math
 import struct
-from pathlib import Path
 
 import pytest
-from vectors import ChunkReader
+from vectors import VECTOR_DOC as _DATA
+from vectors import VECTORS, ChunkReader
 
 from sofab import (
     MIN_OUTPUT_BUFFER,
@@ -38,9 +37,6 @@ from sofab import (
     WireType,
 )
 
-VECTORS_PATH = Path(__file__).resolve().parents[1] / "assets" / "test_vectors.json"
-_DATA = json.loads(VECTORS_PATH.read_text())
-VECTORS = _DATA["vectors"]
 _IDS = [v["name"] for v in VECTORS]
 
 # WHICH COLUMN THIS REPO ASSERTS: `serialized` — the dense, primitive-layer ground
