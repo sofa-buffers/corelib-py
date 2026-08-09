@@ -76,7 +76,13 @@ else:  # pragma: no cover - native branch: exercised only when the compiled
 
         IMPL = "python"
 
-__version__ = "0.1.0"
+#: Release version of this runtime. This literal is the single source of truth:
+#: ``pyproject.toml`` declares the distribution version *dynamic* and reads it
+#: from here, so an install and an import can never report different versions
+#: (``tests/test_version.py``). Deriving it from the installed distribution
+#: metadata instead would cost an ``importlib.metadata`` import on every
+#: ``import sofab`` and report nothing usable when running from a source tree.
+__version__ = "0.10.0"
 
 __all__ = [
     "Encoder",
