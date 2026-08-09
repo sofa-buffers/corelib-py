@@ -506,25 +506,83 @@ proves the compiler-less install still passes.
 
 ## Benchmarks
 
-`bench/perfbench.py` runs the standard workloads; `bench/compare_protobuf.py`
+`bench/perfbench.py` implements the three tools BENCH_SPEC requires — the same
+workloads, on the same data, measured the same way and printed in the same
+grammar as the C/C++/Rust/Go/… ports, so the numbers are directly comparable
+across languages. `bench/compare_protobuf.py` is extra, and language-native: it
 compares the native accelerator, the pure-Python fallback, and (for a yardstick)
 `protobuf`'s Python runtime (upb C backend), with full materialization on both
 sides so it is apples-to-apples with the SofaBuffers pull API:
 
 ```bash
-python bench/perfbench.py time            # throughput on this machine, MB/s (MB = 1e6)
+python bench/perfbench.py bench           # throughput on this machine, MB/s (MB = 1e6)
 python bench/perfbench.py perf            # per-op cost for the shared 12-field message
 bash  bench/run_callgrind.sh              # instructions/op (Callgrind) — clock-independent
 pip install protobuf                      # optional; the column is dropped if absent
 python bench/compare_protobuf.py          # best-of-5 MB/s table
 ```
 
-`time` / `perf` measure this machine and move with its load; `run_callgrind.sh`
+`bench` / `perf` measure this machine and move with its load; `run_callgrind.sh`
 counts instructions retired, which is deterministic and comparable across hosts,
 so it is the one to trust when judging a change to the library itself.
+(`time` still works as a synonym for `bench`.)
+
+The workloads are BENCH_SPEC's, not this port's invention:
+
+| dataset | what it is there for |
+|---------|----------------------|
+| `u64 array (1000)` | the compact scalar-array path, 1..10-byte varints |
+| `typical message` | seven mixed fields, ~37 bytes — the small-message case |
+| `perf message` (`perf` only) | twelve fields, 170 bytes on every port — a size parity check |
+| `blob 1MB` | buffer handling: 1,000,005 encoded bytes, one-shot vs. streaming vs. chunk-fed decode |
+| `composite` | 956 bytes exercising a wrapper array, non-ASCII UTF-8, depth-3 nesting, an omitted default field and a two-byte header |
+
+The three `blob 1MB` rows are read **against each other**, never next to
+`typical message`: five of its bytes are metadata and a million are payload, so
+the absolute figure is this machine's memory bandwidth. The signal is the gap
+between them — one-shot is one contiguous write into a 1,000,005-byte caller
+buffer with no sink; streaming is the same bytes through a **4096**-byte caller
+buffer with a flush sink, i.e. ~245 flushes of the divisible-run path
+(CORELIB_PLAN §5.1); decode is fed in 4096-byte chunks. This port grants no
+pass-through, so BENCH_SPEC's optional `blob 1MB passthrough` row is absent
+rather than stubbed.
+
+BENCH_SPEC says to read that pair as `Ir/op`, and on x86-64 CPython there is a
+caveat: the one-shot row is a *single* 1,000,000-byte `memcpy`, which glibc
+serves from its ERMS (`rep movsb`) path and Valgrind counts at ~1 instruction per
+byte, while the streaming row's 4096-byte copies take the vectorised path at a
+fraction of that. `Ir/op` consequently reports one-shot as the *dearer* of the
+two (≈1.07M vs ≈0.41M) although it does strictly less work — measured, not
+assumed: a bare 1 MB `memcpy` costs ≈967k Ir under Callgrind on this host. For
+these two rows read the MB/s above (one-shot ≈2.7× streaming, which is the real
+cost of the flush machinery); every other row is `Ir/op`'s to tell.
 
 Representative result (throughput MB/s, higher is better; one x86-64 host,
-CPython 3.12 — the *ratios* are the point):
+CPython 3.14 — the *ratios* are the point, not the absolute numbers):
+
+| Workload | sofab **native** | sofab pure | native vs pure |
+|----------|-----------------:|-----------:|---------------:|
+| encode: u64 array (1000) | **1067** | 7.9 | ≈136× |
+| encode: typical message | **47.6** | 3.8 | ≈13× |
+| encode: blob 1MB one-shot | **37729** | 28370 | ≈1.3× |
+| encode: blob 1MB streaming | **13777** | 3066 | ≈4.5× |
+| encode: composite | **176** | 7.6 | ≈23× |
+| decode: u64 array (1000) | **452** | 5.4 | ≈84× |
+| decode: typical message | **15.7** | 1.3 | ≈12× |
+| decode: blob 1MB | **5926** | 414 | ≈14× |
+| decode: composite | **38.0** | 5.0 | ≈7.6× |
+| decode: composite skip-all | **187** | 6.5 | ≈29× |
+
+Two readings worth pulling out. The blob **one-shot** row is `memcpy` in both
+engines and the two are nearly level — there is no per-field Python work left to
+remove there; the **streaming** row costs the native engine 2.7× the one-shot and
+the pure engine 9.3×, and that gap *is* the flush machinery. And `decode:
+composite skip-all` is ≈4.9× `decode: composite` on the native engine: what a
+router or filter saves by walking a message without materializing it.
+
+Against protobuf (a separate measurement — `bench/compare_protobuf.py`, best of
+5, one x86-64 host, CPython 3.12; read this table internally, not across into the
+one above):
 
 | Workload | sofab **native** | sofab pure | protobuf (upb) | native vs protobuf |
 |----------|-----------------:|-----------:|---------------:|:------------------:|
@@ -533,9 +591,11 @@ CPython 3.12 — the *ratios* are the point):
 | decode: u64 array (1000) | **≈460** | ≈7.8 | ≈195 | **≈2.4× faster** |
 | decode: typical message  | ≈9.2     | ≈2.1 | ≈9.0 | ≈1.0× (see note) |
 
-The native accelerator is **~4× faster than the pure-Python fallback on a small
-mixed message and ~60–75× on array-heavy ones**, and beats protobuf everywhere
-except the smallest decode, where the two are level. That last workload is where
+The native accelerator is **an order of magnitude faster than the pure-Python
+fallback on small mixed messages and ~85–135× on array-heavy ones**, and beats
+protobuf everywhere except the smallest decode, where the two are level. (The
+per-field gap has widened since this table was taken — see the row set above,
+measured on current `main`.) That last workload is where
 the streaming **pull** API costs the most: it crosses the Python↔C boundary twice
 per field (`next()` then a typed read), whereas protobuf parses the whole message
 in one C call — an inherent pull-vs-parse-tree trade-off that only shows on very
