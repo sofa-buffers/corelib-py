@@ -58,7 +58,7 @@ import sofab   # Encoder, Decoder, Visitor, wire-format types and limits
 | Goal | How |
 |------|-----|
 | Streaming **out** | `Encoder` writes to any binary stream (file, socket, `BytesIO`), so a message can exceed RAM and stream straight to the wire. |
-| Streaming **in** | `Decoder` is a pull parser over any `read(n)` reader; `next()` returns one field header at a time, never materializing the whole message. |
+| Streaming **in** | `Decoder` is a pull parser over any `read(n)` reader; `next()` returns one field header at a time, never materializing the whole message. A call that runs out of bytes reports `SofaIncompleteError` **without consuming anything**, so it can simply be re-issued when more arrive. |
 | Native speed, zero runtime deps | The hot path ships as an optional Cython accelerator (`sofab._speedups`); when it can't be built it falls back to pure Python. No runtime third-party deps either way. |
 | Runs everywhere | With no compiler or wheel, `pip` still installs a working pure-Python build (`py3-none-any`). Native and pure paths are byte-for-byte identical — falling back changes only speed. |
 | Sticky errors | `Encoder(sticky=True)` records the first failure and turns later writes into no-ops, so generated `marshal` code can check `enc.error` once. |
@@ -137,6 +137,35 @@ while (field := dec.next()) is not None:
     ...                              # pull each field, or dec.skip()
 ```
 
+**When the bytes have not all arrived yet.** A reader that can return `b""`
+before end-of-message — a non-blocking socket, a queue fed by another task — puts
+the decoder in the position CORELIB_PLAN §5.2 calls `INCOMPLETE`: the bytes stop
+*inside* a field. That is not an error and not the end of the message; it means
+"feed me more". Two shapes signal it, and both are **resumable — the suspended
+call consumed nothing**, so the answer to either is to obtain more bytes and
+issue the *same* call again:
+
+* `next()` returns `None` — the bytes stopped exactly *between* fields (§5.2
+  `COMPLETE`: a message may end here, and more fields may also still follow);
+* `SofaIncompleteError` is raised — the bytes stopped *inside* a field header or
+  payload, or inside a sequence that is still open.
+
+```python
+while True:
+    try:
+        field = dec.next()
+    except SofaIncompleteError:
+        feed_more(); continue        # partial field retained; re-issue next()
+    if field is None:
+        if stream_ended: break       # your framing decides; the decoder never does
+        feed_more(); continue
+    value = read_the_value(dec, field)   # same retry rule for the typed reads
+```
+
+Whether an incomplete message is acceptable is the **caller's** decision, not the
+decoder's: only your framing (a length prefix, a datagram boundary, EOF) knows
+whether more bytes can still come.
+
 ### Code generator
 
 The most common real use is driving the library through **generated code**:
@@ -202,6 +231,12 @@ from an untrusted array count — a truncated oversize claim fails promptly as
 The key point for Python: **the library allocates results for you — the caller
 never provides a value buffer.**
 
+* **Decode: a suspended call keeps its bytes, and only its bytes.** Everything
+  the reader hands over is retained, so a field split across chunks is never
+  half-consumed; the buffer's consumed prefix is dropped on the next refill,
+  down to the first byte of the call in flight — that byte is the one a resumed
+  call re-reads from. The window held is therefore one field (for a `skip()`
+  over a sequence, one sequence), not one message.
 * **Decode.** `Decoder` keeps a single internal buffer, refilled from the
   `read(n)` source and never handed out, so there is **no zero-copy aliasing**:
   `string()` returns a fresh `str`, `bytes()` independent `bytes`, scalars a

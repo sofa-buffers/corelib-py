@@ -14,6 +14,14 @@ reader and continues, so the same code path serves both a fully-buffered
 message and a reader that dribbles one byte at a time. See ``_varint`` /
 ``_read_varints`` / ``_read_exact`` below.
 
+**Suspend and resume (CORELIB_PLAN §5.2).** A reader that runs dry mid-field —
+a socket with nothing buffered yet — makes the call raise
+:class:`SofaIncompleteError`. That is a first-class outcome, not an error, so
+the call consumes nothing: the cursor goes back to where it started, the bytes
+already read stay buffered, and re-issuing the same call once more bytes have
+arrived parses the field from its first byte. See the "resume transactions"
+section in :class:`Decoder`.
+
 Typical use::
 
     dec = Decoder(reader)
@@ -110,6 +118,61 @@ class Decoder:
         self._cur: Field | None = None
         # pending unconsumed value: tuple keyed by the _* constants above
         self._pending: tuple[Any, ...] | None = None
+        # Resume transaction (§5.2): the buffer offset the call in flight
+        # started at, and -1 or the floor a multi-field walk pins. See _suspend.
+        self._keep = 0
+        self._floor = -1
+
+    # --- resume transactions (CORELIB_PLAN §5.2) ----------------------------
+    #
+    # §5.2 requires the decoder to "suspend and resume at **any** byte boundary
+    # without losing state": running out of bytes mid-construct is INCOMPLETE,
+    # a first-class outcome the caller answers by supplying more bytes — not an
+    # error that may consume anything. For this pull decoder that means every
+    # public call is a transaction: it either consumes the whole construct or
+    # consumes nothing at all. On the suspension path the cursor goes back to
+    # where the call began and the bytes already parsed stay buffered, so
+    # re-issuing the same call once more bytes have arrived re-parses the
+    # construct from its **first** byte. Without that, a resumed call would
+    # restart mid-construct and silently decode fabricated fields — the one
+    # outcome §5.2 forbids (folding a merely-split message into INVALID, or
+    # worse, into a wrong COMPLETE).
+    #
+    # Two rules keep the whole mechanism down to one integer — ``_keep``, the
+    # cursor position the call in flight started at — so the guarantee costs the
+    # hot path a single store per call rather than a state snapshot:
+    #
+    # * **the cursor is the only thing that moves while a call can still
+    #   suspend.** ``_pending`` is cleared, ``_depth`` stepped and ``_cur``
+    #   published only after the construct's last byte is in hand, so there is
+    #   nothing else to undo. Every ``_take_*`` below therefore consumes first
+    #   and commits after — the one ordering rule this file depends on.
+    # * **every call is one field.** ``_keep`` is re-armed by ``next()`` and by
+    #   each typed read, so it is always meaningful and never has to be cleared:
+    #   it simply names the start of the most recent call. It doubles as the
+    #   floor :meth:`_need` may compact to, which is what keeps a suspended
+    #   construct's bytes in the buffer for the retry.
+    #
+    # ``skip()`` over a whole *sequence* is the one call that spans many fields.
+    # It pins ``_floor`` at its first byte so the refill path cannot drop the
+    # sequence behind the walk, and restores ``_pos``/``_depth``/``_cur``/
+    # ``_pending`` itself if the walk suspends — a re-issued ``skip()`` then
+    # replays the sequence from its start.
+    #
+    # INVALID is deliberately *not* rewound: it is terminal (§5.2), so no
+    # continuation of bytes can make the stream valid again and there is nothing
+    # to resume.
+
+    def _suspend(self, msg: str) -> SofaIncompleteError:
+        """Rewind to the current call's first byte and build its ``INCOMPLETE``.
+
+        Called at every truncation site, so the rewind happens whether the raise
+        is nested inside a field walk or not. ``_keep`` is maintained by
+        :meth:`_need` across compaction, so it names the call's start byte in the
+        *current* buffer even if the buffer was rebased while the call ran.
+        """
+        self._pos = self._keep
+        return SofaIncompleteError(msg)
 
     # --- low-level byte sourcing --------------------------------------------
     #
@@ -119,22 +182,51 @@ class Decoder:
     def _need(self, n: int) -> bool:
         """Ensure at least ``n`` bytes are available at ``_pos``, pulling more
         from the reader (and compacting the consumed prefix) as required.
-        Returns ``False`` if the stream ends with fewer than ``n`` available."""
+        Returns ``False`` if the stream ends with fewer than ``n`` available.
+
+        Everything the reader hands over is kept: on failure the bytes read so
+        far stay in ``_buf``, which is what makes a suspension non-destructive.
+        """
         buf = self._buf
         pos = self._pos
         if len(buf) - pos >= n:
             return True
-        if pos:
-            buf = buf[pos:]
-            self._pos = 0
-        read = self._read
-        chunk = self._chunk
-        while len(buf) < n:
-            data = read(chunk)
+        # Compaction may only drop what can never be read again. With a resume
+        # transaction open that floor is the transaction's start, not the
+        # cursor: the bytes in between belong to the construct being parsed and
+        # a suspension has to be able to replay them (§5.2).
+        base = self._keep if self._floor < 0 else self._floor
+        if base:
+            buf = buf[base:]
+            pos -= base
+            self._pos = pos
+            self._keep -= base
+            if self._floor > 0:
+                self._floor -= base
+        want = pos + n
+        if len(buf) < want:
+            read = self._read
+            chunk = self._chunk
+            short = want - len(buf)
+            data = read(chunk if chunk > short else short)
             if not data:
                 self._buf = buf
                 return False
             buf = buf + data if buf else data
+            if len(buf) < want:
+                # More than one read needed: accumulate in a bytearray from here,
+                # since repeated ``bytes + bytes`` would make a chunk-fed large
+                # payload quadratic. (One read is the common case and stays a
+                # plain concatenation — often not even that, on the first fill.)
+                acc = bytearray(buf)
+                while len(acc) < want:
+                    short = want - len(acc)
+                    data = read(chunk if chunk > short else short)
+                    if not data:
+                        self._buf = bytes(acc)
+                        return False
+                    acc += data
+                buf = bytes(acc)
         self._buf = buf
         return True
 
@@ -145,7 +237,7 @@ class Decoder:
         pos = self._pos
         if pos >= len(buf):
             if not self._need(1):
-                raise SofaIncompleteError("truncated varint")
+                raise self._suspend("truncated varint")
             buf = self._buf
             pos = self._pos
         b = buf[pos]
@@ -160,7 +252,7 @@ class Decoder:
             if pos >= n:
                 self._pos = pos
                 if not self._need(1):
-                    raise SofaIncompleteError("truncated varint")
+                    raise self._suspend("truncated varint")
                 buf = self._buf
                 pos = self._pos
                 n = len(buf)
@@ -184,26 +276,24 @@ class Decoder:
 
     def _read_exact(self, n: int) -> bytes:
         """Return the next ``n`` bytes. Fast path is a single buffer slice; the
-        slow path accumulates across refills for a chunk-fed reader."""
+        slow path accumulates across refills for a chunk-fed reader.
+
+        The accumulation happens inside ``_buf`` rather than in a local, so a
+        payload that stops halfway is still buffered when the truncation is
+        reported and the next attempt continues from it (§5.2)."""
         buf = self._buf
         pos = self._pos
         end = pos + n
         if end <= len(buf):
             self._pos = end
             return buf[pos:end]
-        out = bytearray(buf[pos:])
-        self._buf = b""
-        self._pos = 0
-        read = self._read
-        chunk = self._chunk
-        while len(out) < n:
-            data = read(max(chunk, n - len(out)))
-            if not data:
-                raise SofaIncompleteError("truncated payload")
-            out += data
-        if len(out) > n:  # keep the overshoot for the next read
-            self._buf = bytes(out[n:])
-        return bytes(out[:n])
+        if not self._need(n):
+            raise self._suspend("truncated payload")
+        buf = self._buf
+        pos = self._pos
+        end = pos + n
+        self._pos = end
+        return buf[pos:end]
 
     def _elem_bound_error(
         self,
@@ -233,7 +323,7 @@ class Decoder:
                 x = zigzag_decode(v) if zigzag else v
                 if x < lo or x > hi:  # type: ignore[operator]
                     return SofaDecodeError("array element outside declared width")
-        return SofaIncompleteError("truncated varint")
+        return self._suspend("truncated varint")
 
     def _read_varints(
         self,
@@ -344,13 +434,19 @@ class Decoder:
         """Advance to the next field. Returns ``None`` at clean EOF.
 
         Any value left unconsumed from the previous field is skipped first.
+
+        If the bytes run out inside the header (or inside the value being
+        skipped), :class:`SofaIncompleteError` is raised and the decoder is left
+        untouched: call ``next()`` again once more bytes are available and the
+        field is parsed from its first byte (§5.2).
         """
+        self._keep = self._pos  # opens this field's resume transaction (§5.2)
         if self._pending is not None:
             self._skip_pending()
 
         if not self._need(1):
             if self._depth != 0:
-                raise SofaIncompleteError("truncated: unbalanced sequence")
+                raise self._suspend("truncated: unbalanced sequence")
             return None
 
         header = self._varint()
@@ -488,13 +584,12 @@ class Decoder:
         """
         total = count * elem_size
         if total > sys.maxsize:
-            raise SofaIncompleteError("truncated payload")
+            raise self._suspend("truncated payload")
         return total
 
     def _skip_pending(self) -> None:
         pending = self._pending
         assert pending is not None
-        self._pending = None
         kind = pending[0]
         if kind == _SCALAR:
             self._varint()
@@ -504,17 +599,41 @@ class Decoder:
             self._skip_varints(pending[2])
         else:  # _FARRAY
             self._read_exact(self._farray_nbytes(pending[2], pending[3]))
+        # Cleared only now: had the value run out mid-skip, the field has to
+        # stay pending so the retry skips it again from its first byte (§5.2).
+        self._pending = None
 
     def skip(self) -> None:
         """Skip the current field's value, or an entire (nested) sequence if the
-        current field is a sequence start."""
+        current field is a sequence start.
+
+        Suspends as a unit: if the bytes run out part-way, nothing is consumed
+        and the same ``skip()`` can be re-issued when more arrive (§5.2).
+        """
+        self._keep = self._pos
         if self._cur is not None and self._cur.type == WireType.SEQUENCE_START:
-            target = self._depth - 1
-            while self._depth > target:
-                # Defensive: at EOF with an open sequence, next() itself raises
-                # "truncated: unbalanced sequence", so it never returns None here.
-                if self.next() is None:  # pragma: no cover
-                    raise SofaIncompleteError("truncated sequence")
+            # Walking a whole sequence spans many fields, so unlike every other
+            # call this one moves the field state — and lets ``next()`` re-arm
+            # ``_keep`` — before it can suspend. ``_floor`` pins the refill
+            # path's compaction at the first byte *inside* the sequence for the
+            # duration, and the field state is put back here, so a re-issued
+            # ``skip()`` replays the whole sequence (§5.2).
+            self._floor = self._pos
+            depth, cur, pending = self._depth, self._cur, self._pending
+            try:
+                target = depth - 1
+                while self._depth > target:
+                    # Defensive: at EOF with an open sequence, next() itself
+                    # raises "truncated: unbalanced sequence", so it never
+                    # returns None here.
+                    if self.next() is None:  # pragma: no cover
+                        raise self._suspend("truncated sequence")
+            except SofaIncompleteError:
+                self._pos = self._keep = self._floor
+                self._depth, self._cur, self._pending = depth, cur, pending
+                raise
+            finally:
+                self._floor = -1
             return
         if self._pending is not None:
             self._skip_pending()
@@ -565,8 +684,10 @@ class Decoder:
         pending = self._pending
         if pending is None or pending[0] != _SCALAR or pending[1] != wtype:
             raise SofaStateError("no matching scalar value for the current field")
-        self._pending = None
-        return self._varint()
+        self._keep = self._pos
+        value = self._varint()
+        self._pending = None  # committed only once the value is in hand (§5.2)
+        return value
 
     def unsigned(self) -> int:
         """Consume the current field as an unsigned integer.
@@ -592,8 +713,10 @@ class Decoder:
             raise SofaStateError("current field is not a fixlen value")
         if pending[1] != subtype:
             raise SofaStateError("fixlen subtype does not match the requested read")
-        self._pending = None
-        return self._read_exact(pending[2])
+        self._keep = self._pos
+        data = self._read_exact(pending[2])
+        self._pending = None  # committed only once the payload is in hand (§5.2)
+        return data
 
     def float32(self) -> float:
         """Consume the current fixlen field as a 32-bit IEEE-754 float.
@@ -658,10 +781,15 @@ class Decoder:
     # --- array reads --------------------------------------------------------
 
     def _take_varray(self, wtype: WireType) -> int:
+        """Validate the pending array and return its count.
+
+        The pending value is *not* cleared here — the caller clears it once the
+        payload has actually been decoded, so a suspension leaves the array
+        re-readable from its first element (§5.2).
+        """
         pending = self._pending
         if pending is None or pending[0] != _VARRAY or pending[1] != wtype:
             raise SofaStateError("current field is not a matching varint array")
-        self._pending = None
         return int(pending[2])
 
     def read_unsigned_array(self, elem_max: int | None = None) -> list[int]:
@@ -678,7 +806,10 @@ class Decoder:
         Raises :class:`SofaStateError` if the field is not an unsigned array.
         """
         count = self._take_varray(WireType.ARRAY_UNSIGNED)
-        return self._read_varints(count, 0, elem_max)
+        self._keep = self._pos
+        out = self._read_varints(count, 0, elem_max)
+        self._pending = None  # committed only once the payload is in hand (§5.2)
+        return out
 
     def read_signed_array(
         self,
@@ -693,12 +824,15 @@ class Decoder:
         Raises :class:`SofaStateError` if the field is not a signed array.
         """
         count = self._take_varray(WireType.ARRAY_SIGNED)
+        self._keep = self._pos
         # ZigZag inlined rather than calling zigzag_decode per element: the
         # transform is two operations, the call around it was the expensive part.
-        return [
+        out = [
             (v >> 1) ^ -(v & 1)
             for v in self._read_varints(count, elem_min, elem_max, True)
         ]
+        self._pending = None  # committed only once the payload is in hand (§5.2)
+        return out
 
     def _take_farray(self, subtype: FixlenSubtype) -> tuple[int, int]:
         pending = self._pending
@@ -708,7 +842,8 @@ class Decoder:
         # known even for a zero-count array — check it like any other read.
         if pending[1] != subtype:
             raise SofaStateError("fixlen-array subtype does not match the requested read")
-        self._pending = None
+        # Like _take_varray, the pending value is cleared by the caller only
+        # after the payload has been read (§5.2).
         return int(pending[2]), int(pending[3])  # count, elem_size
 
     def read_float32_array(self) -> list[float]:
@@ -717,7 +852,9 @@ class Decoder:
         Raises :class:`SofaStateError` if the field is not an fp32 array.
         """
         count, elem_size = self._take_farray(FixlenSubtype.FP32)
+        self._keep = self._pos
         data = self._read_exact(self._farray_nbytes(count, elem_size))
+        self._pending = None  # committed only once the payload is in hand (§5.2)
         # The fixlen_word must declare a 4-byte element width for fp32; reject a
         # mismatch as malformed instead of letting struct.unpack raise a raw
         # struct.error (which would leak an implementation detail and diverge
@@ -732,7 +869,9 @@ class Decoder:
         Raises :class:`SofaStateError` if the field is not an fp64 array.
         """
         count, elem_size = self._take_farray(FixlenSubtype.FP64)
+        self._keep = self._pos
         data = self._read_exact(self._farray_nbytes(count, elem_size))
+        self._pending = None  # committed only once the payload is in hand (§5.2)
         # fp64 elements are 8 bytes wide; see read_float32_array.
         if len(data) != count * 8:
             raise SofaDecodeError("fixlen-array element width does not match its subtype")
