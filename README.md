@@ -226,6 +226,16 @@ guessed by the runtime. Independent of any limit, the decoder never pre-allocate
 from an untrusted array count — a truncated oversize claim fails promptly as
 `SofaIncompleteError` rather than attempting a huge allocation.
 
+A **schema** bound is the opposite kind of thing: it is part of the message
+definition, so breaching it is malformed input, not policy. The integer-array
+reads take the declared element width for exactly that reason —
+`read_unsigned_array(255)` for a `u8` array, `read_signed_array(-128, 127)` for
+an `i8` one (either half may be given alone; the other side stays open). An
+element outside the declared width raises `SofaDecodeError` the moment its own
+bytes are decoded, so the verdict never depends on how much of the array
+followed it or on which engine read it (MESSAGE_SPEC §7.1). Omit the argument
+for `u64`/`i64`, whose range is the value domain, or for an unbounded consumer.
+
 ## Memory handling
 
 The key point for Python: **the library allocates results for you — the caller
