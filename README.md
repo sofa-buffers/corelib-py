@@ -63,7 +63,7 @@ import sofab   # Encoder, Decoder, Visitor, wire-format types and limits
 | Runs everywhere | With no compiler or wheel, `pip` still installs a working pure-Python build (`py3-none-any`). Native and pure paths are byte-for-byte identical — falling back changes only speed. |
 | Sticky errors | `Encoder(sticky=True)` records the first failure and turns later writes into no-ops, so generated `marshal` code can check `enc.error` once. |
 | No silent truncation | An integer field accepts what Python accepts wherever an integer is required — anything with `__index__` (`int`, `bool`, `IntEnum`, NumPy integers). A `float` is refused with `SofaRangeError`, `3.0` included: writing `3` for a caller's `3.7` would change the value in a way the receiver could never detect. |
-| Reserve-offset | `Encoder.over_buffer(buf, offset=…)` leaves room at the front of the buffer for a lower-layer protocol header. |
+| Reserve-offset | `Encoder.over_buffer(buf, offset=…)` leaves room at the front of the buffer for a lower-layer protocol header; a sink calling `buffer_set(buf, offset)` re-arms that room for **every** flushed packet. |
 | Sparse sequences | `write_sequence_begin_lazy` holds a sequence header back until the sequence receives content, so a sequence-typed field equal to its declared default is **omitted** rather than framed empty (MESSAGE_SPEC §2) — decided in one forward pass, without buffering the sub-message. `write_sequence_end` drops a contentless sequence; `write_sequence_end_keep` forces the frame out where presence itself carries meaning — a wrapper-array **element** is still always framed, even when all-default, because element presence is what carries a dynamic array's length (§5.1). |
 | Typed | Fully type-annotated with a `py.typed` marker (PEP 561); clean under `mypy --strict`. |
 | Forward/backward compatible | Unknown fields are consumed with `skip()`. |
@@ -215,6 +215,16 @@ never provides a value buffer.**
   drains to the writer. `Encoder.over_buffer` is caller-owned and bounded: you
   provide a fixed `bytearray`, it writes in place via a `memoryview` and flushes
   to the sink + reuses the buffer when full.
+* **The start offset belongs to the installation, not to the buffer.** A flush
+  sink states what it did by what it does before returning. Returning **without**
+  installing anything means it *copied* the bytes it was handed: the same buffer
+  stays active and encoding resumes at offset 0. A sink that *takes* the buffer —
+  queues it for an async write, hands it to a transport — **must** install a
+  replacement with `buffer_set(buf, offset)` before it returns, and that call's
+  `offset` is where encoding resumes. Re-installing is therefore how a sink gets
+  fresh framing-header room in *every* flushed packet (one header per packet),
+  including when it passes the **same** buffer back: a bare return would reserve
+  nothing, since the offset is consumed by the installation that carried it.
 * **Sequence framing is lazy.** `write_sequence_begin_lazy(id)` pushes the id onto
   a pending run and writes nothing; the first field write inside commits the whole
   run, outermost header first. `write_sequence_end()` then drops a sequence that

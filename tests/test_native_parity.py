@@ -113,6 +113,52 @@ def test_over_buffer_byte_identical_with_buffer_set_sink(cap):
     assert _encode_over_buffer(NativeEncoder, cap) == want
 
 
+def _encode_reserving_header(enc_cls, cap, offset, filler=0xEE):
+    """Encode `_program` through `cap`-byte buffers whose sink *takes* the buffer it
+    was handed and installs a replacement reserving `offset` bytes of framing room —
+    the take-and-replace shape of CORELIB_PLAN §5.1."""
+    packets = []
+    enc = None
+
+    def sink(chunk):
+        packets.append(bytes(chunk))
+        enc.buffer_set(bytearray([filler]) * cap, offset)
+
+    enc = enc_cls.over_buffer(bytearray([filler]) * cap, offset, sink)
+    _program(enc)
+    enc.flush()
+    return packets
+
+
+@pytest.mark.parametrize("cap,offset", [(12, 1), (16, 4), (24, 4), (64, 8), (100, 16)])
+def test_over_buffer_sink_reinstalled_offset_survives_the_drain(cap, offset):
+    """§5.1: the start offset belongs to the installation, not to the buffer — a sink
+    that re-arms it on every flush gets header room in *every* packet.
+
+    Both engines used to drop it: the drain reset the cursor to 0 unconditionally
+    *after* the sink had run, discarding the offset the sink had just installed, so
+    every packet but the first began at byte 0 and the sink's framing header would
+    overwrite ``offset`` payload bytes per packet, silently.
+    """
+    ref = PyEncoder()
+    _program(ref)
+    ref.flush()
+    want = ref.getvalue()
+
+    head = bytes([0xEE]) * offset
+    for enc_cls in (PyEncoder, NativeEncoder):
+        packets = _encode_reserving_header(enc_cls, cap, offset)
+        assert len(packets) > 1, "buffer too large to force a mid-stream flush"
+        for i, packet in enumerate(packets):
+            assert packet[:offset] == head, f"{enc_cls.__name__} packet {i}: reservation lost"
+        assert b"".join(p[offset:] for p in packets) == want
+
+    # ... and both engines cut the stream in exactly the same places.
+    assert _encode_reserving_header(PyEncoder, cap, offset) == _encode_reserving_header(
+        NativeEncoder, cap, offset
+    )
+
+
 def _walk(dec):
     out = []
     while (f := dec.next()) is not None:
