@@ -47,6 +47,17 @@ def _pack_f32_bits(value: float) -> int:
 
     NaN is narrowed bit-for-bit (inverse of :func:`_unpack_f32_bits`); every
     other value goes through ``struct``.
+
+    A magnitude too large for fp32 **overflows to ±inf**, which is the IEEE-754
+    fp64->fp32 narrowing every native-``fp32`` corelib performs (a C ``(float)``
+    cast, Rust ``as f32``, Java ``(float)``) and what the native accelerator's
+    ``_pack_f32`` does. ``struct`` reports that overflow as ``OverflowError``
+    instead of producing the bytes, and it does so *exactly* at the rounding
+    boundary — a value between ``FLT_MAX`` and the tie point still packs, as
+    ``FLT_MAX`` — so turning the exception into the ±inf pattern reproduces the
+    native narrowing bit-for-bit. Letting it escape instead would both break
+    that engine parity and leave the §6.3 outcome set (``OverflowError`` is no
+    ``SofaError``, so sticky mode could not latch it).
     """
     if value != value:  # NaN — only a NaN is unequal to itself
         dbits = int(_U64.unpack(_F64.pack(value))[0])
@@ -57,7 +68,13 @@ def _pack_f32_bits(value: float) -> int:
             # collapse to inf; force it back to a (quiet) NaN instead.
             bits |= 0x00400000
         return bits
-    return int(_U32.unpack(_F32.pack(value))[0])
+    try:
+        return int(_U32.unpack(_F32.pack(value))[0])
+    except OverflowError:
+        # Cold: only an out-of-fp32-range magnitude gets here. float() re-raises
+        # for a value that is not even a double (a huge int), which is what the
+        # native path does with it too.
+        return _F32_EXP | (0x80000000 if float(value) < 0.0 else 0)
 
 
 def pack_f32(value: float) -> bytes:
