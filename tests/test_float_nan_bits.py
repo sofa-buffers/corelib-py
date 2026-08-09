@@ -15,10 +15,13 @@ engine (native/pure) is active.
 
 from __future__ import annotations
 
+import struct
+
 import pytest
 from vectors import reader
 
 from sofab import Decoder, Encoder, FixlenSubtype, WireType
+from sofab._core import _unpack_f32_bits, unpack_f32
 
 # We must feed the corelib the *literal* payload bytes: struct.unpack("<f", ...)
 # would itself quiet a signaling NaN before the library ever sees it (that
@@ -194,3 +197,62 @@ def test_fp32_array_mixes_nan_and_ordinary_elements():
     out = Encoder()
     out.write_float32_array(4, got)
     assert out.getvalue()[-4 * len(payloads):].hex() == "".join(payloads)
+
+
+# --- narrowing a NaN whose payload fp32 cannot hold --------------------------
+#
+# An fp32 mantissa is the top 23 bits of the fp64 one, so the low 29 bits are
+# dropped by the narrowing `write_float32` performs on a Python float (a C
+# double). A NaN whose *whole* payload lives in those bits would narrow to an
+# all-zero mantissa — which is no longer a NaN but ±inf. §4.6 allows the payload
+# to be lost (fp32 cannot represent it) but not the value's class: a NaN must
+# stay a NaN, so the narrowing forces the is-quiet bit back on. Both engines do
+# it, and CI runs this file under each.
+
+
+def _f64_hex(bits: int) -> str:
+    return struct.pack("<Q", bits).hex()
+
+
+#: fp64 bit pattern -> the fp32 payload `write_float32` must produce.
+NARROWED_NAN = {
+    "sNaN, payload 1 (lost)": (0x7FF0000000000001, "0000c07f"),
+    "negative sNaN, payload 1 (lost)": (0xFFF0000000000001, "0000c0ff"),
+    "sNaN, all 29 dropped bits set": (0x7FF000001FFFFFFF, "0000c07f"),
+    "negative sNaN, all 29 dropped bits set": (0xFFF000001FFFFFFF, "0000c0ff"),
+    # Control: the lowest payload bit fp32 *can* hold (bit 29) survives, and the
+    # value stays signaling — the rescue above must not fire here.
+    "sNaN, lowest surviving payload bit": (0x7FF0000020000000, "0100807f"),
+}
+
+
+@pytest.mark.parametrize("name,case", list(NARROWED_NAN.items()), ids=list(NARROWED_NAN))
+def test_nan_narrowed_to_fp32_stays_a_nan(name, case):
+    bits, expected = case
+    dec = Decoder(reader(_f64_frame(_f64_hex(bits))))
+    dec.next()
+    value = dec.float64()
+    assert value != value, "the fp64 NaN did not survive the trip through a float"
+
+    out = Encoder()
+    out.write_float32(7, value)
+    got = out.getvalue()[-4:].hex()
+    assert got != "0000807f" and got != "000080ff", f"{name} collapsed to inf"
+    assert got == expected, f"{name} narrowed to {got}"
+
+
+def test_unpack_f32_bits_matches_struct_on_ordinary_values():
+    """The raw-bit widening agrees with the ordinary one on every non-NaN value.
+
+    ``_unpack_f32_bits`` exists for NaN payloads (§6.5): the public helpers reach
+    its bit path only for a NaN and take ``struct``'s exact conversion otherwise,
+    so its own non-NaN fallback is what any future caller that skips that test
+    would land in. Pin the two to each other — a bit path that quietly disagreed
+    on ordinary values would be a landmine for the next caller — comparing the
+    raw doubles, so ``-0.0`` and the infinities are compared by bits and not by
+    ``==``.
+    """
+    for hexbits in ("0000803f", "00000080", "0000807f", "000080ff", "ffff7f7f", "00000000"):
+        raw = bytes.fromhex(hexbits)
+        via_bits = _unpack_f32_bits(int.from_bytes(raw, "little"))
+        assert struct.pack("<d", via_bits) == struct.pack("<d", unpack_f32(raw)), hexbits

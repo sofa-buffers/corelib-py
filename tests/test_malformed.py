@@ -3,6 +3,8 @@ corelib-c-cpp/test/c/test_istream.c (SOFAB_RET_E_INVALID_MSG cases)."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from vectors import ChunkReader, reader
 
@@ -197,6 +199,7 @@ def test_array_fixlen_giant_element_width_rejected_at_header():
 # lockstep (they returned INCOMPLETE together before the fix). ``Decoder``
 # imported from ``sofab`` resolves to the native class when it is compiled in,
 # so name the pure engine explicitly rather than relying on the public alias.
+from sofab import decoder as _pydec_module  # noqa: E402
 from sofab.decoder import Decoder as _PyDecoder  # noqa: E402
 
 _DECODERS = [_PyDecoder]
@@ -450,6 +453,50 @@ def test_signed_array_huge_count_does_not_preallocate():
     assert f is not None and f.count == 0x7FFFFFFF
     with pytest.raises(SofaIncompleteError):
         dec.read_signed_array()
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_fixlen_array_huge_count_does_not_preallocate(decoder_cls):
+    # The same hardening on the fixlen-array path, where the payload size is a
+    # *product* (count * element width) rather than a count of varints: 2^31-1
+    # fp64 elements claim a 16 GB payload. That size must be reached without
+    # materialising anything, and a message carrying none of it must fail
+    # promptly as truncated (INCOMPLETE).
+    # 0x05 = (0<<3)|ARRAY_FIXLEN, count = 0x7FFFFFFF, fixlen_word = (8<<3)|FP64.
+    data = [0x05] + _uvarint(0x7FFFFFFF) + _uvarint((8 << 3) | int(FixlenSubtype.FP64))
+    dec = decoder_cls(reader(data))
+    f = dec.next()
+    assert f is not None and f.count == 0x7FFFFFFF and f.size == 8
+    with pytest.raises(SofaIncompleteError):
+        dec.read_float64_array()
+
+    dec = decoder_cls(reader(data))
+    dec.next()
+    with pytest.raises(SofaIncompleteError):  # and the skip walk is bounded too
+        dec.skip()
+
+
+def test_fixlen_array_payload_beyond_the_address_space_is_truncated(monkeypatch):
+    # The 32-bit case of the test above, forced on a 64-bit host: there,
+    # count * element width can exceed what a Py_ssize_t — and therefore any
+    # real buffer — can index. Such a payload can never be satisfied, so it is
+    # §5.2's truncated read, not a raw OverflowError escaping from the read
+    # underneath (which would leave §6.3's outcome set and diverge from the
+    # native engine). Pure engine only: the native decoder does this arithmetic
+    # in C against the same ceiling, and its branch is invisible to coverage.py.
+    monkeypatch.setattr(_pydec_module, "sys", SimpleNamespace(maxsize=2**31 - 1))
+    data = [0x05] + _uvarint(0x7FFFFFFF) + _uvarint((8 << 3) | int(FixlenSubtype.FP64))
+
+    dec = _PyDecoder(reader(data))
+    f = dec.next()
+    assert f is not None and f.count * f.size > 2**31 - 1
+    with pytest.raises(SofaIncompleteError):
+        dec.read_float64_array()
+
+    dec = _PyDecoder(reader(data))
+    dec.next()
+    with pytest.raises(SofaIncompleteError):
+        dec.skip()
 
 
 def test_max_array_count_rejects_oversize_before_alloc():

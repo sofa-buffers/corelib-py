@@ -127,6 +127,25 @@ def test_encode_does_not_replace_or_drop():
     assert enc.getvalue() == b""
 
 
+def test_encode_refusal_is_latched_in_sticky_mode():
+    # §6.3: a sticky encoder records the first failure and turns every later
+    # write into a no-op instead of raising per call — the shape generated
+    # `serialize` code uses, checking `enc.error` once at the end. The
+    # strict-UTF-8 refusal has to travel that path like any other
+    # InvalidArgument: raising out of a sticky encoder would break the contract,
+    # and *not* recording it would let a message with a silently missing string
+    # field be handed back as if it were complete.
+    enc = Encoder(sticky=True)
+    enc.write_unsigned(1, 5)
+    enc.write_string(2, "x\ud800")  # refused — recorded, not raised
+    enc.write_unsigned(3, 6)  # a no-op behind the latched error
+
+    assert isinstance(enc.error, SofaRangeError)
+    reference = Encoder()
+    reference.write_unsigned(1, 5)
+    assert enc.getvalue() == reference.getvalue()  # only the pre-failure field
+
+
 def test_encode_surrogate_reconstructed_from_wire_bytes():
     # The surrogateescape trick the conformance runner uses maps invalid wire
     # bytes back to a str; encoding that str must still be refused (it is exactly
