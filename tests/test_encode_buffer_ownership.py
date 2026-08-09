@@ -121,6 +121,37 @@ def test_payload_longer_than_the_scratch_splits_across_drains(enc_cls):
 
 
 @pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_in_memory_model_drives_a_min_output_buffer(enc_cls):
+    """The in-memory model over the smallest buffer §5.1 admits.
+
+    ``MIN_OUTPUT_BUFFER`` is 1 because every atomic unit — a header varint, a
+    ``fixlen_word``, an element count, a scalar, one float — splits at any byte
+    boundary, so a one-byte buffer must already yield exactly the one-shot
+    bytes. Installing one on ``Encoder()`` puts the in-memory sink in the corner
+    it never otherwise reaches: every single write overflows the buffer, so the
+    result is assembled entirely out of drained pieces, starting with the very
+    first one — including the divisible ``string``/``blob`` runs, which are at
+    least as long as the whole buffer and are handed to the result directly.
+    """
+    def build(enc):
+        enc.write_unsigned(5, 300)
+        enc.write_signed(6, -70000)
+        enc.write_string(1, "hello, sofab")
+        enc.write_bytes(2, bytes(range(64)))
+        enc.write_float64(3, 3.14159265)
+        enc.write_unsigned_array(4, [0, 128, 70000])
+
+    expected = _oneshot(enc_cls, build)
+
+    tiny = enc_cls()
+    tiny.buffer_set(bytearray(MIN_OUTPUT_BUFFER), 0)
+    build(tiny)
+    tiny.flush()
+    assert tiny.bytes_used() <= MIN_OUTPUT_BUFFER
+    assert tiny.getvalue() == expected
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
 def test_writer_model_refuses_getvalue(enc_cls):
     """Bytes handed to the writer are gone; returning the undrained tail would be
     "partial output as if it were complete" (§5.1)."""
