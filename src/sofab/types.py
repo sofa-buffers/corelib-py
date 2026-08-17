@@ -140,21 +140,39 @@ class SofaLimitError(SofaError):
 
 
 class SofaRangeError(SofaError):
-    """A value (or id/count) is not writable on encode — the ``InvalidArgument``
-    outcome of CORELIB_PLAN §6.3.
+    """The caller's own request is invalid — the ``InvalidArgument`` outcome of
+    CORELIB_PLAN §6.3, which is the *only* code that taxonomy has for a caller
+    mistake (every remaining malformed input is :class:`SofaDecodeError`).
 
-    Either it is outside the permitted range, or it is not an integer at all:
-    integer fields accept whatever Python considers losslessly an integer (any
-    object with ``__index__`` — ``int``, ``bool``, ``IntEnum``, NumPy integers),
-    and refuse everything else rather than silently truncating it. A ``float`` is
-    therefore rejected, ``3.0`` included; convert explicitly with ``int(x)`` if
-    that is what you mean.
+    On encode, a value (or id/count) is not writable: either it is outside the
+    permitted range, or it is not an integer at all: integer fields accept
+    whatever Python considers losslessly an integer (any object with
+    ``__index__`` — ``int``, ``bool``, ``IntEnum``, NumPy integers), and refuse
+    everything else rather than silently truncating it. A ``float`` is therefore
+    rejected, ``3.0`` included; convert explicitly with ``int(x)`` if that is
+    what you mean. The same code covers the encoder's other invalid calls:
+    :meth:`~sofab.Encoder.getvalue` on a caller-owned fixed buffer, and a
+    sequence end without a matching begin.
+
+    On decode it means the decoder has **no value pending at all** — a typed read
+    issued before :meth:`~sofab.Decoder.next`, twice for one field, or on a
+    sequence start/end. It is *not* raised when a pending value's wire type
+    merely contradicts the read: that is MESSAGE_SPEC §7.3, which the typed reads
+    answer with ``None`` instead (see :class:`sofab.Decoder`).
     """
 
 
-class SofaStateError(SofaError):
-    """API misuse, e.g. reading a value of the wrong type for the current
-    field, or ending a sequence that was never started."""
+#: Deprecated alias for :class:`SofaRangeError`, kept so ``except
+#: SofaStateError`` still compiles.
+#:
+#: It used to be its own class covering "API misuse", a category CORELIB_PLAN
+#: §6.3 does not have: half of what it reported is an out-of-range argument
+#: (:class:`SofaRangeError`), and the other half — a read whose type contradicts
+#: the field on the wire — is not an error at all (MESSAGE_SPEC §7.3: the field
+#: is skipped like an unknown id and the typed read returns ``None``). Catching
+#: it therefore no longer detects a wrong-type read, and now also catches every
+#: other ``InvalidArgument``.
+SofaStateError = SofaRangeError
 
 
 class SofaBufferError(SofaError):

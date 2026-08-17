@@ -81,12 +81,14 @@ def test_fixlen_len_peeks_wire_byte_length_without_consuming():
     assert dec.bytes() == blob
 
 
-def test_fixlen_len_on_non_fixlen_field_raises():
-    from sofab import SofaStateError
+def test_fixlen_len_on_non_fixlen_field_returns_none():
+    from sofab import SofaRangeError
 
     dec = _roundtrip(lambda e: e.write_unsigned(0, 42))
     dec.next()  # a scalar (unsigned) field is not a fixlen value
-    with pytest.raises(SofaStateError):
+    assert dec.fixlen_len() is None  # §7.3: no fixlen length to report
+    assert dec.unsigned() == 42  # the peek consumed nothing either way
+    with pytest.raises(SofaRangeError):  # now there is no pending value at all
         dec.fixlen_len()
 
 

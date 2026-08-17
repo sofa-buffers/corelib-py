@@ -295,10 +295,13 @@ def test_decode_fp64_wrong_payload_length_raises():
         dec.next()
 
 
-# --------------- Decoder — wrong-type read → SofaStateError ------------------
+# ------------- Decoder — wrong-type read → §7.3 skip, not an error -----------
 
 
-def test_read_wrong_type_raises_state_error():
+def test_read_wrong_type_returns_none_and_leaves_the_field():
+    """MESSAGE_SPEC §7.3: a read whose type contradicts the field on the wire is
+    not an error — the field is skipped like an unknown id and the destination
+    stays untouched, which for a value-returning API means ``None``."""
     enc = Encoder()
     enc.write_unsigned(1, 5)
     enc.write_string(2, "hi")
@@ -308,27 +311,31 @@ def test_read_wrong_type_raises_state_error():
 
     dec = Decoder(io.BytesIO(data))
     dec.next()  # unsigned field
-    with pytest.raises(SofaStateError):
-        dec.float32()  # fixlen read on a scalar field
+    assert dec.float32() is None  # fixlen read on a scalar field
 
     dec.next()  # string (fixlen) field
-    with pytest.raises(SofaStateError):
-        dec.float64()  # wrong fixlen subtype
+    assert dec.float64() is None  # wrong fixlen subtype
 
     dec.next()  # unsigned array
-    with pytest.raises(SofaStateError):
-        dec.read_signed_array()  # wrong varint-array wire type
+    assert dec.read_signed_array() is None  # wrong varint-array wire type
 
     dec.next()  # fp32 array
-    with pytest.raises(SofaStateError):
-        dec.read_float64_array()  # wrong fixlen-array subtype
+    assert dec.read_float64_array() is None  # wrong fixlen-array subtype
+
+    # Nothing was consumed by any of the four refusals, so the stream is still
+    # exactly where it was: the last field is skipped by next(), which then
+    # reports clean EOF (the decode stays COMPLETE).
+    assert dec.next() is None
 
 
 def test_scalar_read_without_matching_field_raises():
     dec = Decoder(io.BytesIO(_hdr(1, WireType.UNSIGNED) + _varint(9)))
     dec.next()
     assert dec.unsigned() == 9
-    # no pending value now → asking again is a state error
+    # no pending value now → a caller mistake, the §6.3 InvalidArgument outcome
+    with pytest.raises(SofaRangeError):
+        dec.unsigned()
+    # and the deprecated alias still catches it
     with pytest.raises(SofaStateError):
         dec.unsigned()
 
@@ -416,11 +423,11 @@ def test_read_array_missing_element_at_boundary_raises():
         dec.read_unsigned_array()
 
 
-def test_read_float_array_on_non_fixlen_array_raises():
+def test_read_float_array_on_non_fixlen_array_returns_none():
     dec = Decoder(io.BytesIO(_hdr(1, WireType.UNSIGNED) + _varint(1)))
     dec.next()
-    with pytest.raises(SofaStateError):
-        dec.read_float32_array()  # current field is not a fixlen array at all
+    assert dec.read_float32_array() is None  # not a fixlen array at all → §7.3
+    assert dec.unsigned() == 1  # still pending: the right read still takes it
 
 
 # ------------- Encoder — error propagation through fixlen writers ------------

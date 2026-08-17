@@ -501,7 +501,6 @@ from .types import (
     SofaIncompleteError,
     SofaLimitError,
     SofaRangeError,
-    SofaStateError,
     WireType,
 )
 
@@ -880,7 +879,7 @@ cdef inline PyObject* _elem(list seq, Py_ssize_t i) except NULL:
     # count is already on the wire at this point, so a short read has to be an
     # error rather than a silently truncated array.
     if i >= PyList_GET_SIZE(seq):
-        raise SofaStateError("array shrank while it was being encoded")
+        raise SofaRangeError("array shrank while it was being encoded")
     return PyList_GET_ITEM(seq, i)
 
 cdef inline list _as_float_list(object values):
@@ -1227,7 +1226,7 @@ cdef class Encoder:
         # returning an undrained tail would be partial output dressed up as a
         # whole message (S5.1).
         if not self._in_memory:
-            raise SofaStateError("getvalue() is only valid for the in-memory model")
+            raise SofaRangeError("getvalue() is only valid for the in-memory model")
         if self._result is None:        # never drained: the message is the prefix
             return PyBytes_FromStringAndSize(
                 <char*>self._fixed_ptr, <Py_ssize_t>self._cursor)
@@ -1484,7 +1483,7 @@ cdef class Encoder:
             return
         try:
             if self._depth <= 0:
-                raise SofaStateError("sequence_end without matching begin")
+                raise SofaRangeError("sequence_end without matching begin")
             if self._npending:
                 # The innermost open sequence is the last held-back one (the
                 # pending run is a suffix), so dropping it is a plain pop.
@@ -1503,7 +1502,7 @@ cdef class Encoder:
             return
         try:
             if self._depth <= 0:
-                raise SofaStateError("sequence_end without matching begin")
+                raise SofaRangeError("sequence_end without matching begin")
             if self._npending:
                 self._commit_pending()
             self._emit_varint(<uint64_t>_WT_SEQUENCE_END)
@@ -2025,7 +2024,7 @@ cdef class Decoder:
             # before its payload is read or buffered — and PARKED on the pending
             # value rather than raised, so the caller keeps the §6.2.1 window in
             # which it can declare the field schema-bounded and take the cap off
-            # it. Every consume path raises it; see _park_limit / _pending_error.
+            # it. Every consume path raises it; see _park_limit / _mismatch.
             if subtype == _ST_STRING:
                 cap = self._max_string_len
                 if cap is not None and boxed > cap:
@@ -2101,14 +2100,23 @@ cdef class Decoder:
         self._limit_msg = msg
         return 0
 
-    cdef object _pending_error(self, msg):
-        # The exception a mismatched pending kind deserves: the parked cap
-        # rejection when one is what stands in the way, the caller's state error
-        # otherwise. Reached only once a read has already found the kind wrong,
-        # so the ordinary path never pays for it.
+    cdef object _mismatch(self):
+        # The answer a typed read owes a pending value whose wire tag
+        # contradicts it: None — MESSAGE_SPEC §7.3, not an error. The value
+        # stays pending, so the next next() (or an explicit skip()) discards it
+        # exactly like an unknown id, nothing is written to the caller, and the
+        # decode stays COMPLETE. Two conditions reach here that are not that:
+        # no pending value at all is a caller mistake (§6.3 InvalidArgument),
+        # and a parked receiver cap (§6.2.1) stands in the way of the skip as
+        # much as of the read — skipping still buffers the payload — and is a
+        # terminal rejection of the message. Both raise. Reached only once a
+        # read has found the kind wrong, so the ordinary path never pays for
+        # it. Mirrors Decoder._mismatch in the pure engine.
+        if self._pk == _PEND_NONE:
+            raise SofaRangeError("no value pending for the current field")
         if self._pk == _PEND_LIMIT:
-            return SofaLimitError(self._limit_msg)
-        return SofaStateError(msg)
+            raise SofaLimitError(self._limit_msg)
+        return None
 
     def schema_bounded(self):
         # Declare the current field schema-bounded, so the receiver-side caps do
@@ -2203,36 +2211,44 @@ cdef class Decoder:
             self._skip_pending()
         return 0
 
-    # --- scalar reads -------------------------------------------------------
+    # --- typed reads and §7.3 -----------------------------------------------
+    #
+    # Each read tests the whole tag of the pending value (wire type plus, for
+    # the fixlen kinds, the subtype) against the type it declares, in one
+    # combined test on the fast path, and hands every cold outcome to
+    # _mismatch. Mirrors Decoder._take_* in the pure engine — see the long note
+    # there.
 
-    cdef uint64_t _take_scalar(self, int wtype) except? 0xDEAD:
-        if self._pk != _PEND_SCALAR or self._pend_wtype != wtype:
-            raise SofaStateError("no matching scalar value for the current field")
+    cdef uint64_t _take_scalar(self) except? 0xDEAD:
+        # The tag is already matched by the caller (§7.3), so this only consumes.
         self._arm()
         cdef uint64_t value = self._varint()
         self._pk = _PEND_NONE   # committed only once the value is in hand (§5.2)
         return value
 
     def unsigned(self):
-        return PyLong_FromUnsignedLongLong(self._take_scalar(_WT_UNSIGNED))
+        if self._pk != _PEND_SCALAR or self._pend_wtype != _WT_UNSIGNED:
+            return self._mismatch()
+        return PyLong_FromUnsignedLongLong(self._take_scalar())
 
     def signed(self):
-        return PyLong_FromLongLong(_zigzag_decode(self._take_scalar(_WT_SIGNED)))
+        if self._pk != _PEND_SCALAR or self._pend_wtype != _WT_SIGNED:
+            return self._mismatch()
+        return PyLong_FromLongLong(_zigzag_decode(self._take_scalar()))
 
     def bool(self):
-        return self._take_scalar(_WT_UNSIGNED) != 0
+        if self._pk != _PEND_SCALAR or self._pend_wtype != _WT_UNSIGNED:
+            return self._mismatch()
+        return self._take_scalar() != 0
 
-    cdef const unsigned char* _take_fixlen_ptr(self, int subtype, Py_ssize_t n) except NULL:
+    cdef const unsigned char* _take_fixlen_ptr(self, Py_ssize_t n) except NULL:
         # Fixlen payload as a pointer instead of a ``bytes``. When the payload is
         # already buffered — the ordinary case — the value can be built straight
         # off the buffer, so the copy the intermediate ``bytes`` object used to
         # cost disappears. When it is not (a chunk-fed reader mid-payload), fall
         # back to _read_exact and park its object in ``_spill``, which owns it
-        # for as long as the caller can still hold the pointer.
-        if self._pk != _PEND_FIXLEN:
-            raise self._pending_error("current field is not a fixlen value")
-        if self._pend_subtype != subtype:
-            raise SofaStateError("fixlen subtype does not match the requested read")
+        # for as long as the caller can still hold the pointer. The whole tag
+        # is already matched by the caller (§7.3), so this only consumes.
         cdef const unsigned char* p
         if self._n - self._pos >= n:
             self._pk = _PEND_NONE
@@ -2249,10 +2265,14 @@ cdef class Decoder:
 
     def float32(self):
         # Width is settled at header time (§4.6/§7), so _pend_size is 4 here.
-        return _unpack_f32(self._take_fixlen_ptr(_ST_FP32, 4))
+        if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_FP32:
+            return self._mismatch()
+        return _unpack_f32(self._take_fixlen_ptr(4))
 
     def float64(self):
-        return _unpack_f64(self._take_fixlen_ptr(_ST_FP64, 8))
+        if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_FP64:
+            return self._mismatch()
+        return _unpack_f64(self._take_fixlen_ptr(8))
 
     def fixlen_len(self):
         # Peek the current fixlen field's payload byte length (from its length
@@ -2266,18 +2286,22 @@ cdef class Decoder:
             # parked rejection. That is what lets generated code decide the
             # SCHEMA bound (INVALID, §7.1) whether or not schema_bounded() has
             # been called yet. Mirrors Decoder.fixlen_len in the pure engine.
+            # ... and, for the same reason, it does not re-raise the cap the
+            # way a consuming read does.
             if self._pk == _PEND_LIMIT and self._pk_real == _PEND_FIXLEN:
                 return self._pend_size
-            raise SofaStateError("current field is not a fixlen value")
+            if self._pk == _PEND_NONE:
+                raise SofaRangeError("no value pending for the current field")
+            return None  # §7.3: not a fixlen field, so it has no fixlen length
         return self._pend_size
 
     def string(self):
         cdef Py_ssize_t n
         cdef const unsigned char* p
-        if self._pk != _PEND_FIXLEN:
-            raise self._pending_error("current field is not a fixlen value")
+        if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_STRING:
+            return self._mismatch()
         n = <Py_ssize_t>self._pend_size      # bounded by FIXLEN_MAX in next()
-        p = self._take_fixlen_ptr(_ST_STRING, n)
+        p = self._take_fixlen_ptr(n)
         try:
             # Decoded straight off the buffer: strict UTF-8 (no ``errors=``), so
             # an invalid payload raises rather than being replaced (§6.4).
@@ -2288,29 +2312,27 @@ cdef class Decoder:
     def bytes(self):
         cdef Py_ssize_t n
         cdef const unsigned char* p
-        if self._pk != _PEND_FIXLEN:
-            raise self._pending_error("current field is not a fixlen value")
+        if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_BLOB:
+            return self._mismatch()
         n = <Py_ssize_t>self._pend_size
-        p = self._take_fixlen_ptr(_ST_BLOB, n)
+        p = self._take_fixlen_ptr(n)
         if self._spill is not None:
             return self._spill      # already an exact-size bytes; hand it over
         return PyBytes_FromStringAndSize(<const char*>p, n)
 
     # --- array reads --------------------------------------------------------
 
-    cdef uint64_t _take_varray(self, int wtype) except? 0xDEAD:
-        # Validates the pending array and returns its count. The pending value is
-        # cleared by the caller only once the payload has actually been decoded,
-        # so a suspension leaves the array re-readable from element one (§5.2).
-        if self._pk != _PEND_VARRAY or self._pend_wtype != wtype:
-            raise self._pending_error("current field is not a matching varint array")
-        return self._pend_count
-
     def read_unsigned_array(self, elem_max=None):
         # elem_max is the field's declared element width; see the pure engine's
-        # Decoder.read_unsigned_array for what it buys (§7.1/§5.2, #267).
-        cdef uint64_t count = self._take_varray(_WT_ARRAY_UNSIGNED)
+        # Decoder.read_unsigned_array for what it buys (§7.1/§5.2, #267). The
+        # pending value is cleared only once the payload has actually been
+        # decoded, so a suspension leaves the array re-readable from element
+        # one (§5.2).
+        cdef uint64_t count
         cdef list out
+        if self._pk != _PEND_VARRAY or self._pend_wtype != _WT_ARRAY_UNSIGNED:
+            return self._mismatch()
+        count = self._pend_count
         self._arm()
         if elem_max is None:
             out = self._read_varints(<Py_ssize_t>count, False, False, 0, 0)
@@ -2326,10 +2348,13 @@ cdef class Decoder:
         # given on its own, in which case it bounds its own side and the other
         # stays at the widest an i64 element can be — passing one alone must not
         # fault on the missing half (issue #67).
-        cdef uint64_t count = self._take_varray(_WT_ARRAY_SIGNED)
+        cdef uint64_t count
         cdef list out
         cdef int64_t lo = INT64_MIN
         cdef int64_t hi = INT64_MAX
+        if self._pk != _PEND_VARRAY or self._pend_wtype != _WT_ARRAY_SIGNED:
+            return self._mismatch()
+        count = self._pend_count
         self._arm()
         if elem_min is None and elem_max is None:
             out = self._read_varints(<Py_ssize_t>count, True, False, 0, 0)
@@ -2342,24 +2367,21 @@ cdef class Decoder:
         self._pk = _PEND_NONE   # committed only once the payload is in hand
         return out
 
-    cdef bytes _take_farray_payload(self, int subtype):
-        # Validate the pending fixlen array, then read its payload inside a
-        # resume transaction: an array whose payload has not fully arrived stays
-        # pending and re-readable from its first payload byte (§5.2). Like
-        # _take_varray, the pending value is cleared only once the payload is in
-        # hand — the count and element width stay in the decoder's C fields
-        # rather than being handed back through a tuple nobody outlives.
+    cdef bytes _take_farray_payload(self):
+        # Read the pending fixlen array's payload inside a resume transaction: an
+        # array whose payload has not fully arrived stays pending and re-readable
+        # from its first payload byte (§5.2). Like the varint arrays, the pending
+        # value is cleared only once the payload is in hand — the count and
+        # element width stay in the decoder's C fields rather than being handed
+        # back through a tuple nobody outlives. The whole tag is already matched
+        # by the caller (§7.3).
         cdef bytes data
-        if self._pk != _PEND_FARRAY:
-            raise self._pending_error("current field is not a fixlen array")
-        if self._pend_subtype != subtype:
-            raise SofaStateError("fixlen-array subtype does not match the requested read")
         self._arm()
         data = self._read_exact(self._farray_nbytes(self._pend_count, self._pend_size))
         self._pk = _PEND_NONE   # committed only once the payload is in hand
         return data
 
-    cdef list _read_farray(self, int subtype, Py_ssize_t width):
+    cdef object _read_farray(self, int subtype, Py_ssize_t width):
         # The element width is settled at the fixlen_word by next() — §4.8 fixes
         # it to 4 for fp32 and 8 for fp64, and §5.2 wants that INVALID verdict
         # before any payload read — so a pending array always matches ``width``
@@ -2368,7 +2390,12 @@ cdef class Decoder:
         # reach (issue #75). The unpack loop stays in bounds regardless: it
         # derives its element count from the buffer it actually holds, never
         # from the wire.
-        cdef bytes data = self._take_farray_payload(subtype)
+        #
+        # §4.8: a fixlen array always carries its fixlen_word, so the subtype is
+        # known even for a zero-count array — check it like any other read.
+        if self._pk != _PEND_FARRAY or self._pend_subtype != subtype:
+            return self._mismatch()
+        cdef bytes data = self._take_farray_payload()
         cdef const unsigned char* p = <const unsigned char*>PyBytes_AS_STRING(data)
         cdef Py_ssize_t count = PyBytes_GET_SIZE(data) // width
         cdef list out = PyList_New(count)

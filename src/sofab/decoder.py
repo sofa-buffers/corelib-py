@@ -50,7 +50,7 @@ from .types import (
     SofaDecodeError,
     SofaIncompleteError,
     SofaLimitError,
-    SofaStateError,
+    SofaRangeError,
     WireType,
 )
 
@@ -65,7 +65,7 @@ _FARRAY = 3
 # A pending value a receiver-side cap has rejected (§6.2.1). The real pending
 # tuple is parked inside it — ``(_LIMIT, message, pending)`` — so the rejection
 # can still be waived by :meth:`Decoder.schema_bounded` and so a peek can read
-# through it. Every consume path re-raises it; see ``_pending_error``.
+# through it. Every consume path re-raises it; see ``_mismatch``.
 _LIMIT = 4
 
 # Wire-type members indexed by their integer value, so the per-field hot path
@@ -91,6 +91,18 @@ class Decoder:
     methods (:meth:`unsigned`, :meth:`string`, :meth:`read_float64_array`, …)
     to consume its value, or :meth:`skip` to discard it. Alternatively hand a
     :class:`sofab.Visitor` to :meth:`drive` for callback-style decoding.
+
+    **A typed read whose type contradicts the field on the wire is not an
+    error** (MESSAGE_SPEC §7.3, CORELIB_PLAN §6.3). It returns ``None`` and
+    consumes nothing, so the field is skipped by the following :meth:`next` just
+    like a field with an unknown id, and the decode stays COMPLETE — reading a
+    STRING field with :meth:`float64` yields ``None``, not an exception.
+    Generated code tests :attr:`Field.type` / :attr:`Field.subtype` before
+    reading and so never sees this; hand-written callers should either do the
+    same or treat ``None`` as "not my field". A read issued when there is **no**
+    pending value at all — before the first :meth:`next`, twice for one field, or
+    on a sequence start/end — is a caller mistake and raises
+    :class:`sofab.SofaRangeError`.
     """
 
     def __init__(
@@ -546,7 +558,7 @@ class Decoder:
             # before its payload is read or buffered, which is where §6.2.1 wants
             # it — and parked on the pending value rather than raised. Nothing is
             # read or allocated until the field is consumed, and every consume
-            # path raises it (``_pending_error``), so deferring the raise by one
+            # path raises it (``_mismatch``), so deferring the raise by one
             # call costs the protection nothing; what it buys is the window
             # §6.2.1 requires, in which the caller can declare the field
             # schema-bounded and take the cap off it (:meth:`schema_bounded`).
@@ -653,17 +665,25 @@ class Decoder:
             self._pending = pending[2]
 
     @staticmethod
-    def _pending_error(pending: tuple[Any, ...] | None, msg: str) -> Exception:
-        """Build the exception a mismatched pending value deserves: the parked
-        receiver-cap rejection (§6.2.1) when one is what is standing in the way,
-        and the caller's state error otherwise.
+    def _mismatch(pending: tuple[Any, ...] | None) -> None:
+        """The answer a typed read owes a pending value whose wire tag
+        contradicts it: ``None`` — see "typed reads and §7.3" below.
+
+        Two conditions reach here that are not that. No pending value **at all**
+        is a caller mistake, the §6.3 ``InvalidArgument`` outcome. And a parked
+        receiver-cap rejection (§6.2.1) stands in the way of the skip as much as
+        of the read — skipping the field still buffers its payload (see
+        :meth:`_skip_pending`) — and is a terminal rejection of the *message*,
+        not an answer about one read. Both raise.
 
         Reached only from paths that have already found the pending kind wrong,
         so the ordinary read costs nothing for it.
         """
-        if pending is not None and pending[0] == _LIMIT:
-            return SofaLimitError(pending[1])
-        return SofaStateError(msg)
+        if pending is None:
+            raise SofaRangeError("no value pending for the current field")
+        if pending[0] == _LIMIT:
+            raise SofaLimitError(pending[1])
+        return None
 
     # --- skipping -----------------------------------------------------------
 
@@ -741,6 +761,11 @@ class Decoder:
         hooks (see :class:`sofab.Visitor`). A visitor may decline a field via
         ``on_field`` / ``on_sequence_begin`` returning ``False`` to skip it
         without paying the decode cost."""
+        # Every read below is dispatched on the field's *own* wire type, so its
+        # tag matches by construction and none of them can return the §7.3
+        # ``None`` — which is what the ignores below say to mypy. There is no
+        # §7.3 mismatch to answer here at all: a visitor declares nothing about a
+        # field's type, it simply declines the fields it does not want.
         while (f := self.next()) is not None:
             t = f.type
             if t == WireType.SEQUENCE_END:
@@ -751,90 +776,120 @@ class Decoder:
             elif visitor.on_field(f) is False:
                 self.skip()
             elif t == WireType.UNSIGNED:
-                visitor.on_unsigned(f.id, self.unsigned())
+                visitor.on_unsigned(f.id, self.unsigned())  # type: ignore[arg-type]
             elif t == WireType.SIGNED:
-                visitor.on_signed(f.id, self.signed())
+                visitor.on_signed(f.id, self.signed())  # type: ignore[arg-type]
             elif t == WireType.FIXLEN:
                 st = f.subtype
                 if st == FixlenSubtype.FP32:
-                    visitor.on_float32(f.id, self.float32())
+                    visitor.on_float32(f.id, self.float32())  # type: ignore[arg-type]
                 elif st == FixlenSubtype.FP64:
-                    visitor.on_float64(f.id, self.float64())
+                    visitor.on_float64(f.id, self.float64())  # type: ignore[arg-type]
                 elif st == FixlenSubtype.STRING:
-                    visitor.on_string(f.id, self.string())
+                    visitor.on_string(f.id, self.string())  # type: ignore[arg-type]
                 else:
-                    visitor.on_bytes(f.id, self.bytes())
+                    visitor.on_bytes(f.id, self.bytes())  # type: ignore[arg-type]
             elif t == WireType.ARRAY_UNSIGNED:
-                visitor.on_unsigned_array(f.id, self.read_unsigned_array())
+                visitor.on_unsigned_array(f.id, self.read_unsigned_array())  # type: ignore[arg-type]
             elif t == WireType.ARRAY_SIGNED:
-                visitor.on_signed_array(f.id, self.read_signed_array())
+                visitor.on_signed_array(f.id, self.read_signed_array())  # type: ignore[arg-type]
             else:  # ARRAY_FIXLEN
                 if f.subtype == FixlenSubtype.FP32:
-                    visitor.on_float32_array(f.id, self.read_float32_array())
+                    visitor.on_float32_array(f.id, self.read_float32_array())  # type: ignore[arg-type]
                 else:
-                    visitor.on_float64_array(f.id, self.read_float64_array())
+                    visitor.on_float64_array(f.id, self.read_float64_array())  # type: ignore[arg-type]
 
-    # --- scalar reads -------------------------------------------------------
+    # --- typed reads and §7.3 -----------------------------------------------
+    #
+    # Every typed read below compares the whole tag of the pending value — the
+    # wire type plus, for the fixlen kinds, the subtype, since fp32/fp64/string/
+    # blob share WireType.FIXLEN — against the type the read declares, and
+    # answers a contradiction the way MESSAGE_SPEC §7.3 requires: **not** as an
+    # error. The field is left pending and unconsumed, so the next `next()` (or
+    # an explicit `skip()`) discards it exactly like a field with an unknown id,
+    # the caller's destination is never written, and a decode that meets nothing
+    # else stays COMPLETE. The read reports that by returning None — the one
+    # answer that cannot be mistaken for a decoded value; returning a zero would
+    # be writing the destination, which is what §7.3 forbids. Because the value
+    # is still pending, a caller may immediately re-read the same field with the
+    # type the wire actually carries.
+    #
+    # Having **no** pending value at all is the other half, and is a genuine
+    # caller mistake — a read before next(), a second read of one field, or a
+    # read on a sequence start/end. CORELIB_PLAN §6.3 has exactly one code for
+    # that, InvalidArgument, so it raises SofaRangeError.
 
-    def _take_scalar(self, wtype: WireType) -> int:
+    def _take_scalar(self, wtype: WireType) -> int | None:
         pending = self._pending
         if pending is None or pending[0] != _SCALAR or pending[1] != wtype:
-            raise SofaStateError("no matching scalar value for the current field")
+            return self._mismatch(pending)  # §7.3
         self._keep = self._pos
         value = self._varint()
         self._pending = None  # committed only once the value is in hand (§5.2)
         return value
 
-    def unsigned(self) -> int:
+    def unsigned(self) -> int | None:
         """Consume the current field as an unsigned integer.
 
-        Raises :class:`SofaStateError` if the current field is not unsigned.
+        Returns ``None`` if the field is not unsigned (§7.3), leaving it for the
+        skip; raises :class:`SofaRangeError` if no value is pending at all.
         """
         return self._take_scalar(WireType.UNSIGNED)
 
-    def signed(self) -> int:
+    def signed(self) -> int | None:
         """Consume the current field as a ZigZag-decoded signed integer.
 
-        Raises :class:`SofaStateError` if the current field is not signed.
+        Returns ``None`` if the field is not signed (§7.3), leaving it for the
+        skip; raises :class:`SofaRangeError` if no value is pending at all.
         """
-        return zigzag_decode(self._take_scalar(WireType.SIGNED))
+        raw = self._take_scalar(WireType.SIGNED)
+        return None if raw is None else zigzag_decode(raw)
 
-    def bool(self) -> bool:
-        """Consume the current unsigned field as a boolean (non-zero is true)."""
-        return self._take_scalar(WireType.UNSIGNED) != 0
+    def bool(self) -> bool | None:
+        """Consume the current unsigned field as a boolean (non-zero is true).
 
-    def _take_fixlen(self, subtype: FixlenSubtype) -> bytes:
+        Returns ``None`` if the field is not unsigned (§7.3), leaving it for the
+        skip; raises :class:`SofaRangeError` if no value is pending at all. Test
+        it with ``is True`` / ``is not None`` rather than truthiness, which cannot
+        tell ``None`` apart from ``False``.
+        """
+        raw = self._take_scalar(WireType.UNSIGNED)
+        return None if raw is None else raw != 0
+
+    def _take_fixlen(self, subtype: FixlenSubtype) -> bytes | None:
         pending = self._pending
-        if pending is None or pending[0] != _FIXLEN:
-            raise self._pending_error(pending, "current field is not a fixlen value")
-        if pending[1] != subtype:
-            raise SofaStateError("fixlen subtype does not match the requested read")
+        if pending is None or pending[0] != _FIXLEN or pending[1] != subtype:
+            return self._mismatch(pending)  # §7.3
         self._keep = self._pos
         data = self._read_exact(pending[2])
         self._pending = None  # committed only once the payload is in hand (§5.2)
         return data
 
-    def float32(self) -> float:
+    def float32(self) -> float | None:
         """Consume the current fixlen field as a 32-bit IEEE-754 float.
 
-        Raises :class:`SofaStateError` if the field is not an fp32 fixlen. The
-        payload is necessarily 4 bytes: §4.6's width rule is settled at the
+        Returns ``None`` if the field is not an fp32 fixlen (§7.3), leaving it
+        for the skip; raises :class:`SofaRangeError` if no value is pending at
+        all. The payload is necessarily 4 bytes: §4.6's width rule is settled at the
         length header by :meth:`next`, which is where §5.2 wants that INVALID
         verdict reached — before any payload read, so it outranks a truncation
         behind it. Re-deciding the width here could only restate a check no
         input can reach (the native engine does not carry one either).
         """
-        return _core.unpack_f32(self._take_fixlen(FixlenSubtype.FP32))
+        data = self._take_fixlen(FixlenSubtype.FP32)
+        return None if data is None else _core.unpack_f32(data)
 
-    def float64(self) -> float:
+    def float64(self) -> float | None:
         """Consume the current fixlen field as a 64-bit IEEE-754 float.
 
-        Raises :class:`SofaStateError` if the field is not an fp64 fixlen; the
-        payload is necessarily 8 bytes (see :meth:`float32`).
+        Returns ``None`` if the field is not an fp64 fixlen (§7.3), leaving it
+        for the skip; raises :class:`SofaRangeError` if no value is pending at
+        all. The payload is necessarily 8 bytes (see :meth:`float32`).
         """
-        return _core.unpack_f64(self._take_fixlen(FixlenSubtype.FP64))
+        data = self._take_fixlen(FixlenSubtype.FP64)
+        return None if data is None else _core.unpack_f64(data)
 
-    def fixlen_len(self) -> int:
+    def fixlen_len(self) -> int | None:
         """Return the current fixlen field's payload byte length without consuming it.
 
         The length is read straight from the field's length header, so this is a
@@ -846,44 +901,53 @@ class Decoder:
         to measure it (the string field is UTF-8 on the wire, so the payload byte
         length is the length ``maxlen`` bounds).
 
-        Raises :class:`SofaStateError` if the current field is not a fixlen value.
+        Returns ``None`` if the current field is not a fixlen value at all
+        (§7.3) — there is no fixlen length to report, and nothing is consumed
+        either way; raises :class:`SofaRangeError` if no value is pending.
         """
         pending = self._pending
-        if pending is None or pending[0] != _FIXLEN:
+        if pending is None:
+            raise SofaRangeError("no value pending for the current field")
+        if pending[0] != _FIXLEN:
             # A parked receiver-cap rejection (§6.2.1) keeps the real pending
             # value inside it, and this peek reads nothing and allocates
-            # nothing — so it answers through the wrapper. That is deliberate:
-            # this is the length generated code measures the SCHEMA bound
-            # against, and that bound's INVALID outranks the cap (§7.1), so it
-            # must be decidable whether or not :meth:`schema_bounded` has been
-            # called yet.
-            if pending is not None and pending[0] == _LIMIT and pending[2][0] == _FIXLEN:
+            # nothing — so it answers through the wrapper, and for the same
+            # reason it does not re-raise the cap the way a consuming read
+            # does. That is deliberate: this is the length generated code
+            # measures the SCHEMA bound against, and that bound's INVALID
+            # outranks the cap (§7.1), so it must be decidable whether or not
+            # :meth:`schema_bounded` has been called yet.
+            if pending[0] == _LIMIT and pending[2][0] == _FIXLEN:
                 return int(pending[2][2])
-            raise SofaStateError("current field is not a fixlen value")
+            return None  # §7.3: not a fixlen field, so it has no fixlen length
         return int(pending[2])
 
-    def string(self) -> str:
+    def string(self) -> str | None:
         """Consume the current fixlen field as a UTF-8 decoded string.
 
-        Raises :class:`SofaStateError` if the field is not a STRING fixlen, or
-        :class:`SofaDecodeError` if the payload is not valid UTF-8.
+        Returns ``None`` if the field is not a STRING fixlen (§7.3), leaving it
+        for the skip; raises :class:`SofaRangeError` if no value is pending at
+        all, or :class:`SofaDecodeError` if the payload is not valid UTF-8.
         """
         raw = self._take_fixlen(FixlenSubtype.STRING)
+        if raw is None:
+            return None
         try:
             return raw.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise SofaDecodeError("invalid UTF-8 in string field") from exc
 
-    def bytes(self) -> bytes:
+    def bytes(self) -> bytes | None:
         """Consume the current fixlen field as a raw byte blob.
 
-        Raises :class:`SofaStateError` if the field is not a BLOB fixlen.
+        Returns ``None`` if the field is not a BLOB fixlen (§7.3), leaving it for
+        the skip; raises :class:`SofaRangeError` if no value is pending at all.
         """
         return self._take_fixlen(FixlenSubtype.BLOB)
 
     # --- array reads --------------------------------------------------------
 
-    def _take_varray(self, wtype: WireType) -> int:
+    def _take_varray(self, wtype: WireType) -> int | None:
         """Validate the pending array and return its count.
 
         The pending value is *not* cleared here — the caller clears it once the
@@ -892,10 +956,10 @@ class Decoder:
         """
         pending = self._pending
         if pending is None or pending[0] != _VARRAY or pending[1] != wtype:
-            raise self._pending_error(pending, "current field is not a matching varint array")
+            return self._mismatch(pending)  # §7.3
         return int(pending[2])
 
-    def read_unsigned_array(self, elem_max: int | None = None) -> list[int]:
+    def read_unsigned_array(self, elem_max: int | None = None) -> list[int] | None:
         """Consume the current field as a list of unsigned integers.
 
         Pass the schema's declared element width as ``elem_max`` (``255`` for a
@@ -907,9 +971,13 @@ class Decoder:
         Omit for ``u64``, whose range is the value domain, and for an unbounded
         consumer.
 
-        Raises :class:`SofaStateError` if the field is not an unsigned array.
+        Returns ``None`` if the field is not an unsigned array (§7.3), leaving it
+        for the skip; raises :class:`SofaRangeError` if no value is pending at
+        all.
         """
         count = self._take_varray(WireType.ARRAY_UNSIGNED)
+        if count is None:
+            return None
         self._keep = self._pos
         # No lower bound: an unsigned element decodes to 0..2**64-1 by
         # construction, so passing 0 would only cost the loop a compare per
@@ -922,16 +990,20 @@ class Decoder:
         self,
         elem_min: int | None = None,
         elem_max: int | None = None,
-    ) -> list[int]:
+    ) -> list[int] | None:
         """Consume the current field as a list of ZigZag-decoded signed integers.
 
         ``elem_min``/``elem_max`` bound each element to its declared width — see
         :meth:`read_unsigned_array`. Either may be given on its own, which bounds
         that side and leaves the other open.
 
-        Raises :class:`SofaStateError` if the field is not a signed array.
+        Returns ``None`` if the field is not a signed array (§7.3), leaving it
+        for the skip; raises :class:`SofaRangeError` if no value is pending at
+        all.
         """
         count = self._take_varray(WireType.ARRAY_SIGNED)
+        if count is None:
+            return None
         self._keep = self._pos
         # ZigZag inlined rather than calling zigzag_decode per element: the
         # transform is two operations, the call around it was the expensive part.
@@ -942,24 +1014,26 @@ class Decoder:
         self._pending = None  # committed only once the payload is in hand (§5.2)
         return out
 
-    def _take_farray(self, subtype: FixlenSubtype) -> tuple[int, int]:
+    def _take_farray(self, subtype: FixlenSubtype) -> tuple[int, int] | None:
         pending = self._pending
-        if pending is None or pending[0] != _FARRAY:
-            raise self._pending_error(pending, "current field is not a fixlen array")
         # §4.8: a fixlen array always carries its fixlen_word, so the subtype is
         # known even for a zero-count array — check it like any other read.
-        if pending[1] != subtype:
-            raise SofaStateError("fixlen-array subtype does not match the requested read")
+        if pending is None or pending[0] != _FARRAY or pending[1] != subtype:
+            return self._mismatch(pending)  # §7.3
         # Like _take_varray, the pending value is cleared by the caller only
         # after the payload has been read (§5.2).
         return int(pending[2]), int(pending[3])  # count, elem_size
 
-    def read_float32_array(self) -> list[float]:
+    def read_float32_array(self) -> list[float] | None:
         """Consume the current field as a list of 32-bit IEEE-754 floats.
 
-        Raises :class:`SofaStateError` if the field is not an fp32 array.
+        Returns ``None`` if the field is not an fp32 array (§7.3), leaving it for
+        the skip; raises :class:`SofaRangeError` if no value is pending at all.
         """
-        count, elem_size = self._take_farray(FixlenSubtype.FP32)
+        taken = self._take_farray(FixlenSubtype.FP32)
+        if taken is None:
+            return None
+        count, elem_size = taken
         self._keep = self._pos
         # ``elem_size`` is necessarily 4 here: §4.8's width rule is settled at
         # the fixlen_word by ``next()``, which is where §5.2 wants that INVALID
@@ -971,12 +1045,16 @@ class Decoder:
         self._pending = None  # committed only once the payload is in hand (§5.2)
         return _core.unpack_f32_array(data, count)
 
-    def read_float64_array(self) -> list[float]:
+    def read_float64_array(self) -> list[float] | None:
         """Consume the current field as a list of 64-bit IEEE-754 floats.
 
-        Raises :class:`SofaStateError` if the field is not an fp64 array.
+        Returns ``None`` if the field is not an fp64 array (§7.3), leaving it for
+        the skip; raises :class:`SofaRangeError` if no value is pending at all.
         """
-        count, elem_size = self._take_farray(FixlenSubtype.FP64)
+        taken = self._take_farray(FixlenSubtype.FP64)
+        if taken is None:
+            return None
+        count, elem_size = taken
         self._keep = self._pos
         # ``elem_size`` is necessarily 8 here; see read_float32_array.
         data = self._read_exact(self._farray_nbytes(count, elem_size))

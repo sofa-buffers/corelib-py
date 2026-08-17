@@ -75,7 +75,7 @@ same string.
 | Reserve-offset | `Encoder.over_buffer(buf, offset=…)` leaves room at the front of the buffer for a lower-layer protocol header; a sink calling `buffer_set(buf, offset)` re-arms that room for **every** flushed packet. |
 | Sparse sequences | `write_sequence_begin_lazy` holds a sequence header back until the sequence receives content, so a sequence-typed field equal to its declared default is **omitted** rather than framed empty (MESSAGE_SPEC §2) — decided in one forward pass, without buffering the sub-message. `write_sequence_end` drops a contentless sequence; `write_sequence_end_keep` forces the frame out where presence itself carries meaning — a wrapper-array **element** is still always framed, even when all-default, because element presence is what carries a dynamic array's length (§5.1). |
 | Typed | Fully type-annotated with a `py.typed` marker (PEP 561); clean under `mypy --strict`. |
-| Forward/backward compatible | Unknown fields are consumed with `skip()` — *consumed*, not copied: the payload is stepped over, never materialized. |
+| Forward/backward compatible | Unknown fields are consumed with `skip()` — *consumed*, not copied: the payload is stepped over, never materialized. A field whose wire type contradicts the read is the same situation and takes the same path (MESSAGE_SPEC §7.3, see [Deserialize](#deserialize)). |
 
 ## Usage
 
@@ -154,6 +154,20 @@ while (field := dec.next()) is not None:   # None == clean EOF
     elif field.id == 3: s = dec.string()
     else:               dec.skip()         # unknown field
 ```
+
+**A read whose type contradicts the field on the wire is not an error**
+(MESSAGE_SPEC §7.3): it returns `None` and consumes nothing, so the field is
+skipped by the following `next()` exactly like a field with an unknown id and the
+decode stays complete — `dec.float64()` on a `string` field yields `None`, not an
+exception. Test `field.type` / `field.subtype` before reading (this is what
+generated code does) or treat `None` as "not my field"; because nothing was
+consumed, re-reading the same field with the type the wire carries still works. A
+read issued when there is **no** pending value at all — before the first `next()`,
+twice for one field, or on a sequence start/end — is a caller mistake and raises
+`SofaRangeError` (§6.3 `InvalidArgument`, the only code that taxonomy has for
+one). `SofaStateError` is now a deprecated alias of `SofaRangeError`: catching it
+no longer detects a wrong-type read, because there is no longer an exception to
+catch.
 
 ### Deserialize stream
 
@@ -383,7 +397,7 @@ never provides a value buffer.**
     forwards each bufferful to `writer.write` — §5.1's "unbounded schema" shape.
     A 100 MB message costs 1 KiB of encoder memory, and the bytes leave *while*
     the message is written, not at `flush()`. Nothing is retained, so
-    `getvalue()` raises `SofaStateError`: returning the undrained tail would be
+    `getvalue()` raises `SofaRangeError`: returning the undrained tail would be
     partial output dressed up as a whole message.
   * `Encoder()` is the same scratch buffer with the sink appending into the
     *result* — the message `getvalue()` hands back, joined from the drained

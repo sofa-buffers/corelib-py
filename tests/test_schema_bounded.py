@@ -27,7 +27,6 @@ from sofab import (
     SofaDecodeError,
     SofaIncompleteError,
     SofaLimitError,
-    SofaStateError,
 )
 
 BIG = "x" * 2000
@@ -254,13 +253,15 @@ def test_a_capped_field_read_as_the_wrong_type_reports_the_cap(engine):
 @pytest.mark.parametrize("engine", ENGINES)
 def test_fixlen_len_still_refuses_a_capped_array(engine):
     # The peek answers for a fixlen field only: a capped ARRAY states a count,
-    # not a payload byte length, so it is the wrong shape for it either way.
+    # not a payload byte length, so it is the wrong shape for it either way — and
+    # it answers that the same way it does for an uncapped array, with the §7.3
+    # ``None``. The cap is not re-raised here: the peek reads and allocates
+    # nothing, which is why it answers through a parked rejection at all.
     enc = Encoder()
     enc.write_unsigned_array(1, list(range(6)))
     dec = _dec(engine, enc.getvalue(), max_array_count=5)
     assert dec.next() is not None
-    with pytest.raises(SofaStateError):
-        dec.fixlen_len()
+    assert dec.fixlen_len() is None
 
 
 # --- the schema bound is the caller's to enforce, as INVALID -----------------
