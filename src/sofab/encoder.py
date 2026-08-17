@@ -65,7 +65,6 @@ from .types import (
     SofaBufferError,
     SofaError,
     SofaRangeError,
-    SofaStateError,
     WireType,
 )
 
@@ -355,10 +354,10 @@ class Encoder:
         been handed over, and with :meth:`over_buffer` they are in the caller's
         buffer — returning the undrained tail of either would be partial output
         dressed up as a whole message (CORELIB_PLAN §5.1), so both raise
-        :class:`SofaStateError`.
+        :class:`SofaRangeError`.
         """
         if not self._in_memory:
-            raise SofaStateError("getvalue() is only valid for the in-memory model")
+            raise SofaRangeError("getvalue() is only valid for the in-memory model")
         chunks = self._result
         if chunks is None:  # never drained: the message is the buffer prefix
             return bytes(self._fixed[0 : self._cursor])
@@ -761,13 +760,13 @@ class Encoder:
         is the empty collection (MESSAGE_SPEC §2). Where the frame must be
         visible, close with :meth:`write_sequence_end_keep` instead.
 
-        Raises :class:`SofaStateError` if no sequence is currently open.
+        Raises :class:`SofaRangeError` if no sequence is currently open.
         """
         if not self._begin():
             return
         try:
             if self._depth <= 0:
-                raise SofaStateError("sequence_end without matching begin")
+                raise SofaRangeError("sequence_end without matching begin")
             if self._pending:
                 # The innermost open sequence is the last held-back one (the
                 # pending run is a suffix), so dropping it is a plain pop: no
@@ -803,13 +802,13 @@ class Encoder:
         do costs one non-canonical empty frame that every decoder normalizes away,
         while the reverse silently changes an array's length.
 
-        Raises :class:`SofaStateError` if no sequence is currently open.
+        Raises :class:`SofaRangeError` if no sequence is currently open.
         """
         if not self._begin():
             return
         try:
             if self._depth <= 0:
-                raise SofaStateError("sequence_end without matching begin")
+                raise SofaRangeError("sequence_end without matching begin")
             if self._pending:
                 self._commit_pending()
             self._emit_varint(WireType.SEQUENCE_END)

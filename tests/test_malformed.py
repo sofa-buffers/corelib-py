@@ -702,7 +702,9 @@ def test_encode_nesting_beyond_max_depth_rejected():
 
 def test_sequence_end_without_begin():
     enc = Encoder()
-    with pytest.raises(SofaStateError):
+    with pytest.raises(SofaRangeError):  # §6.3 InvalidArgument — a caller mistake
+        enc.write_sequence_end()
+    with pytest.raises(SofaStateError):  # ... and the deprecated alias catches it
         enc.write_sequence_end()
 
 
@@ -712,13 +714,15 @@ def test_buffer_full_without_sink():
         enc.write_unsigned(0, 1 << 60)
 
 
-def test_wrong_type_read_raises_state_error():
+def test_wrong_type_read_is_not_an_error():
+    """§7.3: the read's type contradicts the wire, so the field is skipped like
+    an unknown id — not reported as INVALID, and not an error at all."""
     enc = Encoder()
     enc.write_unsigned(0, 5)
     dec = Decoder(reader(enc.getvalue()))
     dec.next()
-    with pytest.raises(SofaStateError):
-        dec.signed()  # field is unsigned
+    assert dec.signed() is None  # field is unsigned
+    assert dec.next() is None  # the skipped field left the decode COMPLETE
 
 
 # --- sticky mode ------------------------------------------------------------
