@@ -165,9 +165,8 @@ consumed, re-reading the same field with the type the wire carries still works. 
 read issued when there is **no** pending value at all — before the first `next()`,
 twice for one field, or on a sequence start/end — is a caller mistake and raises
 `SofaRangeError` (§6.3 `InvalidArgument`, the only code that taxonomy has for
-one). `SofaStateError` is now a deprecated alias of `SofaRangeError`: catching it
-no longer detects a wrong-type read, because there is no longer an exception to
-catch.
+one). There is no separate "API misuse" class: §6.3 has no code for one, and a
+wrong-type read is not an error to catch in the first place.
 
 ### Deserialize stream
 

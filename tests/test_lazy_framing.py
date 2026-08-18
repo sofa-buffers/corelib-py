@@ -295,7 +295,7 @@ def test_deep_nesting_commits_the_whole_run_in_order(Encoder, depth):
 def test_depth_bookkeeping_is_unchanged(Encoder):
     """Invariant 5: ``begin_lazy`` still increments depth and still rejects past
     MAX_DEPTH; ``end`` and ``end_keep`` both decrement."""
-    from sofab.types import MAX_DEPTH, SofaRangeError, SofaStateError
+    from sofab.types import MAX_DEPTH, SofaRangeError
 
     enc = Encoder()
     for _ in range(MAX_DEPTH):
@@ -310,9 +310,9 @@ def test_depth_bookkeeping_is_unchanged(Encoder):
     # end_keep decrements too: close everything, then over-close.
     for _ in range(MAX_DEPTH):
         enc.write_sequence_end_keep()
-    with pytest.raises(SofaStateError):
+    with pytest.raises(SofaRangeError):
         enc.write_sequence_end_keep()
-    with pytest.raises(SofaStateError):
+    with pytest.raises(SofaRangeError):
         enc.write_sequence_end()
 
 

@@ -18,7 +18,6 @@ from sofab import (
     SofaIncompleteError,
     SofaLimitError,
     SofaRangeError,
-    SofaStateError,
     WireType,
 )
 
@@ -703,8 +702,6 @@ def test_encode_nesting_beyond_max_depth_rejected():
 def test_sequence_end_without_begin():
     enc = Encoder()
     with pytest.raises(SofaRangeError):  # §6.3 InvalidArgument — a caller mistake
-        enc.write_sequence_end()
-    with pytest.raises(SofaStateError):  # ... and the deprecated alias catches it
         enc.write_sequence_end()
 
 
