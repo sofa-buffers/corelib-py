@@ -33,7 +33,6 @@ from .types import (
     SofaIncompleteError,
     SofaLimitError,
     SofaRangeError,
-    SofaStateError,
     WireType,
 )
 from .visitor import Visitor
@@ -96,7 +95,6 @@ __all__ = [
     "SofaIncompleteError",
     "SofaLimitError",
     "SofaRangeError",
-    "SofaStateError",
     "SofaBufferError",
     "API_VERSION",
     "ID_MAX",

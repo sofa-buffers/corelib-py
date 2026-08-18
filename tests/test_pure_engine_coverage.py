@@ -31,7 +31,6 @@ from sofab.types import (
     SofaDecodeError,
     SofaIncompleteError,
     SofaRangeError,
-    SofaStateError,
     WireType,
 )
 
@@ -85,12 +84,12 @@ def test_signed_array_element_out_of_range_raises():
 
 
 def test_sequence_end_without_begin_raises():
-    with pytest.raises(SofaStateError):
+    with pytest.raises(SofaRangeError):
         Encoder().write_sequence_end()
 
 
 def test_sequence_end_keep_without_begin_raises():
-    with pytest.raises(SofaStateError):
+    with pytest.raises(SofaRangeError):
         Encoder().write_sequence_end_keep()
 
 
@@ -180,7 +179,7 @@ def test_fixed_buffer_full_without_sink_raises():
 def test_getvalue_on_fixed_buffer_raises():
     enc = Encoder.over_buffer(bytearray(16), offset=0)
     enc.write_unsigned(1, 7)
-    with pytest.raises(SofaStateError):
+    with pytest.raises(SofaRangeError):
         enc.getvalue()
 
 
@@ -336,7 +335,7 @@ def test_scalar_read_without_matching_field_raises():
     with pytest.raises(SofaRangeError):
         dec.unsigned()
     # and the deprecated alias still catches it
-    with pytest.raises(SofaStateError):
+    with pytest.raises(SofaRangeError):
         dec.unsigned()
 
 

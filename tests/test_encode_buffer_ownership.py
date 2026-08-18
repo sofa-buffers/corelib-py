@@ -21,7 +21,7 @@ import io
 import pytest
 from vectors import build_full_scale
 
-from sofab import MIN_OUTPUT_BUFFER, SofaRangeError, SofaStateError
+from sofab import MIN_OUTPUT_BUFFER, SofaRangeError
 from sofab.encoder import _SCRATCH_SIZE as PY_SCRATCH
 from sofab.encoder import Encoder as PyEncoder
 
@@ -157,7 +157,7 @@ def test_writer_model_refuses_getvalue(enc_cls):
     "partial output as if it were complete" (§5.1)."""
     enc = enc_cls(io.BytesIO())
     enc.write_unsigned(1, 7)
-    with pytest.raises(SofaStateError):
+    with pytest.raises(SofaRangeError):
         enc.getvalue()
 
 

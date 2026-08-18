@@ -25,7 +25,8 @@ from vectors import ChunkReader
 
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
-from sofab.types import SofaError, SofaLimitError, SofaRangeError, SofaStateError
+import sofab
+from sofab.types import SofaError, SofaLimitError, SofaRangeError
 
 _ENGINES = [(PyEncoder, PyDecoder)]
 try:  # the native accelerator, when compiled in, must behave identically
@@ -46,15 +47,16 @@ def _decoder(Decoder, build):
     return Decoder(io.BytesIO(enc.getvalue()))
 
 
-# --- the alias --------------------------------------------------------------
+# --- the taxonomy -----------------------------------------------------------
 
 
-def test_state_error_is_now_an_alias_of_range_error():
-    """§6.3 fixes the taxonomy at five codes and has none for "invalid usage",
-    so the old class is gone; the name survives only so ``except SofaStateError``
-    keeps compiling."""
-    assert SofaStateError is SofaRangeError
+def test_no_invalid_usage_class_exists():
+    """§6.3 fixes the taxonomy at five codes and has none for "invalid usage".
+    The old class is gone and so is the alias that briefly stood in for it, so a
+    caller mistake is a :class:`SofaRangeError` (§6.3 ``InvalidArgument``) and
+    nothing else names the removed category."""
     assert issubclass(SofaRangeError, SofaError)
+    assert not hasattr(sofab, "SofaStateError")
 
 
 # --- §7.3: every wrong-type read, on every wire kind ------------------------

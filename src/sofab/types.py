@@ -162,18 +162,5 @@ class SofaRangeError(SofaError):
     """
 
 
-#: Deprecated alias for :class:`SofaRangeError`, kept so ``except
-#: SofaStateError`` still compiles.
-#:
-#: It used to be its own class covering "API misuse", a category CORELIB_PLAN
-#: §6.3 does not have: half of what it reported is an out-of-range argument
-#: (:class:`SofaRangeError`), and the other half — a read whose type contradicts
-#: the field on the wire — is not an error at all (MESSAGE_SPEC §7.3: the field
-#: is skipped like an unknown id and the typed read returns ``None``). Catching
-#: it therefore no longer detects a wrong-type read, and now also catches every
-#: other ``InvalidArgument``.
-SofaStateError = SofaRangeError
-
-
 class SofaBufferError(SofaError):
     """A fixed encoder buffer filled up and no flush sink was provided."""
