@@ -23,9 +23,9 @@ import io
 import pytest
 from vectors import ChunkReader
 
+import sofab
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
-import sofab
 from sofab.types import SofaError, SofaLimitError, SofaRangeError
 
 _ENGINES = [(PyEncoder, PyDecoder)]
