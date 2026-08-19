@@ -1,0 +1,73 @@
+name: "Version consistency"
+
+# The git tag is the source of truth for a release version: what a tag says and
+# what an install (and an import) reports must be the same string. Modelled on
+# corelib-c-cpp's workflow of the same name, adapted to this repo's single
+# version literal.
+#
+# Tags only: the comparison is only meaningful when there is a tag to compare
+# against. Between releases `__version__` may legitimately sit ahead of the
+# newest tag, so running this on every push and pull request produced noise, not
+# signal — and cost a runner slot per run.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check-versions:
+    name: Check versions against the tag
+    runs-on: ubuntu-latest
+    # ~30 s: checkout, install, two comparisons.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+
+      - name: Reference version (git tag)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref_version=${GITHUB_REF_NAME#v}
+          [[ -n "$ref_version" ]] || { echo "::error::empty tag name"; exit 1; }
+          echo "REF_VERSION=$ref_version" >> "$GITHUB_ENV"
+
+      - name: Check the source literal (src/sofab/__init__.py)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `__version__` is the single source of truth: pyproject.toml declares
+          # the distribution version dynamic and reads it from here.
+          version=$(grep -oP '^__version__\s*=\s*"\K[^"]+' src/sofab/__init__.py | head -1)
+          [[ -n "$version" ]] || { echo "::error::src/sofab/__init__.py: no __version__ literal found"; exit 1; }
+          [[ "$version" == "$REF_VERSION" ]] || { echo "::error::sofab.__version__: '$version' != '$REF_VERSION'"; exit 1; }
+
+      - name: Check what an install reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Proves the dynamic wiring in pyproject.toml still resolves: the
+          # distribution metadata, not just the literal, has to carry the tag.
+          python -m pip install -e .
+          python - <<'PY'
+          import os, sys
+          from importlib.metadata import version as dist_version
+          import sofab
+          ref = os.environ["REF_VERSION"]
+          for label, got in (("sofab.__version__", sofab.__version__),
+                             ("distribution metadata", dist_version("sofa-buffers-corelib"))):
+              if got != ref:
+                  sys.exit(f"::error::{label}: {got!r} != {ref!r}")
+          print(f"version {ref} consistent across the literal and the installed distribution")
+          PY
