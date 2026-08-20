@@ -14,10 +14,52 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Every job below carries a `timeout-minutes`. GitHub's default is 360, so a
+# step that wedges (a hung pip resolver, a network stall) holds one of the
+# organisation's 20 concurrent runner slots for six hours and every other repo
+# in the family queues behind it. The bounds here are roughly an order of
+# magnitude above the observed runtimes — see each job — so a hang fails fast
+# and names itself, while an ordinarily slow run is never cut off.
+
 jobs:
+  lint:
+    name: Lint and type-check
+    runs-on: ubuntu-latest
+    # ~30 s: install plus ruff plus mypy.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          # The newest interpreter this package supports. ruff is safe to run
+          # once: [tool.ruff] pins target-version = "py39", so its verdict does
+          # not depend on the interpreter. mypy is NOT -- it has no
+          # python_version in [tool.mypy] and follows the running interpreter --
+          # so it runs per leg in the test matrix instead, and here only as a
+          # fast gate against the newest.
+          python-version: '3.14'
+          cache: 'pip'
+
+      - name: Install package and tooling
+        # `pip install -e .` builds the native accelerator and is the
+        # prerequisite of everything in this repo; mypy resolves
+        # `sofab._speedups` through the installed package.
+        run: python -m pip install -e . ruff mypy
+
+      - name: Lint (ruff)
+        run: ruff check src/sofab tests
+
+      - name: Type-check (mypy)
+        run: mypy --strict src/sofab
+
   test:
     name: test (Python ${{ matrix.python }})
+    needs: [lint]
     runs-on: ubuntu-latest
+    # ~40-50 s per leg (install, native build, two pytest runs).
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -33,7 +75,15 @@ jobs:
           cache: 'pip'
 
       - name: Install package and tooling
-        run: python -m pip install -e . pytest ruff mypy
+        run: python -m pip install -e . pytest mypy
+
+      # mypy runs per interpreter, not once in the gate: [tool.mypy] sets no
+      # python_version, so mypy targets whatever interpreter runs it. With
+      # requires-python = ">=3.9" that means a type error visible only under 3.9
+      # -- a stdlib signature that changed, a generic that is not subscriptable
+      # there -- is invisible if mypy only ever runs on the newest leg.
+      - name: Type-check (mypy)
+        run: mypy --strict src/sofab
 
       - name: Assert the native accelerator was built
         # setup.py marks the extension `optional=True` so a compiler-less host
@@ -45,12 +95,6 @@ jobs:
         # wants the full suite run, not the part that still imports.
         run: |
           python -c "import sofab, sys; sys.exit(0 if sofab.IMPL == 'native' else f'native accelerator missing: sofab.IMPL == {sofab.IMPL!r}')"
-
-      - name: Lint (ruff)
-        run: ruff check src/sofab tests
-
-      - name: Type-check (mypy)
-        run: mypy --strict src/sofab
 
       - name: Test (native engine)
         env:
@@ -69,7 +113,10 @@ jobs:
 
   fallback:
     name: Pure-Python fallback install (no native build)
+    needs: [lint]
     runs-on: ubuntu-latest
+    # ~15-20 s: no compile, one pytest run.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
@@ -97,7 +144,10 @@ jobs:
 
   coverage:
     name: Coverage
+    needs: [lint]
     runs-on: ubuntu-latest
+    # ~25-35 s including the badge publish.
+    timeout-minutes: 15
     permissions:
       contents: write # to publish the generated badge to the `badges` branch
     steps:

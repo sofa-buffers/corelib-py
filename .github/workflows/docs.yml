@@ -16,10 +16,17 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
+# Both jobs are bounded: GitHub's 360-minute default would let a wedged Sphinx
+# build or a stalled Pages deploy sit on one of the organisation's 20 concurrent
+# runner slots for six hours. The bounds are far above the observed runtimes
+# (~30 s to build, ~10 s to deploy), so only a genuine hang trips them.
+
 jobs:
   build:
     name: Build API docs
     runs-on: ubuntu-latest
+    # ~30 s: install plus sphinx-apidoc plus sphinx-build.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
@@ -48,6 +55,8 @@ jobs:
     name: Deploy to GitHub Pages
     needs: build
     runs-on: ubuntu-latest
+    # ~10 s: the Pages deployment API call.
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
