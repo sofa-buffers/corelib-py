@@ -55,16 +55,49 @@ jobs:
         run: mypy --strict src/sofab
 
   test:
-    name: test (Python ${{ matrix.python }})
+    name: test (${{ matrix.os }}, Python ${{ matrix.python }})
     needs: [lint]
-    runs-on: ubuntu-latest
-    # ~40-50 s per leg (install, native build, two pytest runs).
+    runs-on: ${{ matrix.os }}
+    # ~40-50 s per leg on Linux (install, native build, two pytest runs); the
+    # macOS and Windows legs compile the accelerator with a different toolchain
+    # and run a little longer.
     timeout-minutes: 15
+    # bash everywhere, so a step behaves the same on all three runners: the
+    # accelerator assertion below embeds a Python expression with quotes that
+    # PowerShell would parse by its own rules.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
-        # Oldest supported (matches pyproject requires-python) plus current releases.
-        python: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
+        # Two axes, and they are not equally valuable.
+        #
+        #   * INTERPRETER: a type error or a stdlib difference visible only under
+        #     3.9 is what the full fan-out catches, and mypy runs per leg. That is
+        #     interpreter-specific, not OS-specific, so Linux carries all six.
+        #   * OS: everything platform-dependent — the C toolchain that builds the
+        #     accelerator, path handling, and the *locale encoding*. This axis was
+        #     missing entirely, and it cost us: tests/vectors.py read the shared
+        #     vectors without an explicit encoding, so Windows decoded them as
+        #     cp1252 and fed double-encoded UTF-8 into the encoder. Eight
+        #     conformance failures that a Linux-only matrix could not see, found
+        #     only when the release workflow first ran the suite on Windows.
+        #
+        # So: every interpreter on Linux, plus the boundaries requires-python
+        # promises on macOS and Windows. Ten legs instead of eighteen, and the
+        # gap that actually bit is closed.
+        include:
+          - { os: ubuntu-latest, python: '3.9' }
+          - { os: ubuntu-latest, python: '3.10' }
+          - { os: ubuntu-latest, python: '3.11' }
+          - { os: ubuntu-latest, python: '3.12' }
+          - { os: ubuntu-latest, python: '3.13' }
+          - { os: ubuntu-latest, python: '3.14' }
+          - { os: macos-latest, python: '3.9' }
+          - { os: macos-latest, python: '3.14' }
+          - { os: windows-latest, python: '3.9' }
+          - { os: windows-latest, python: '3.14' }
     steps:
       - uses: actions/checkout@v7
 
