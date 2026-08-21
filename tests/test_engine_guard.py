@@ -89,11 +89,13 @@ def test_the_guard_fails_when_the_required_engine_is_missing() -> None:
         env=env,
         capture_output=True,
         text=True,
-        # text=True decodes the child's output with the *locale* encoding, which
-        # on Windows is cp1252: any non-ASCII pytest prints would raise
-        # UnicodeDecodeError here rather than fail the assertion below. Same
-        # class as the vectors file, caught by PYTHONWARNDEFAULTENCODING.
-        encoding="utf-8",
+        # The child is a pytest run, and it writes in *its* locale encoding —
+        # cp1252 on Windows, where an em dash is 0x97. Pinning utf-8 here would
+        # make the reader raise UnicodeDecodeError, leaving stdout None; pinning
+        # nothing risks the same on a stricter locale. Decode with the platform
+        # default, but never let a stray byte turn an assertion into a crash:
+        # this test only looks for an ASCII test name in the output.
+        errors="replace",
     )
     assert proc.returncode != 0, f"guard passed with the wrong engine active:\n{proc.stdout}"
     # ...and for the right reason.
