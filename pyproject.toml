@@ -37,7 +37,32 @@ version = { attr = "sofab.__version__" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-sofab = ["py.typed", "_speedups.pyx"]
+sofab = ["py.typed"]
+
+# The accelerator sources are build inputs, not runtime files: a built wheel
+# already contains the compiled extension, so shipping the .pyx and the
+# Cython-generated .c on top adds ~1.5 MB of dead weight to every wheel. They
+# still travel in the sdist (MANIFEST.in), which is where a from-source build
+# needs them.
+[tool.setuptools.exclude-package-data]
+sofab = ["_speedups.pyx", "_speedups.c"]
+
+[tool.cibuildwheel]
+# Wheels exist for one reason: to deliver the compiled accelerator to users who
+# have no compiler. A wheel that quietly fell back to pure Python would be worse
+# than no wheel — it looks like a platform wheel, installs like one, and is slow.
+# setup.py is deliberately tolerant (the extension is optional=True and a failed
+# compile degrades to pure Python), which is right for a from-source install and
+# wrong here, so every wheel is tested for IMPL == "native" before it may ship.
+build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
+# 32-bit and PyPy: not covered by the test matrix, and not worth the build time.
+skip = "*-win32 *_i686 pp*"
+build-frontend = "build"
+test-requires = "pytest"
+test-command = [
+    "python -c \"import sofab, sys; sys.exit(0 if sofab.IMPL == 'native' else f'wheel has no accelerator: IMPL={sofab.IMPL}')\"",
+    "pytest {project}/tests -q",
+]
 
 [tool.ruff]
 line-length = 100

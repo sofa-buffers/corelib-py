@@ -1,0 +1,168 @@
+name: Release
+
+# ⚠️ DO NOT RENAME THIS FILE (release.yml).
+# Its basename is part of the PyPI trusted-publishing (OIDC) identity: the
+# sofa-buffers-corelib project on pypi.org has a Trusted Publisher pinned to repo
+# sofa-buffers/corelib-py + workflow filename "release.yml" + environment "pypi".
+# Renaming (or moving) this file changes that OIDC claim and PyPI refuses the
+# upload with `invalid-publisher`. If a rename is ever truly needed, update the
+# Workflow-filename field on the Trusted Publisher first.
+
+# Builds the distribution for a v* tag and publishes it to PyPI:
+#   - one sdist (the from-source path: pip compiles the accelerator, or falls
+#     back to pure Python if there is no compiler);
+#   - platform wheels with the accelerator already compiled, so an install needs
+#     no toolchain at all.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Every job carries a `timeout-minutes`, as in ci.yml: a wedged step must not
+# hold one of the organisation's runner slots for GitHub's six-hour default.
+jobs:
+  # Fail before spending ~20 runner-minutes on wheels. `version-consistency.yml`
+  # checks the same equality on a tag, but it is a separate workflow — its
+  # failure does not stop this one, so the gate is repeated here.
+  check-version:
+    name: Tag must match the version literal
+    runs-on: ubuntu-latest
+    # ~15 s: checkout and two string comparisons.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          # Unlike the generator's tags, this one is compared verbatim against a
+          # Python version literal, so it must already be spelled the PEP 440 way:
+          # 0.11.0rc1, never 0.11.0-rc1.
+          if ! printf '%s' "$tag_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$'; then
+            echo "::error::tag '$GITHUB_REF_NAME' is not a PEP 440 release version (expected vX.Y.Z or vX.Y.Zrc1)" >&2
+            exit 1
+          fi
+          version=$(grep -oP '^__version__\s*=\s*"\K[^"]+' src/sofab/__init__.py | head -1)
+          echo "tag: $tag_version, sofab.__version__: $version"
+          if [ "$version" != "$tag_version" ]; then
+            echo "::error::sofab.__version__ ($version) != tag ($tag_version) — bump the literal before tagging" >&2
+            exit 1
+          fi
+
+  sdist:
+    name: Build sdist
+    needs: [check-version]
+    runs-on: ubuntu-latest
+    # ~1 min: install build, produce one tarball.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - name: Build
+        run: |
+          python -m pip install --upgrade build
+          python -m build --sdist
+      # The sdist is the only artifact that carries the accelerator *source*, so
+      # a platform without a wheel can still compile it (or degrade to pure
+      # Python). Prove it is in there rather than trusting MANIFEST.in.
+      - name: The accelerator source must ship in the sdist
+        run: |
+          set -euo pipefail
+          tar -tzf dist/*.tar.gz | grep -q 'src/sofab/_speedups\.pyx$' || {
+            echo "::error::_speedups.pyx is missing from the sdist — a from-source install would be pure Python forever" >&2
+            tar -tzf dist/*.tar.gz >&2; exit 1
+          }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+
+  wheels:
+    name: Wheels (${{ matrix.name }})
+    needs: [check-version]
+    runs-on: ${{ matrix.os }}
+    # ~15-25 min: six interpreters × (compile + full test suite) per runner.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners for both Linux architectures — building aarch64 under
+          # QEMU emulation costs an order of magnitude more wall-clock, and arm64
+          # runners are free for public repositories.
+          - { os: ubuntu-latest,    name: linux-x86_64 }
+          - { os: ubuntu-24.04-arm, name: linux-aarch64 }
+          - { os: macos-13,         name: macos-x86_64 }
+          - { os: macos-latest,     name: macos-arm64 }
+          - { os: windows-latest,   name: windows-amd64 }
+    steps:
+      - uses: actions/checkout@v7
+      # Selection, the accelerator assertion and the test command all live in
+      # [tool.cibuildwheel] in pyproject.toml, so a local `cibuildwheel` run and
+      # this job build exactly the same set.
+      - uses: pypa/cibuildwheel@v4.2.0
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-wheels-${{ matrix.name }}
+          path: wheelhouse/*.whl
+
+  publish:
+    name: Publish to PyPI
+    needs: [sdist, wheels]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    # ~2 min: download artifacts, check, upload.
+    timeout-minutes: 20
+    # The environment name is a matched part of the OIDC identity: it must equal
+    # the Environment field of the Trusted Publisher on pypi.org.
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write # OIDC trusted publishing + PEP 740 attestations
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - name: Guard — one sdist, some wheels, all at the tag version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          ls -la dist
+          sdists=$(ls dist/*.tar.gz 2>/dev/null | wc -l)
+          wheels=$(ls dist/*.whl 2>/dev/null | wc -l)
+          echo "sdists: $sdists, wheels: $wheels, expected version: $tag_version"
+          [ "$sdists" -eq 1 ] || { echo "::error::expected exactly one sdist, found $sdists" >&2; exit 1; }
+          [ "$wheels" -gt 0 ] || { echo "::error::no wheels to publish" >&2; exit 1; }
+          # A PyPI version is immutable, so a file built from the wrong tree can
+          # never be replaced — only yanked.
+          fail=0
+          for f in dist/*; do
+            case "$(basename "$f")" in
+              sofa_buffers_corelib-"$tag_version"-*|sofa_buffers_corelib-"$tag_version".tar.gz) ;;
+              *) echo "::error::$(basename "$f") does not carry version $tag_version" >&2; fail=1 ;;
+            esac
+          done
+          [ "$fail" -eq 0 ]
+      - name: Check the metadata renders
+        run: |
+          python -m pip install --upgrade twine
+          twine check dist/*
+      - name: Publish via trusted publishing (OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1
