@@ -71,7 +71,25 @@ not from a personal account: a pending publisher filed personally makes *that
 account* the owner of the project on first upload. It converts into a normal
 publisher by itself once the first upload succeeds.
 
-## After a release
+## What the release workflow checks
+
+Three layers, each answering a question the one before it cannot:
+
+1. **The artifacts** — the sdist is installed into a clean venv and must report
+   `IMPL == "native"` (a runner has a compiler) and pass the full suite from a
+   directory with no `./src` to import by accident. Listing files proves
+   `MANIFEST.in`; only an install proves the sdist *builds*. Each wheel is tested
+   the same way by cibuildwheel, on the interpreter it was built for.
+2. **The upload** — after publishing, `pip install sofa-buffers-corelib==<version>`
+   from PyPI on Linux, macOS and Windows × Python 3.9 and 3.14 (the boundaries
+   `requires-python` promises), asserting version and `IMPL == "native"`.
+3. **The set** — a per-platform job cannot see whether the *other* platforms'
+   wheels were uploaded. `verify-file-set` diffs what PyPI serves against exactly
+   what the run built, and checks PEP 740 provenance on every file. It compares
+   sets rather than counting to a hard-coded number, so adding a Python version to
+   the matrix does not need a second edit.
+
+Manually, after any release:
 
 ```sh
 pip install sofa-buffers-corelib==<version>
