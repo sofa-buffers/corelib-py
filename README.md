@@ -476,6 +476,13 @@ print(sofab.IMPL)        # "native" when the compiled extension is loaded
 
 Force the pure-Python path with `SOFAB_PUREPYTHON=1`.
 
+Released wheels ship the accelerator already compiled, so a plain
+`pip install sofa-buffers-corelib` gets the native engine without a toolchain on
+every platform that has a wheel (CPython 3.9–3.14 on Linux — glibc and musl,
+x86-64 and ARM64 — macOS Intel and Apple Silicon, and Windows x86-64). Anywhere
+else pip builds the sdist, which compiles the accelerator if a C compiler is
+present and installs the pure-Python engine if not.
+
 ## Feature flags
 
 The package always builds the full format (unsigned / signed varints, fp32 /
