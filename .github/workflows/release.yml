@@ -129,7 +129,11 @@ jobs:
           # runners are free for public repositories.
           - { os: ubuntu-latest,    name: linux-x86_64 }
           - { os: ubuntu-24.04-arm, name: linux-aarch64 }
-          - { os: macos-13,         name: macos-x86_64 }
+          # macos-13 is retired: the label no longer resolves to any runner, so
+          # a job asking for it sits in `queued` until GitHub's 24-hour limit and
+          # holds the whole run open. Intel macOS is `macos-<version>-intel` now,
+          # still a standard (free for public repos) runner.
+          - { os: macos-15-intel,   name: macos-x86_64 }
           - { os: macos-latest,     name: macos-arm64 }
           - { os: windows-latest,   name: windows-amd64 }
     steps:
