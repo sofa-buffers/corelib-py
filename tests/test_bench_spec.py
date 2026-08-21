@@ -264,7 +264,7 @@ def test_unknown_workload_is_rejected(capsys):
 def test_callgrind_script_covers_every_workload():
     """The script's workload list and the tool's registry must agree — a
     workload missing from the script is a row missing from the Ir/op table."""
-    script = (BENCH.parent / "run_callgrind.sh").read_text()
+    script = (BENCH.parent / "run_callgrind.sh").read_text(encoding="utf-8")
     for name, (label, _) in pb.WORKLOADS.items():
         assert re.search(rf"\b{name}\b", script), name
         assert label in script, label

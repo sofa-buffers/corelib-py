@@ -26,7 +26,7 @@ from sofab.encoder import Encoder as PyEncoder
 #: ``corelib-c-cpp``. Loaded once here rather than re-read and re-parsed by every
 #: suite that walks it.
 VECTORS_PATH = Path(__file__).resolve().parents[1] / "assets" / "test_vectors.json"
-VECTOR_DOC = json.loads(VECTORS_PATH.read_text())
+VECTOR_DOC = json.loads(VECTORS_PATH.read_text(encoding="utf-8"))
 VECTORS = VECTOR_DOC["vectors"]
 
 # --- engine parametrisation --------------------------------------------------
