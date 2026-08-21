@@ -79,9 +79,13 @@ jobs:
       - name: The accelerator source must ship in the sdist
         run: |
           set -euo pipefail
-          tar -tzf dist/*.tar.gz | grep -q 'src/sofab/_speedups\.pyx$' || {
+          # List once into a file: `tar | grep -q` closes the pipe on the first
+          # match, tar dies of SIGPIPE, and pipefail turns that into a failed
+          # pipeline — a guard that fails precisely when it finds what it wants.
+          tar -tzf dist/*.tar.gz > /tmp/sdist-files.txt
+          grep -q 'src/sofab/_speedups\.pyx$' /tmp/sdist-files.txt || {
             echo "::error::_speedups.pyx is missing from the sdist — a from-source install would be pure Python forever" >&2
-            tar -tzf dist/*.tar.gz >&2; exit 1
+            cat /tmp/sdist-files.txt >&2; exit 1
           }
       # Install the tarball the way a platform without a wheel would, and use
       # what comes out. Listing files proves MANIFEST.in; only an install proves
