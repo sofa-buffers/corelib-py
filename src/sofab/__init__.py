@@ -81,7 +81,7 @@ else:  # pragma: no cover - native branch: exercised only when the compiled
 #: (``tests/test_version.py``). Deriving it from the installed distribution
 #: metadata instead would cost an ``importlib.metadata`` import on every
 #: ``import sofab`` and report nothing usable when running from a source tree.
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 __all__ = [
     "Encoder",
