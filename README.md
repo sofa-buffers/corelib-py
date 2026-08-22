@@ -60,6 +60,40 @@ place it is written down: `pyproject.toml` declares the distribution version
 dynamic and reads it from there, so an install and an import always report the
 same string.
 
+### Native accelerator
+
+`Encoder` / `Decoder` / `Field` are re-exported from the compiled
+`sofab._speedups` extension when present, and from the pure-Python
+`encoder.py` / `decoder.py` otherwise. The native core is a small Cython
+implementation of the same algorithm — one contiguous buffer, an advancing
+cursor, bulk `memcpy`, and varint/zigzag compiled to C. Both engines import wire
+constants, enums and exception classes from the shared `types.py`, so a
+`SofaRangeError` is the *same class* from either, and the two produce
+byte-for-byte identical output (enforced by `tests/test_native_parity.py`).
+
+The active engine is reported by `sofab.IMPL` (`"native"` or `"python"`):
+
+```python
+import sofab
+print(sofab.IMPL)        # "native" when the compiled extension is loaded
+```
+
+Force the pure-Python path with `SOFAB_PUREPYTHON=1`.
+
+Released wheels ship the accelerator already compiled, so a plain
+`pip install sofa-buffers-corelib` gets the native engine without a toolchain on
+every platform that has a wheel (CPython 3.9–3.14 on Linux — glibc and musl,
+x86-64 and ARM64 — macOS Intel and Apple Silicon, and Windows x86-64). Anywhere
+else pip builds the sdist, which compiles the accelerator if a C compiler is
+present and installs the pure-Python engine if not.
+
+### Feature flags
+
+The package always builds the full format (unsigned / signed varints, fp32 /
+fp64, strings, blobs, arrays and nested sequences). The one build toggle is
+`SOFAB_DISABLE_NATIVE=1`, which builds a native-free (pure-Python) distribution;
+it changes only speed, never the wire format or the public API.
+
 ## Why this design
 
 | Goal | How |
@@ -288,7 +322,7 @@ generated loop: retry a `SofaIncompleteError` after obtaining more bytes, as
 [Deserialize stream](#deserialize-stream) describes — the suspended call
 consumed nothing, so re-issuing it is always correct.
 
-## Decode limits
+### Decode limits
 
 Array counts and string/blob lengths are optional on the wire, so by default the
 decoder allocates whatever a message declares. Untrusted input can abuse that, so
@@ -316,7 +350,7 @@ is read or allocated in between, and the field cannot be got at any other way, s
 the protection is the same; what the gap buys is the window in which the caller
 can say the field is not one of the cap's business.
 
-### A schema-bounded field is exempt: `schema_bounded()`
+#### A schema-bounded field is exempt: `schema_bounded()`
 
 A cap is *capacity* the deployment commits where the **sender** chooses the size.
 Where the **schema** already states a `count:`/`maxlen:`, that bound governs
@@ -455,40 +489,6 @@ never provides a value buffer.**
   construction*: a held-back header takes no buffer space, and the buffer only
   fills through a write, which commits the run before its first byte. A tiny
   output buffer therefore yields exactly the one-shot bytes.
-
-## Native accelerator
-
-`Encoder` / `Decoder` / `Field` are re-exported from the compiled
-`sofab._speedups` extension when present, and from the pure-Python
-`encoder.py` / `decoder.py` otherwise. The native core is a small Cython
-implementation of the same algorithm — one contiguous buffer, an advancing
-cursor, bulk `memcpy`, and varint/zigzag compiled to C. Both engines import wire
-constants, enums and exception classes from the shared `types.py`, so a
-`SofaRangeError` is the *same class* from either, and the two produce
-byte-for-byte identical output (enforced by `tests/test_native_parity.py`).
-
-The active engine is reported by `sofab.IMPL` (`"native"` or `"python"`):
-
-```python
-import sofab
-print(sofab.IMPL)        # "native" when the compiled extension is loaded
-```
-
-Force the pure-Python path with `SOFAB_PUREPYTHON=1`.
-
-Released wheels ship the accelerator already compiled, so a plain
-`pip install sofa-buffers-corelib` gets the native engine without a toolchain on
-every platform that has a wheel (CPython 3.9–3.14 on Linux — glibc and musl,
-x86-64 and ARM64 — macOS Intel and Apple Silicon, and Windows x86-64). Anywhere
-else pip builds the sdist, which compiles the accelerator if a C compiler is
-present and installs the pure-Python engine if not.
-
-## Feature flags
-
-The package always builds the full format (unsigned / signed varints, fp32 /
-fp64, strings, blobs, arrays and nested sequences). The one build toggle is
-`SOFAB_DISABLE_NATIVE=1`, which builds a native-free (pure-Python) distribution;
-it changes only speed, never the wire format or the public API.
 
 ## Build & test
 
