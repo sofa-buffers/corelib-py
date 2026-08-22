@@ -1,5 +1,18 @@
 [build-system]
-requires = ["setuptools>=61", "wheel", "Cython>=3.0"]
+# Cython 3.3.0 is excluded because it generates C this module cannot compile.
+# Its string-constant table sizes a bit-field from the longest constant of each
+# kind, and the accelerator's only bytes constant is ``b""`` — so the width comes
+# out as zero and the emitted
+#
+#     const struct { const unsigned int length: 0; } bytes_length_index[] = {{0}};
+#
+# is rejected outright ("zero width for bit-field 'length'"): C requires a
+# zero-width bit-field to be unnamed. Nothing in this repository triggers it and
+# nothing here can work around it; 3.2.9 and every earlier 3.x generate a
+# well-formed table from the same sources. Excluded by exact version rather than
+# capped below 3.3, so a fixed 3.3.1 is picked up without another release here —
+# and if it is not fixed there, CI says so.
+requires = ["setuptools>=61", "wheel", "Cython>=3.0,!=3.3.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
