@@ -10,9 +10,20 @@ on:
 permissions:
   contents: read
 
+# A superseded push releases its runner slots instead of queueing behind itself
+# (CORELIB_PLAN §12.1) -- the account has 20 concurrent Actions slots for the
+# whole family, so freeing them early is worth real time. Off on `main`, and
+# only there: the badge publish in the `coverage` job below runs on `main` and
+# nowhere else, so a cancelled `main` run takes the badge update with it. Nothing
+# fails and nothing is reported; the badge simply keeps showing the older number
+# until the next push to `main` happens to survive.
+#
+# The group name stays `ci-` rather than §12.1's `${{ github.workflow }}-`:
+# `ci-` is already unique to this workflow, so the two behave identically here
+# and §12 fixes triggers, settings and ordering, never names.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Every job below carries a `timeout-minutes`. GitHub's default is 360, so a
 # step that wedges (a hung pip resolver, a network stall) holds one of the
