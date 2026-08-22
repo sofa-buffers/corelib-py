@@ -60,6 +60,34 @@ class WireType(IntEnum):
     SEQUENCE_END = 0x7
 
 
+class Status(IntEnum):
+    """The three-valued decode outcome CORELIB_PLAN §5.2 requires.
+
+    Returned by every :meth:`sofab.Decoder.feed`, describing the bytes consumed
+    **so far** — not a verdict on the message as a whole:
+
+    * :attr:`COMPLETE` — the consumed bytes end exactly at a field boundary. A
+      valid message *may* end here; more fields may also still follow.
+    * :attr:`INCOMPLETE` — the bytes end *inside* a construct. **This is not an
+      error.** The partial tail is retained and the next ``feed`` continues from
+      it. Whether an incomplete message is acceptable is the caller's decision:
+      only its framing (a length prefix, a datagram boundary, EOF) knows whether
+      more bytes can still come.
+    * :attr:`INVALID` — the bytes are malformed regardless of what follows.
+      Terminal; the reason is on :attr:`sofab.Decoder.error`.
+
+    There is deliberately **no** ``finish``/``end`` step that could reclassify
+    :attr:`INCOMPLETE` as an error (§5.2): the status ``feed`` returned *is* the
+    answer. A receiver-side limit rejection (§6.2.1) is not one of these three —
+    it is a well-formed message the receiver declined, so it arrives on the error
+    channel as :class:`SofaLimitError`, never as :attr:`INVALID` (§6.3).
+    """
+
+    COMPLETE = 0
+    INCOMPLETE = 1
+    INVALID = 2
+
+
 class FixlenSubtype(IntEnum):
     """The 3 low bits of a fixlen length header."""
 

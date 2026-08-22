@@ -132,3 +132,61 @@ def test_docs_landing_page_matches_the_shipped_engines() -> None:
     )
     lowered = text.lower()
     assert "accelerator" in lowered and "fallback" in lowered
+
+
+# --- the push-decode sections (CORELIB_PLAN §5.2 / §5.3) ---------------------
+#
+# Same rule as the Generator example: the README states facts about the API, so
+# its examples are executed rather than eyeballed. Both sections here document
+# calls that did not exist before push mode, which is exactly the kind of doc a
+# refactor drifts away from silently.
+
+
+def _run_readme_block(readme: str, heading: str, ns: dict) -> dict:
+    body = _sections(readme).get(heading)
+    assert body is not None, f"README lost its `{heading}` section"
+    blocks = _python_blocks(body)
+    assert blocks, f"`{heading}` has no runnable example"
+    for i, block in enumerate(blocks):
+        exec(compile(block, f"README.md#{heading}[{i}]", "exec"), ns)
+    return ns
+
+
+def test_binding_example_runs_and_decodes(readme: str) -> None:
+    """The ``Binding`` example must decode the message it claims to."""
+    enc = Encoder()
+    enc.write_unsigned(1, 300)
+    enc.write_string(3, "grüß dich")
+    enc.write_unsigned_array(4, [7, 8, 9])
+    enc.flush()
+
+    ns: dict = {"payload": enc.getvalue()}
+    _run_readme_block(readme, "### Decode into your own storage (`Binding`)", ns)
+
+    assert ns["u"][0] == 300
+    assert ns["objs"][0] == "grüß dich"
+    words, u = ns["words"], ns["u"]
+    assert list(u[8 : 8 + u[3]]) == [7, 8, 9]
+    assert len(words) == ns["b"].tree_words_required * 8
+
+
+def test_feed_example_matches_the_api(readme: str) -> None:
+    """The ``feed`` example is written against a socket, so it is checked for
+    shape rather than executed: the names it uses must exist and mean what the
+    surrounding table says."""
+    from sofab import Decoder, Status
+
+    body = _sections(readme).get("### Deserialize push (`feed`)")
+    assert body is not None, "README lost its `### Deserialize push (`feed`)` section"
+    src = "\n".join(_python_blocks(body))
+    assert "Decoder(visitor=" in src and "dec.feed(" in src
+    assert "dec.error" in src
+    for name in ("COMPLETE", "INCOMPLETE", "INVALID"):
+        assert f"`Status.{name}`" in body, f"the outcome table lost {name}"
+        assert hasattr(Status, name)
+    assert hasattr(Decoder, "feed") and hasattr(Decoder, "reset")
+    # §5.2: no finalize step may exist, and the README has to say so — the
+    # absence is part of the contract, not an omission.
+    assert "no** `finish()`/`end()`" in body
+    for banned in ("finish", "finalize", "end", "close"):
+        assert not hasattr(Decoder, banned), banned

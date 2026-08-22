@@ -212,6 +212,107 @@ Whether an incomplete message is acceptable is the **caller's** decision, not th
 decoder's: only your framing (a length prefix, a datagram boundary, EOF) knows
 whether more bytes can still come.
 
+### Deserialize push (`feed`)
+
+The other half of CORELIB_PLAN §5.2's **push-feed / pull-read** model. Instead of
+handing the decoder a source it pulls from, hand it a *field handler* and push
+chunks in. Every `feed` returns the three-valued decode outcome for the bytes
+consumed **so far**:
+
+```python
+from sofab import Decoder, Status, Visitor
+
+class Handler(Visitor):
+    def on_unsigned(self, field_id, value): ...
+    def on_string(self, field_id, value): ...
+
+dec = Decoder(visitor=Handler())
+for chunk in socket_chunks():
+    st = dec.feed(chunk)               # COMPLETE / INCOMPLETE / INVALID
+    if st is Status.INVALID:
+        raise ValueError(dec.error)    # terminal; the reason is on .error
+```
+
+| outcome | meaning |
+|---|---|
+| `Status.COMPLETE` | the bytes end **exactly** at a field boundary — a valid message may end here, and more fields may also still follow |
+| `Status.INCOMPLETE` | the bytes end **inside** a construct, or inside a sequence still open. **Not an error.** The partial tail is retained; the next `feed` continues from it |
+| `Status.INVALID` | malformed regardless of what follows. Terminal — every later `feed` returns it again — with the reason on `dec.error` |
+
+There is deliberately **no** `finish()`/`end()`: §5.2 forbids a finalize step
+that could reclassify `INCOMPLETE` as an error. The status `feed` returned *is*
+the answer, and whether an `INCOMPLETE` at end-of-input is acceptable is your
+framing's call, not the decoder's. A **receiver-side limit** (`max_array_count`
+and friends) is not one of the three outcomes — the message is well-formed and
+you simply declined it — so it is raised as `SofaLimitError` rather than folded
+into `INVALID` (§6.3).
+
+**A fed chunk is borrowed only for the duration of the call** (§6, normative).
+Whatever the decoder still needs afterwards — a construct split across the
+boundary, a decoded string or blob — is copied out before `feed` returns, so you
+may reuse or overwrite that buffer the moment it comes back. `feed` accepts
+`bytes`, `bytearray` or a `memoryview` over either.
+
+`reset()` starts a new message on the same decoder, keeping the handler.
+
+### Decode into your own storage (`Binding`)
+
+A `Visitor` costs one Python call per field. A **`Binding`** costs none: you
+declare once where every field id belongs, and the decoder writes there itself —
+the shape §5.3 has in mind when it says the visitor pattern "lets the decoder
+write each field straight into the waiting member without an intermediate
+representation", with the last Python call taken out of it.
+
+```python
+from sofab import Binding, Decoder
+
+b = (Binding()
+     .unsigned(1, at=0, count_at=2)          # -> words slot 0, arrival in slot 2
+     .string(3, at=0, maxlen=64)             # -> objects[0]
+     .unsigned_array(4, at=8, cap=16, count_at=3))
+
+words = bytearray(b.tree_words_required * 8)     # you allocate; you size it
+objs = [None] * b.tree_objects_required
+dec = Decoder(binding=b, words=words, objects=objs)
+dec.feed(payload)
+
+u = memoryview(words).cast("Q")                  # as many typed views as you like
+u[0]                                             # field 1
+objs[0]                                          # field 3
+list(u[8:8 + u[3]])                              # field 4's u[3] elements
+```
+
+Two pieces of storage, both **yours**: `words`, one writable byte buffer whose
+length is a multiple of 8 — every numeric field is one 64-bit slot, floats
+widened to a native `double`, arrays `cap` consecutive slots — and `objects`, a
+pre-sized list for `string` and `blob`, the two kinds with no fixed-width machine
+form. Read the slots back through `.cast("q")` / `.cast("Q")` / `.cast("d")` over
+the *same* buffer; that costs no copy.
+
+What follows from the caller owning the storage:
+
+* **Nothing is ever sized from the wire.** `cap` and `maxlen` are the *schema's*
+  bounds, so a message that declares more is malformed against that schema and
+  is rejected as `INVALID` at the count/length header, before an element is read
+  (MESSAGE_SPEC §7.1). It is not a `SofaLimitError`: that is for fields the
+  schema leaves unbounded (§6.2.1), and declaring a bound in the table is what
+  takes the receiver-side cap off the field.
+* **Absence needs no sentinel.** A slot the decoder does not write keeps exactly
+  what you put there. `count_at` names a slot that receives `1` for a scalar that
+  arrived, the element count for an array, the number of occurrences for a
+  sequence.
+* **A contradicting wire tag is skipped, not rejected** (§7.3) — like an unknown
+  id, and the decode stays `COMPLETE`.
+* **Nested messages share the same storage.** `b.sequence(id, child)` descends
+  into a child table whose slots live in the same two buffers, so a whole message
+  tree decodes into one flat pair. A sequence with no binding is skipped whole.
+* **A binding is build-once.** Building a decoder from it freezes the table — the
+  decoder caches what it derives, including (in the native engine) a compiled
+  lookup table shared by every decoder over that binding.
+
+A `Binding` and a `Visitor` compose: bind the fields you know, and the visitor
+gets everything else.
+
 ### Code generator
 
 The most common real use is driving the library through **generated code**:
@@ -357,8 +458,11 @@ for `u64`/`i64`, whose range is the value domain, or for an unbounded consumer.
 
 ## Memory handling
 
-The key point for Python: **the library allocates results for you — the caller
-never provides a value buffer.**
+The key point for Python: **decoding allocates results for you unless you ask it
+not to.** The pull and visitor paths hand back fresh `int`/`str`/`bytes`/`list`
+objects; a `Binding` writes into storage you supplied and sized instead, and
+allocates only for `string` and `blob`, which have no fixed-width machine form.
+Encoding never allocates an output buffer at all (§5.1).
 
 * **Decode: a suspended call keeps its bytes, and only its bytes.** Everything
   the reader hands over is retained, so a field split across chunks is never
@@ -366,8 +470,17 @@ never provides a value buffer.**
   down to the first byte of the call in flight — that byte is the one a resumed
   call re-reads from. The window held is therefore one field (for a `skip()`
   over a sequence, one sequence), not one message.
+* **Decode: a fed chunk is borrowed for the call and no longer** (§6). Anything
+  the decoder still needs when `feed` returns — the tail of a construct split
+  across the boundary, a decoded string or blob — has been copied out of it, so
+  the same calling code is correct whatever the chunk boundaries happen to be.
+* **Decode into your own slots.** With a `Binding` the numeric fields never
+  become Python objects at all: they land in the `words` buffer you passed, sized
+  from the schema. The decoder allocates no destination and grows nothing, and a
+  wire count past your capacity is rejected rather than honoured (§6.6).
 * **Decode.** `Decoder` keeps a single internal buffer, refilled from the
-  `read(n)` source and never handed out, so there is **no zero-copy aliasing**:
+  `read(n)` source or from `feed` and never handed out, so there is **no
+  zero-copy aliasing**:
   `string()` returns a fresh `str`, `bytes()` independent `bytes`, scalars a
   fresh `int`/`float`, and arrays a new `list` — every result stays valid after
   the decoder advances. `fixlen_len()` peeks the current string/blob field's

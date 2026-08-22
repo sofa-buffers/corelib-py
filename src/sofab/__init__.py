@@ -15,6 +15,7 @@ import os as _os
 from typing import TYPE_CHECKING
 
 from ._varint import zigzag_decode, zigzag_encode
+from .binding import Binding
 from .types import (
     API_VERSION,
     ARRAY_MAX,
@@ -33,6 +34,7 @@ from .types import (
     SofaIncompleteError,
     SofaLimitError,
     SofaRangeError,
+    Status,
     WireType,
 )
 from .visitor import Visitor
@@ -87,8 +89,10 @@ __all__ = [
     "Encoder",
     "Decoder",
     "Visitor",
+    "Binding",
     "Field",
     "WireType",
+    "Status",
     "FixlenSubtype",
     "SofaError",
     "SofaDecodeError",
