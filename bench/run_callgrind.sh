@@ -15,12 +15,38 @@
 #
 #     Ir/op = ( Ir(R2) - Ir(R1) ) / ( R2 - R1 )
 #
-# which cancels *all* fixed cost exactly — interpreter startup, imports and the
-# one-time per-workload setup — leaving the pure per-operation cost.
+# which cancels every fixed cost the two legs *share* — interpreter startup,
+# imports and the one-time per-workload setup — leaving the pure per-operation
+# cost. Sharing them is not automatic; see the next paragraph.
+#
+# The two legs are separate processes, so their fixed costs are only equal if
+# they are made to be. Without a pinned hash seed each gets its own — the
+# interpreter startups measured here lie ~3.4e5 Ir apart across seeds — and what
+# fails to cancel lands in the result divided by (R2 - R1): an ABSOLUTE error of
+# a few thousand Ir on every row, however much the row is worth. Three runs of
+# the same commit, before and after pinning:
+#
+#     encode: typical        4896 / 11464 / 6298      ->  7813 / 7813 / 7813
+#     decode: typical       24810 / 26577 / 26769     -> 25551 / 25551 / 25551
+#
+# Pinning does not make the number exact — a handful of Ir still moves between
+# runs, and a *different* fixed seed lands a few tenths of a percent away
+# (7810 at seed 0 and 7, 7824 at seed 42), because the seed reaches the measured
+# loop's own dict lookups too. What it removes is the term that swamps them.
+#
+# The same residual is ±47% on a 7.8k row and ±5% on a 25k row, which is why
+# this has hidden for so long: on `decode: composite` (~246k) it reads as 1.4%
+# and looks like ordinary noise. It is worse still on the blob rows, where
+# BR2 - BR1 is 2 rather than 100. Since the whole point of this number is to be
+# gate-able, the seed is pinned below; override it only to see how much a row
+# depends on it.
 #
 # The blob 1MB rows use their own, much smaller rep counts (BR1/BR2, default
-# 1 and 3): a megabyte of copying per op is slow under Callgrind, and the
-# subtraction cancels fixed cost just as well at three reps as at three hundred.
+# 1 and 3): a megabyte of copying per op is slow under Callgrind, and with the
+# seed pinned the subtraction cancels fixed cost just as well at three reps as
+# at three hundred. (Without it those rows are the *worst* case, not an equal
+# one: the residual is divided by 2 instead of by 100.)
+#
 # Those rows are the ones this tool exists for — the one-shot/streaming delta is
 # the cost of §5.1's divisible-run path with the host's memory subsystem and
 # scheduler taken out of it, which is not something MB/s can show.
@@ -29,6 +55,7 @@
 # Usage:   bash bench/run_callgrind.sh          # defaults R1=10 R2=110, BR1=1 BR2=3
 #          R1=20 R2=520 bash bench/run_callgrind.sh
 #          WORKLOADS="encode_composite decode_composite" bash bench/run_callgrind.sh
+#          PYTHONHASHSEED=7 bash bench/run_callgrind.sh   # a different, still fixed seed
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,6 +65,10 @@ R1="${R1:-10}"
 R2="${R2:-110}"
 BR1="${BR1:-1}"
 BR2="${BR2:-3}"
+# Both legs of every subtraction must run with the same hash seed -- see the note
+# at the top. Exported rather than prefixed onto the valgrind line so nothing
+# invoked from here can be measured with a different one.
+export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
 
 if ! command -v valgrind >/dev/null 2>&1; then
     echo "error: valgrind not found (needed for instruction counts)." >&2
@@ -92,7 +123,7 @@ reps_for() {
 }
 
 echo ">> Measuring instructions/op under Callgrind (R1=$R1, R2=$R2;" \
-     "blob rows BR1=$BR1, BR2=$BR2; this is slow) ..."
+     "blob rows BR1=$BR1, BR2=$BR2; PYTHONHASHSEED=$PYTHONHASHSEED; this is slow) ..."
 echo
 echo "==============================================================================="
 echo " SofaBuffers Python instruction cost   (Callgrind, Ir/op)"
