@@ -51,8 +51,10 @@ cimport cython
 from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize, PyBytes_GET_SIZE
 from cpython.bytearray cimport PyByteArray_AS_STRING, PyByteArray_GET_SIZE
 from cpython.list cimport PyList_Append, PyList_GET_ITEM, PyList_GET_SIZE, PyList_New
+from cpython.buffer cimport (PyObject_GetBuffer, PyBuffer_Release,
+                             PyBUF_WRITABLE, PyBUF_SIMPLE)
 from cpython.long cimport PyLong_FromUnsignedLongLong, PyLong_FromLongLong
-from cpython.ref cimport PyObject
+from cpython.ref cimport PyObject, Py_INCREF
 from libc.stdint cimport uint32_t, uint64_t, int64_t
 from libc.stdlib cimport malloc, realloc, free
 from libc.string cimport memcpy
@@ -478,6 +480,11 @@ cdef extern from "Python.h":
     PyObject* _NewI64 "PyLong_FromLongLong" (int64_t) except NULL
     PyObject* _NewF64 "PyFloat_FromDouble" (double) except NULL
     void _SetItemSteal "PyList_SET_ITEM" (object, Py_ssize_t, PyObject*)
+    # Same steal, but for a slot that already holds an item: releases the old
+    # reference instead of leaking it. The array reads above fill a freshly
+    # allocated list and use the unchecked spelling; the push driver stores
+    # into a caller-supplied list and needs this one.
+    int _SetItemStealOwned "PyList_SetItem" (object, Py_ssize_t, PyObject*) except -1
     int _AppendBorrowed "PyList_Append" (object, PyObject*) except -1
     void _DecRef "Py_DECREF" (PyObject*)
 
@@ -501,6 +508,7 @@ from .types import (
     SofaIncompleteError,
     SofaLimitError,
     SofaRangeError,
+    Status,
     WireType,
 )
 
@@ -618,6 +626,7 @@ cdef int _ST_BLOB = 3
 # hand back the exact same singletons the pure path uses without paying the
 # IntEnum coercion on every field.
 cdef tuple _WT = tuple(WireType)
+cdef tuple _STATUS = tuple(Status)
 cdef tuple _ST = tuple(FixlenSubtype)
 
 # Pending-value kinds (mirror the pure decoder's _SCALAR/_FIXLEN/_VARRAY/_FARRAY).
@@ -1580,6 +1589,178 @@ cdef inline double _unpack_f64(const unsigned char* p) noexcept nogil:
 # Decoder
 # =============================================================================
 
+# --- compiled binding table (CORELIB_PLAN §5.2 / §5.3) -----------------------
+#
+# The C form of sofab.binding.Binding. A table is compiled once per Decoder, so
+# a decoder reused across messages (Decoder.reset) pays for it once; everything
+# after that is a field-id lookup that never leaves C.
+
+cdef int _K_UNSIGNED = 0
+cdef int _K_SIGNED = 1
+cdef int _K_FLOAT32 = 2
+cdef int _K_FLOAT64 = 3
+cdef int _K_STRING = 4
+cdef int _K_BYTES = 5
+cdef int _K_ARRAY_UNSIGNED = 6
+cdef int _K_ARRAY_SIGNED = 7
+cdef int _K_ARRAY_FLOAT32 = 8
+cdef int _K_ARRAY_FLOAT64 = 9
+cdef int _K_SEQUENCE = 10
+
+# What the push driver was doing when the bytes ran out, so the next feed()
+# resumes *that* call rather than walking on and auto-skipping the value the
+# caller is still owed (§5.2).
+cdef int _R_NONE = 0
+cdef int _R_SKIP = 1
+cdef int _R_BOUND = 2
+cdef int _R_VISIT = 3
+
+#: Highest field id still worth a direct-index lookup array. Above it the table
+#: falls back to a linear scan — schemas that sparse are rare, and 4096 ids cost
+#: 16 KB of index at most.
+cdef uint64_t _IDX_MAX_ID = 4096
+
+
+cdef struct _BEntry:
+    uint64_t field_id
+    int kind
+    int wt                  # wire type this binding accepts
+    int st                  # fixlen subtype, or -1 when the kind has none
+    Py_ssize_t at           # slot in words[] (or objects[] for string/blob)
+    Py_ssize_t cap          # array capacity / declared fixlen maxlen, 0 = none
+    Py_ssize_t count_at     # slot to write arrival into, or -1
+    int child               # table index of a sequence's child, or -1
+    bint elem_bounded       # the schema declares the array's element width
+    int64_t elem_lo
+    uint64_t elem_hi
+
+
+cdef struct _BTable:
+    Py_ssize_t first        # index of this table's first entry in _bent
+    Py_ssize_t n
+    int* idx                # id -> local entry index, or NULL for linear scan
+    uint64_t idx_max
+
+
+@cython.final
+cdef class _Compiled:
+    """The compiled form of a :class:`sofab.Binding`, owned by the Binding.
+
+    Compiling walks the table in Python — a few hundred attribute reads for a
+    real schema — which is more than a whole decode costs. A Binding is
+    build-once (see ``Binding.freeze``), so the result can be cached on it and
+    every Decoder built from that table reuses it. Held by the Binding *and* by
+    each Decoder, so it outlives either.
+    """
+
+    cdef _BEntry* bent
+    cdef _BTable* btab
+    cdef Py_ssize_t nent
+    cdef int ntab
+    cdef Py_ssize_t words_required
+    cdef Py_ssize_t objects_required
+
+    def __cinit__(self):
+        self.bent = NULL
+        self.btab = NULL
+        self.nent = 0
+        self.ntab = 0
+        self.words_required = 0
+        self.objects_required = 0
+
+    def __dealloc__(self):
+        cdef int i
+        if self.btab != NULL:
+            for i in range(self.ntab):
+                if self.btab[i].idx != NULL:
+                    free(self.btab[i].idx)
+            free(self.btab)
+            self.btab = NULL
+        if self.bent != NULL:
+            free(self.bent)
+            self.bent = NULL
+
+    cdef int build(self, object binding) except -1:
+        # Flatten the Binding tree into one entry array plus one table per
+        # sequence scope, and give each table a direct id->entry index where the
+        # ids are dense enough for one to be worth the memory.
+        cdef list tables = binding.freeze()
+        cdef dict seen = {}
+        cdef object b, e
+        cdef Py_ssize_t total = 0, k = 0, first, i, ntab
+        cdef int ti
+        cdef uint64_t maxid, fid
+        cdef int* idx
+
+        ntab = len(tables)
+        for i in range(ntab):
+            seen[id(tables[i])] = i
+            total += len(tables[i]._entries)
+        self.words_required = <Py_ssize_t>binding.tree_words_required
+        self.objects_required = <Py_ssize_t>binding.tree_objects_required
+
+        self.btab = <_BTable*>malloc(ntab * sizeof(_BTable))
+        if self.btab == NULL:
+            raise MemoryError()
+        self.ntab = <int>ntab
+        for ti in range(self.ntab):
+            self.btab[ti].idx = NULL
+            self.btab[ti].first = 0
+            self.btab[ti].n = 0
+            self.btab[ti].idx_max = 0
+        # malloc(0) may legally return NULL, which would read as failure.
+        self.bent = <_BEntry*>malloc((total if total else 1) * sizeof(_BEntry))
+        if self.bent == NULL:
+            raise MemoryError()
+        self.nent = total
+
+        for ti in range(self.ntab):
+            b = tables[ti]
+            first = k
+            maxid = 0
+            for e in b._entries:
+                fid = <uint64_t>e.field_id
+                self.bent[k].field_id = fid
+                self.bent[k].kind = <int>e.kind
+                self.bent[k].wt = <int>e.wt
+                self.bent[k].st = -1 if e.st is None else <int>e.st
+                self.bent[k].at = <Py_ssize_t>e.at
+                self.bent[k].cap = <Py_ssize_t>e.cap
+                self.bent[k].count_at = <Py_ssize_t>e.count_at
+                self.bent[k].child = <int>seen[id(e.child)] if e.child is not None else -1
+                self.bent[k].elem_bounded = <bint>e.elem_bounded
+                self.bent[k].elem_lo = <int64_t>e.elem_lo
+                self.bent[k].elem_hi = <uint64_t>e.elem_hi
+                if fid > maxid:
+                    maxid = fid
+                k += 1
+            self.btab[ti].first = first
+            self.btab[ti].n = k - first
+            self.btab[ti].idx_max = maxid
+            if k > first and maxid <= _IDX_MAX_ID:
+                idx = <int*>malloc(<Py_ssize_t>(maxid + 1) * sizeof(int))
+                if idx == NULL:
+                    raise MemoryError()
+                for i in range(<Py_ssize_t>(maxid + 1)):
+                    idx[i] = -1
+                for i in range(k - first):
+                    idx[self.bent[first + i].field_id] = <int>i
+                self.btab[ti].idx = idx
+        return 0
+
+
+cdef _Compiled _compiled_for(object binding):
+    """The Binding's compiled table, built on first use and cached on it."""
+    cdef object cached = binding._compiled
+    cdef _Compiled c
+    if type(cached) is _Compiled:
+        return <_Compiled>cached
+    c = _Compiled.__new__(_Compiled)
+    c.build(binding)
+    binding._compiled = c
+    return c
+
+
 cdef class Decoder:
     """Native pull decoder — see :class:`sofab.decoder.Decoder` for the contract.
 
@@ -1606,6 +1787,8 @@ cdef class Decoder:
     cdef Py_ssize_t _pos
     cdef int _depth
     cdef object _cur
+    # Field id of the header _next_wire last parsed, unboxed.
+    cdef uint64_t _cur_id
     # Wire type of ``_cur`` as a plain int (-1 before the first field / at EOF),
     # so the internal dispatch in skip()/drive() compares C ints instead of
     # rich-comparing WireType members.
@@ -1627,9 +1810,68 @@ cdef class Decoder:
     cdef Py_ssize_t _floor
     cdef int _keep_cur_wtype
 
-    def __cinit__(self, reader, *, int chunk_size=65536,
+    # --- push mode (§5.2) ---------------------------------------------------
+    cdef object _binding             # the Binding this table was compiled from
+    cdef object _visitor
+    cdef object _objects             # list destination for string/blob fields
+    cdef _Compiled _tables          # keeps the compiled table alive
+    cdef _BEntry* _bent
+    cdef _BTable* _btab
+    cdef uint64_t* _words            # caller-owned slot buffer
+    # Heap-allocated rather than inline: a Py_buffer is 80 bytes and only a
+    # decoder with a binding ever fills one, so keeping it out of the struct
+    # keeps every pull decoder — one per message on the one-shot path — smaller.
+    cdef Py_buffer* _wview
+    cdef Py_ssize_t _nwords
+    # Active table, and the enclosing ones: a sequence opens a fresh id scope
+    # (§4.9), so descending REPLACES the table rather than layering onto it.
+    cdef int _tab
+    cdef int* _tstack               # allocated on the first descent, not before
+    cdef int _tsp
+    cdef int _status
+    cdef object _err
+    cdef int _resume_kind
+    cdef Py_ssize_t _resume_entry
+    cdef bint _running
+
+    def __cinit__(self, reader=None, *, binding=None, visitor=None,
+                  words=None, objects=None, int chunk_size=65536,
                   max_array_count=None, max_string_len=None, max_blob_len=None):
-        self._read = reader.read
+        self._tables = None
+        self._bent = NULL
+        self._btab = NULL
+        self._words = NULL
+        self._wview = NULL
+        self._nwords = 0
+        self._tab = -1
+        self._tstack = NULL
+        self._tsp = 0
+        self._status = <int>Status.COMPLETE
+        self._err = None
+        self._resume_kind = _R_NONE
+        self._resume_entry = -1
+        self._running = False
+        self._binding = binding
+        self._visitor = visitor
+        self._objects = objects
+        if reader is None:
+            if binding is None and visitor is None:
+                raise SofaRangeError(
+                    "a decoder needs a byte source (reader) or a field handler "
+                    "(binding / visitor)")
+            self._read = None
+        else:
+            if binding is not None or visitor is not None:
+                raise SofaRangeError(
+                    "a reader is the pull shape; drive it with next()/drive() "
+                    "rather than a push handler")
+            self._read = reader.read
+        if binding is not None:
+            self._tables = _compiled_for(binding)
+            self._bent = self._tables.bent
+            self._btab = self._tables.btab
+            self._bind_words(words, objects)
+            self._tab = 0
         self._chunk = chunk_size
         self._max_array_count = max_array_count
         self._max_string_len = max_string_len
@@ -1649,6 +1891,16 @@ cdef class Decoder:
         self._floor = -1
         self._keep_cur_wtype = -1
 
+    def __dealloc__(self):
+        # _bent / _btab belong to the cached _Compiled, not to this decoder.
+        if self._tstack != NULL:
+            free(self._tstack)
+            self._tstack = NULL
+        if self._wview != NULL:
+            PyBuffer_Release(self._wview)
+            free(self._wview)
+            self._wview = NULL
+
     cdef inline void _rebind(self, bytes newbuf):
         self._buf = newbuf
         self._p = <const unsigned char*>PyBytes_AS_STRING(newbuf)
@@ -1663,7 +1915,7 @@ cdef class Decoder:
     # bytes already parsed stay buffered, so re-issuing the call re-parses the
     # construct from its first byte. The pending value / depth / current field
     # are committed only after the construct's last byte is in hand, which is why
-    # the rewind is a cursor (plus the current wire type, which _next_field
+    # the rewind is a cursor (plus the current wire type, which _next_wire
     # publishes before the varints that trail a fixlen/array header). INVALID is
     # terminal and is deliberately not rewound.
 
@@ -1707,6 +1959,12 @@ cdef class Decoder:
                 self._floor -= base
         want = pos + n
         if PyBytes_GET_SIZE(buf) < want:
+            if self._read is None:
+                # Push mode: nothing to pull from. The bytes end here until the
+                # caller feeds more, which is exactly §5.2's INCOMPLETE.
+                self._rebind(buf)
+                self._pos = pos
+                return False
             req = want - PyBytes_GET_SIZE(buf)
             if req < <Py_ssize_t>self._chunk:
                 req = <Py_ssize_t>self._chunk
@@ -1936,12 +2194,26 @@ cdef class Decoder:
         return self._cur
 
     def next(self):
-        return self._next_field()
+        # Calls _next_wire directly rather than through _next_field: this is the
+        # pull API's per-field hot path, and the wrapper would add a second cdef
+        # call to every field of every message.
+        if self._next_wire(True) < 0:
+            return None
+        return self._cur
 
-    cdef object _next_field(self):
-        # The body of ``next()``, callable from C: ``skip()`` and ``drive()``
-        # both iterate fields, and going through the Python method wrapper for
-        # every one of them costs a full attribute lookup and call frame.
+    cdef int _next_wire(self, bint want_field) except -2:
+        # Parse one field header and publish its identity; returns the wire type,
+        # or -1 at clean EOF. ``skip()``, ``drive()`` and the push driver all
+        # iterate fields, and going through the Python method wrapper for every
+        # one of them costs a full attribute lookup and call frame.
+        #
+        # ``want_field`` is what the push driver buys its speed with. A caller
+        # that binds fields to destinations (see FeedBinding) never looks at a
+        # Field object, and building one per field means an allocation plus up to
+        # five boxed ints — measurably more than parsing the header. With it
+        # False nothing is boxed that the wire does not force: the id, the fixlen
+        # length and the array count stay in C registers unless a Field is asked
+        # for or a configured receiver cap has to compare against them.
         cdef uint64_t header
         cdef int wtype
         cdef object field_id
@@ -1959,12 +2231,15 @@ cdef class Decoder:
             if self._depth != 0:
                 raise self._suspend("truncated: unbalanced sequence")
             self._cur_wtype = -1
-            return None
+            if want_field:
+                self._cur = None
+            return -1
 
         header = self._varint()
         wtype = <int>(header & 0x07)
         fid = header >> 3
         self._cur_wtype = wtype
+        self._cur_id = fid
 
         # ID_MAX bounds every header's id (§6.2), the sequence end included even
         # though its id is discarded (§4.9); validate before the wire-type
@@ -1976,23 +2251,26 @@ cdef class Decoder:
             if self._depth <= 0:
                 raise SofaDecodeError("unbalanced sequence end")
             self._depth -= 1
-            self._cur = _mkfield(_ZERO, _WT[_WT_SEQUENCE_END], _ZERO, _ZERO, _NONE)
-            return self._cur
-
-        field_id = PyLong_FromUnsignedLongLong(fid)
+            if want_field:
+                self._cur = _mkfield(_ZERO, _WT[_WT_SEQUENCE_END], _ZERO, _ZERO, _NONE)
+            return wtype
 
         if wtype == _WT_SEQUENCE_START:
             if self._depth >= _MAX_DEPTH:
                 raise SofaDecodeError("nesting exceeds MAX_DEPTH=%d" % _MAX_DEPTH)
             self._depth += 1
-            self._cur = _mkfield(field_id, _WT[_WT_SEQUENCE_START], _ZERO, _ZERO, _NONE)
-            return self._cur
+            if want_field:
+                self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
+                                     _WT[_WT_SEQUENCE_START], _ZERO, _ZERO, _NONE)
+            return wtype
 
         if wtype == _WT_UNSIGNED or wtype == _WT_SIGNED:
-            self._cur = _mkfield(field_id, _WT[wtype], _ZERO, _ZERO, _NONE)
             self._pk = _PEND_SCALAR
             self._pend_wtype = wtype
-            return self._cur
+            if want_field:
+                self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
+                                     _WT[wtype], _ZERO, _ZERO, _NONE)
+            return wtype
 
         if wtype == _WT_FIXLEN:
             length_header = self._varint()
@@ -2012,10 +2290,6 @@ cdef class Decoder:
                 raise SofaDecodeError("fp32 fixlen length must be 4")
             if subtype == _ST_FP64 and length != 8:
                 raise SofaDecodeError("fp64 fixlen length must be 8")
-            # One boxed length, reused: it is the Field's ``size`` and the value
-            # a configured cap is compared against and named in its message.
-            boxed = PyLong_FromUnsignedLongLong(length)
-            self._cur = _mkfield(field_id, _WT[_WT_FIXLEN], boxed, _ZERO, _ST[subtype])
             self._pk = _PEND_FIXLEN
             self._pend_subtype = subtype
             self._pend_size = length
@@ -2025,32 +2299,46 @@ cdef class Decoder:
             # value rather than raised, so the caller keeps the §6.2.1 window in
             # which it can declare the field schema-bounded and take the cap off
             # it. Every consume path raises it; see _park_limit / _mismatch.
+            cap = _NONE
             if subtype == _ST_STRING:
                 cap = self._max_string_len
-                if cap is not None and boxed > cap:
-                    self._park_limit("string length %d exceeds max_string_len %s"
-                                     % (boxed, cap))
             elif subtype == _ST_BLOB:
                 cap = self._max_blob_len
+            if want_field or cap is not None:
+                # One boxed length, reused: it is the Field's ``size`` and the
+                # value a configured cap is compared against and named in its
+                # message. Neither is wanted on the bound path, so neither is
+                # built there.
+                boxed = PyLong_FromUnsignedLongLong(length)
+                if want_field:
+                    self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
+                                         _WT[_WT_FIXLEN], boxed, _ZERO, _ST[subtype])
                 if cap is not None and boxed > cap:
-                    self._park_limit("blob length %d exceeds max_blob_len %s"
-                                     % (boxed, cap))
-            return self._cur
+                    if subtype == _ST_STRING:
+                        self._park_limit("string length %d exceeds max_string_len %s"
+                                         % (boxed, cap))
+                    else:
+                        self._park_limit("blob length %d exceeds max_blob_len %s"
+                                         % (boxed, cap))
+            return wtype
 
         if wtype == _WT_ARRAY_UNSIGNED or wtype == _WT_ARRAY_SIGNED:
             count = self._varint()
             if count > _ARRAY_MAX:
                 raise SofaDecodeError("array count %d out of range" % PyLong_FromUnsignedLongLong(count))
-            boxed = PyLong_FromUnsignedLongLong(count)   # see the fixlen branch
-            self._cur = _mkfield(field_id, _WT[wtype], _ZERO, boxed, _NONE)
             self._pk = _PEND_VARRAY
             self._pend_wtype = wtype
             self._pend_count = count
-            # Parked, not raised — see the fixlen branch above (§6.2.1).
             cap = self._max_array_count
-            if cap is not None and boxed > cap:
-                self._park_limit("array count %d exceeds max_array_count %s" % (boxed, cap))
-            return self._cur
+            if want_field or cap is not None:
+                boxed = PyLong_FromUnsignedLongLong(count)   # see the fixlen branch
+                if want_field:
+                    self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
+                                         _WT[wtype], _ZERO, boxed, _NONE)
+                # Parked, not raised — see the fixlen branch above (§6.2.1).
+                if cap is not None and boxed > cap:
+                    self._park_limit("array count %d exceeds max_array_count %s" % (boxed, cap))
+            return wtype
 
         # wtype == _WT_ARRAY_FIXLEN
         count = self._varint()
@@ -2074,18 +2362,22 @@ cdef class Decoder:
             raise SofaDecodeError("fp32 fixlen-array element size must be 4")
         if subtype == _ST_FP64 and elem_size != 8:
             raise SofaDecodeError("fp64 fixlen-array element size must be 8")
-        boxed = PyLong_FromUnsignedLongLong(count)      # see the fixlen branch
-        self._cur = _mkfield(field_id, _WT[_WT_ARRAY_FIXLEN],
-                             PyLong_FromUnsignedLongLong(elem_size), boxed, _ST[subtype])
         self._pk = _PEND_FARRAY
         self._pend_subtype = subtype
         self._pend_count = count
         self._pend_size = elem_size
-        # Parked, not raised — see the fixlen branch above (§6.2.1).
         cap = self._max_array_count
-        if cap is not None and boxed > cap:
-            self._park_limit("array count %d exceeds max_array_count %s" % (boxed, cap))
-        return self._cur
+        if want_field or cap is not None:
+            boxed = PyLong_FromUnsignedLongLong(count)      # see the fixlen branch
+            if want_field:
+                self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
+                                     _WT[_WT_ARRAY_FIXLEN],
+                                     PyLong_FromUnsignedLongLong(elem_size), boxed,
+                                     _ST[subtype])
+            # Parked, not raised — see the fixlen branch above (§6.2.1).
+            if cap is not None and boxed > cap:
+                self._park_limit("array count %d exceeds max_array_count %s" % (boxed, cap))
+        return wtype
 
     # --- receiver caps vs. schema bounds (§6.2.1) ---------------------------
 
@@ -2173,7 +2465,7 @@ cdef class Decoder:
         cdef object cur
         if self._cur_wtype == _WT_SEQUENCE_START:
             # Walking a whole sequence spans many fields, so unlike every other
-            # call this one moves the field state — and lets _next_field re-arm
+            # call this one moves the field state — and lets _next_wire re-arm
             # _keep — before it can suspend. _floor pins the refill path's
             # compaction at the first byte *inside* the sequence for the
             # duration, and the field state is put back here, so a re-issued
@@ -2190,7 +2482,7 @@ cdef class Decoder:
             target = depth - 1
             try:
                 while self._depth > target:
-                    if self._next_field() is None:
+                    if self._next_wire(False) < 0:
                         raise self._suspend("truncated sequence")
             except SofaIncompleteError:
                 self._pos = self._floor
@@ -2414,6 +2706,411 @@ cdef class Decoder:
     def read_float64_array(self):
         return self._read_farray(_ST_FP64, 8)
 
+    # --- push-feed driver (CORELIB_PLAN §5.2) -------------------------------
+    #
+    # The native half of sofab.decoder.Decoder's push mode — same API, same
+    # outcomes, and the reason it exists: with a Binding installed a whole field
+    # crosses into Python zero times. The header parses in C, the destination is
+    # a C pointer, an integer array is a C loop over the fed buffer, and only a
+    # string or blob — which have no fixed-width machine form — allocates.
+
+    cdef int _bind_words(self, object words, object objects) except -1:
+        cdef Py_ssize_t need
+        if words is None:
+            raise SofaRangeError("a binding needs a words buffer")
+        self._wview = <Py_buffer*>malloc(sizeof(Py_buffer))
+        if self._wview == NULL:
+            raise MemoryError()
+        try:
+            PyObject_GetBuffer(words, self._wview, PyBUF_WRITABLE | PyBUF_SIMPLE)
+        except (BufferError, TypeError) as exc:
+            free(self._wview)
+            self._wview = NULL
+            # The pure engine reaches the same verdict through memoryview and
+            # reports it as §6.3 InvalidArgument. §5.3 requires the accelerator
+            # to be invisible, so it must not surface a different exception type.
+            raise SofaRangeError(
+                "the words buffer must be a writable, contiguous buffer") from exc
+        if self._wview.len % 8:
+            raise SofaRangeError("the words buffer must be a multiple of 8 bytes")
+        self._words = <uint64_t*>self._wview.buf
+        self._nwords = self._wview.len // 8
+        need = self._tables.words_required
+        if self._nwords < need:
+            raise SofaRangeError("words buffer holds %d slots, the binding needs %d"
+                                 % (self._nwords, need))
+        need = self._tables.objects_required
+        if objects is None:
+            if need:
+                raise SofaRangeError("a binding with string/blob fields needs objects")
+        elif <Py_ssize_t>len(objects) < need:
+            raise SofaRangeError("objects holds %d entries, the binding needs %d"
+                                 % (len(objects), need))
+        return 0
+
+    cdef inline int _push_table(self, int tab) except -1:
+        # MAX_DEPTH already bounds nesting (checked in _next_wire), so one
+        # allocation of that size covers every message that can be decoded.
+        if self._tstack == NULL:
+            self._tstack = <int*>malloc((_MAX_DEPTH + 1) * sizeof(int))
+            if self._tstack == NULL:
+                raise MemoryError()
+        self._tstack[self._tsp] = self._tab
+        self._tsp += 1
+        self._tab = tab
+        return 0
+
+    cdef inline Py_ssize_t _lookup(self, uint64_t fid) noexcept:
+        cdef _BTable* t = &self._btab[self._tab]
+        cdef Py_ssize_t i
+        cdef int local
+        if t.idx != NULL:
+            if fid > t.idx_max:
+                return -1
+            local = t.idx[fid]
+            return t.first + local if local >= 0 else -1
+        for i in range(t.n):
+            if self._bent[t.first + i].field_id == fid:
+                return t.first + i
+        return -1
+
+    @property
+    def error(self):
+        return self._err
+
+    @property
+    def status(self):
+        return _STATUS[self._status]
+
+    @cython.always_allow_keywords(True)
+    def feed(self, data):
+        """Consume ``data`` and report the outcome for the bytes so far (§5.2).
+
+        See :meth:`sofab.decoder.Decoder.feed` for the contract; this is the
+        same call with the loop in C.
+        """
+        cdef bytes chunk
+        cdef bytes buf
+        if self._read is not None:
+            raise SofaRangeError("feed() is the push shape; this decoder has a reader")
+        if self._running:
+            raise SofaRangeError("feed() is not re-entrant")
+        if self._status == <int>Status.INVALID:
+            return Status.INVALID
+        chunk = data if type(data) is bytes else bytes(data)
+        buf = self._buf
+        if self._pos:
+            buf = buf[self._pos:]
+        # ``bytes`` is immutable, so with no carry the chunk can be adopted
+        # rather than copied — and copying is exactly what §6's chunk-lifetime
+        # rule demands for every other input, which bytes(data) above does.
+        self._rebind(buf + chunk if PyBytes_GET_SIZE(buf) else chunk)
+        self._pos = 0
+        self._keep = 0
+        self._floor = -1
+        self._running = True
+        try:
+            self._drive_push()
+        except SofaIncompleteError:
+            self._status = <int>Status.INCOMPLETE
+            return Status.INCOMPLETE
+        except SofaDecodeError as exc:
+            self._err = exc
+            self._status = <int>Status.INVALID
+            return Status.INVALID
+        finally:
+            self._running = False
+        self._status = <int>Status.COMPLETE
+        return Status.COMPLETE
+
+    def reset(self):
+        """Forget the stream and start a new message, keeping the compiled
+        binding and its destinations. See the pure engine for the contract."""
+        self._rebind(b"")
+        self._pos = 0
+        self._depth = 0
+        self._cur = None
+        self._cur_wtype = -1
+        self._spill = None
+        self._pk = _PEND_NONE
+        self._pk_real = _PEND_NONE
+        self._limit_msg = None
+        self._keep = 0
+        self._floor = -1
+        self._keep_cur_wtype = -1
+        self._status = <int>Status.COMPLETE
+        self._err = None
+        self._resume_kind = _R_NONE
+        self._resume_entry = -1
+        self._tsp = 0
+        self._tab = 0 if self._binding is not None else -1
+
+    cdef int _drive_push(self) except -1:
+        cdef int t, rk
+        cdef Py_ssize_t ei
+        cdef _BEntry* e
+        cdef object visitor = self._visitor
+        cdef bint want_field = visitor is not None
+
+        rk = self._resume_kind
+        if rk != _R_NONE:
+            # A value read ran out of bytes last time. Finish *it* — walking on
+            # to the next header would auto-skip the value the caller is owed.
+            self._resume_kind = _R_NONE
+            try:
+                if rk == _R_BOUND:
+                    self._take_bound(&self._bent[self._resume_entry])
+                elif rk == _R_VISIT:
+                    self._visit_value(visitor)
+                else:
+                    self._skip()
+            except SofaIncompleteError:
+                self._resume_kind = rk
+                raise
+
+        while True:
+            t = self._next_wire(want_field)
+            if t < 0:
+                return 0
+
+            if t == _WT_SEQUENCE_END:
+                if self._tsp > 0:
+                    self._tsp -= 1
+                    self._tab = self._tstack[self._tsp]
+                if visitor is not None:
+                    visitor.on_sequence_end()
+                continue
+
+            ei = self._lookup(self._cur_id) if self._tab >= 0 else -1
+            if ei >= 0:
+                e = &self._bent[ei]
+                if e.wt != t or (e.st >= 0 and e.st != self._pend_subtype):
+                    # §7.3: the wire tag contradicts what the schema declared
+                    # for this id. Not an error — treated like an unknown id.
+                    ei = -1
+                    if t != _WT_SEQUENCE_START:
+                        continue
+
+            if t == _WT_SEQUENCE_START:
+                if ei >= 0:
+                    e = &self._bent[ei]
+                    self._push_table(e.child)
+                    if e.count_at >= 0:
+                        self._words[e.count_at] += 1
+                    continue
+                if visitor is not None and visitor.on_sequence_begin(self._cur.id) is not False:
+                    # §4.9 opens a fresh id scope, so the enclosing table must
+                    # not match inside it.
+                    self._push_table(-1)
+                    continue
+                try:
+                    self._skip()
+                except SofaIncompleteError:
+                    self._resume_kind = _R_SKIP
+                    raise
+                continue
+
+            if ei >= 0:
+                try:
+                    self._take_bound(&self._bent[ei])
+                except SofaIncompleteError:
+                    self._resume_kind = _R_BOUND
+                    self._resume_entry = ei
+                    raise
+                continue
+
+            if visitor is not None:
+                if visitor.on_field(self._cur) is False:
+                    continue
+                try:
+                    self._visit_value(visitor)
+                except SofaIncompleteError:
+                    self._resume_kind = _R_VISIT
+                    raise
+                continue
+            # Nobody wants it: the pending value stays pending and the next
+            # header discards it, which suspends in exactly the same place as an
+            # explicit skip would and costs one less call.
+
+    cdef int _take_bound(self, _BEntry* e) except -1:
+        # Decode the current field straight into the destination ``e`` names.
+        # Consumes nothing on the suspension path, like every other read, so the
+        # retry redoes the whole value — including refilling a partly written
+        # array from element zero (§5.2).
+        cdef Py_ssize_t at = e.at
+        cdef uint64_t got = 1
+        cdef int k = e.kind
+        cdef const unsigned char* p
+        if k == _K_UNSIGNED:
+            self._words[at] = self._take_scalar()
+        elif k == _K_SIGNED:
+            (<int64_t*>self._words)[at] = _zigzag_decode(self._take_scalar())
+        elif k == _K_FLOAT64:
+            (<double*>self._words)[at] = _unpack_f64(self._take_fixlen_ptr(8))
+        elif k == _K_FLOAT32:
+            (<double*>self._words)[at] = _unpack_f32(self._take_fixlen_ptr(4))
+        elif k == _K_STRING or k == _K_BYTES:
+            self._unpark(e.cap)
+            if self._pk == _PEND_LIMIT:
+                # No declared bound, so the receiver-side cap still applies and
+                # has already rejected this field (§6.2.1). The typed reads reach
+                # this through _mismatch; _take_object below goes straight to the
+                # payload, so the parked verdict has to be raised here or it
+                # would be silently ignored.
+                raise SofaLimitError(self._limit_msg)
+            if e.cap and self._pend_size > <uint64_t>e.cap:
+                raise SofaDecodeError(
+                    "fixlen length %d exceeds the %d the schema declares"
+                    % (PyLong_FromUnsignedLongLong(self._pend_size), e.cap))
+            self._take_object(k, at)
+        elif k == _K_SEQUENCE:
+            return 0        # the driver owns the descent
+        else:
+            got = self._pend_count
+            # Binding an array always declares its element bound, so the field is
+            # schema-bounded and the receiver-side cap never applies to it.
+            self._unpark(1)
+            if got > <uint64_t>e.cap:
+                # The destination's size is the schema's bound, so a longer
+                # array is a malformed message rather than a receiver policy
+                # call (MESSAGE_SPEC §7.1) — and it is rejected here, at the
+                # count header, before an element is read (§5.2).
+                raise SofaDecodeError(
+                    "array count %d exceeds the %d the schema declares"
+                    % (PyLong_FromUnsignedLongLong(got), e.cap))
+            if k == _K_ARRAY_UNSIGNED:
+                self._fill_varints(self._words + at, <Py_ssize_t>got, False, e)
+            elif k == _K_ARRAY_SIGNED:
+                self._fill_varints(self._words + at, <Py_ssize_t>got, True, e)
+            elif k == _K_ARRAY_FLOAT32:
+                self._fill_farray((<double*>self._words) + at, <Py_ssize_t>got, 4)
+            else:
+                self._fill_farray((<double*>self._words) + at, <Py_ssize_t>got, 8)
+        if e.count_at >= 0:
+            self._words[e.count_at] = got
+        return 0
+
+    cdef inline void _unpark(self, Py_ssize_t declared) noexcept:
+        # A field the binding declares a bound for is schema-bounded, so the
+        # receiver-side cap does not apply to it (§6.2.1). Same effect as
+        # schema_bounded(), without the Python call.
+        if declared and self._pk == _PEND_LIMIT:
+            self._pk = self._pk_real
+            self._limit_msg = None
+
+    cdef int _take_object(self, int kind, Py_ssize_t at) except -1:
+        cdef Py_ssize_t n = <Py_ssize_t>self._pend_size
+        cdef const unsigned char* p = self._take_fixlen_ptr(n)
+        cdef object value
+        if kind == _K_STRING:
+            try:
+                value = PyUnicode_DecodeUTF8(<const char*>p, n, NULL)
+            except UnicodeDecodeError as exc:
+                raise SofaDecodeError("invalid UTF-8 in string field") from exc
+        elif self._spill is not None:
+            value = self._spill      # already an exact-size bytes; hand it over
+        else:
+            value = PyBytes_FromStringAndSize(<const char*>p, n)
+        # The slot may already hold a value from a previous message, so the old
+        # reference has to go rather than leak.
+        Py_INCREF(value)
+        _SetItemStealOwned(self._objects, at, <PyObject*>value)
+        return 0
+
+    cdef int _fill_varints(self, uint64_t* dst, Py_ssize_t count, bint zigzag,
+                           _BEntry* e) except -1:
+        # _read_varints without the list: the elements go straight from the fed
+        # buffer into the caller's slots, so an array costs no allocation and no
+        # Python object per element.
+        cdef Py_ssize_t pos, n, i = 0
+        cdef const unsigned char* p
+        cdef _Varint v
+        cdef uint64_t result
+        cdef int64_t sv
+        cdef bint bounded = e.elem_bounded
+        self._arm()
+        pos = self._pos
+        p = self._p
+        n = self._n
+        while i < count:
+            if n - pos >= 10:
+                # Whole element guaranteed buffered: no per-byte bounds test.
+                v = _varint_take(p + pos)
+                if v.used < 0:
+                    raise SofaDecodeError("overlong varint")
+                pos += v.used
+                result = v.value
+            else:
+                # Near the end of the buffer an element may straddle the chunk.
+                self._pos = pos
+                result = self._varint_refill()
+                p = self._p
+                pos = self._pos
+                n = self._n
+            if zigzag:
+                sv = _zigzag_decode(result)
+                # Checked AT the element, before it is stored, so the INVALID is
+                # reached before a truncation behind the bad element (§7.1/§5.2).
+                if bounded and (sv < e.elem_lo or sv > <int64_t>e.elem_hi):
+                    raise SofaDecodeError("array element outside declared width")
+                (<int64_t*>dst)[i] = sv
+            else:
+                if bounded and result > e.elem_hi:
+                    raise SofaDecodeError("array element outside declared width")
+                dst[i] = result
+            i += 1
+        self._pos = pos
+        self._pk = _PEND_NONE   # committed only once the payload is in hand
+        return 0
+
+    cdef int _fill_farray(self, double* dst, Py_ssize_t count, int width) except -1:
+        cdef Py_ssize_t nbytes = self._farray_nbytes(self._pend_count, self._pend_size)
+        cdef const unsigned char* p
+        cdef Py_ssize_t i
+        self._arm()
+        if self._n - self._pos < nbytes and not self._need(nbytes):
+            raise self._suspend("truncated payload")
+        p = self._p + self._pos
+        if width == 4:
+            for i in range(count):
+                dst[i] = _unpack_f32(p + i * 4)
+        else:
+            for i in range(count):
+                dst[i] = _unpack_f64(p + i * 8)
+        self._pos += nbytes
+        self._pk = _PEND_NONE
+        return 0
+
+    cdef int _visit_value(self, object visitor) except -1:
+        # The value half of a visitor dispatch. Every read is chosen by the
+        # field's own wire type, so none can hit the §7.3 mismatch path.
+        cdef int t = self._cur_wtype
+        cdef object f = self._cur
+        cdef object st
+        if t == _WT_UNSIGNED:
+            visitor.on_unsigned(f.id, self.unsigned())
+        elif t == _WT_SIGNED:
+            visitor.on_signed(f.id, self.signed())
+        elif t == _WT_FIXLEN:
+            st = f.subtype
+            if st == _ST[_ST_FP32]:
+                visitor.on_float32(f.id, self.float32())
+            elif st == _ST[_ST_FP64]:
+                visitor.on_float64(f.id, self.float64())
+            elif st == _ST[_ST_STRING]:
+                visitor.on_string(f.id, self.string())
+            else:
+                visitor.on_bytes(f.id, self.bytes())
+        elif t == _WT_ARRAY_UNSIGNED:
+            visitor.on_unsigned_array(f.id, self.read_unsigned_array())
+        elif t == _WT_ARRAY_SIGNED:
+            visitor.on_signed_array(f.id, self.read_signed_array())
+        elif f.subtype == _ST[_ST_FP32]:
+            visitor.on_float32_array(f.id, self.read_float32_array())
+        else:
+            visitor.on_float64_array(f.id, self.read_float64_array())
+        return 0
+
     # --- visitor driver -----------------------------------------------------
 
     @cython.always_allow_keywords(True)
@@ -2424,10 +3121,10 @@ cdef class Decoder:
         cdef int t
         cdef object st
         while True:
-            f = self._next_field()
-            if f is None:
+            t = self._next_wire(True)
+            if t < 0:
                 break
-            t = self._cur_wtype
+            f = self._cur
             if t == _WT_SEQUENCE_END:
                 visitor.on_sequence_end()
             elif t == _WT_SEQUENCE_START:
