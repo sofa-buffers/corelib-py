@@ -13,10 +13,11 @@ import json
 import struct
 import sys
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
-from sofab import Encoder
+from sofab import Encoder, Field, Status, Visitor
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
 
@@ -77,22 +78,90 @@ DBL_MAX = sys.float_info.max
 FP64_FROM_FLOAT = struct.unpack("<f", struct.pack("<f", 3.14159265))[0]
 
 
-class ChunkReader:
-    """A ``read(n)``-compatible source that hands out at most ``chunk`` bytes per
-    call — used to exercise streaming decode at fine granularity (default: 1)."""
+class Recorder(Visitor):
+    """Records every field the decoder hands over, in order.
 
-    def __init__(self, data: bytes, chunk: int = 1) -> None:
-        self._data = bytes(data)
-        self._pos = 0
-        self._chunk = chunk
+    The decoder is push-only, so this is how a test sees a message: feed the
+    bytes, read the events back. ``events`` holds one tuple per field —
+    ``(kind, field_id, value)`` for a value, ``("seq{", id)`` / ``("seq}",)``
+    for sequence framing — and ``fields`` the :class:`Field` each one arrived
+    with, for the tests that assert on wire metadata rather than on values.
+    """
 
-    def read(self, n: int) -> bytes:
-        if self._pos >= len(self._data):
-            return b""
-        end = min(self._pos + min(n, self._chunk), len(self._data))
-        out = self._data[self._pos : end]
-        self._pos = end
-        return out
+    def __init__(self, decline: Callable[[Field], bool] | None = None) -> None:
+        self.events: list[tuple] = []
+        self.fields: list[Field] = []
+        self._decline = decline
+
+    def on_field(self, field: Field) -> bool | None:
+        self.fields.append(field)
+        return False if self._decline is not None and self._decline(field) else None
+
+    def on_sequence_begin(self, field_id):
+        self.events.append(("seq{", field_id))
+        return None
+
+    def on_sequence_end(self):
+        self.events.append(("seq}",))
+
+    def on_unsigned(self, field_id, value):
+        self.events.append(("u", field_id, value))
+
+    def on_signed(self, field_id, value):
+        self.events.append(("s", field_id, value))
+
+    def on_float32(self, field_id, value):
+        self.events.append(("f32", field_id, value))
+
+    def on_float64(self, field_id, value):
+        self.events.append(("f64", field_id, value))
+
+    def on_string(self, field_id, value):
+        self.events.append(("str", field_id, value))
+
+    def on_bytes(self, field_id, value):
+        self.events.append(("blob", field_id, value))
+
+    def on_unsigned_array(self, field_id, values):
+        self.events.append(("ua", field_id, tuple(values)))
+
+    def on_signed_array(self, field_id, values):
+        self.events.append(("sa", field_id, tuple(values)))
+
+    def on_float32_array(self, field_id, values):
+        self.events.append(("f32a", field_id, tuple(values)))
+
+    def on_float64_array(self, field_id, values):
+        self.events.append(("f64a", field_id, tuple(values)))
+
+
+def walk(dec_cls, data: bytes, chunk: int | None = None, **kw):
+    """Feed ``data`` through a :class:`Recorder` and return ``(status, rec)``.
+
+    ``chunk`` feeds the message that many bytes at a time — §7.2 item 4 wants
+    the outcome to be the same whatever the chunking, so most tests that care
+    run both. Anything the decoder raises (a receiver-cap rejection, a caller
+    mistake) propagates; a malformed message comes back as ``Status.INVALID``
+    with the reason on ``dec.error``.
+    """
+    rec = kw.pop("recorder", None) or Recorder()
+    dec = dec_cls(visitor=rec, **kw)
+    status = Status.COMPLETE
+    if chunk is None:
+        status = dec.feed(data)
+    else:
+        for off in range(0, len(data), chunk) or [0]:
+            status = dec.feed(data[off : off + chunk])
+        if not data:
+            status = dec.feed(b"")
+    return status, rec, dec
+
+
+def values(dec_cls, data: bytes, **kw) -> list[tuple]:
+    """Just the value events of a message that must decode cleanly."""
+    status, rec, _dec = walk(dec_cls, data, **kw)
+    assert status is Status.COMPLETE, status
+    return rec.events
 
 
 def reader(data: bytes) -> io.BytesIO:

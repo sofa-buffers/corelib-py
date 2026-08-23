@@ -1771,8 +1771,6 @@ cdef class Decoder:
     that dribbles one byte at a time.
     """
 
-    cdef object _read
-    cdef int _chunk
     # Receiver-configured decode limits (None = no limit); kept as Python objects
     # so the comparison stays exact for a caller-supplied int of any magnitude.
     cdef object _max_array_count
@@ -1804,10 +1802,9 @@ cdef class Decoder:
     cdef uint64_t _pend_count
     cdef uint64_t _pend_size
     # Resume transaction (§5.2): _keep is the buffer offset the call in flight
-    # started at, _floor is -1 or the compaction floor a multi-field walk pins,
-    # _keep_cur_wtype the current-field wire type as of _keep. See _arm/_suspend.
+    # started at, and _keep_cur_wtype the current-field wire type as of _keep.
+    # See _arm/_suspend.
     cdef Py_ssize_t _keep
-    cdef Py_ssize_t _floor
     cdef int _keep_cur_wtype
 
     # --- push mode (§5.2) ---------------------------------------------------
@@ -1834,8 +1831,7 @@ cdef class Decoder:
     cdef Py_ssize_t _resume_entry
     cdef bint _running
 
-    def __cinit__(self, reader=None, *, binding=None, visitor=None,
-                  words=None, objects=None, int chunk_size=65536,
+    def __cinit__(self, *, binding=None, visitor=None, words=None, objects=None,
                   max_array_count=None, max_string_len=None, max_blob_len=None):
         self._tables = None
         self._bent = NULL
@@ -1854,25 +1850,14 @@ cdef class Decoder:
         self._binding = binding
         self._visitor = visitor
         self._objects = objects
-        if reader is None:
-            if binding is None and visitor is None:
-                raise SofaRangeError(
-                    "a decoder needs a byte source (reader) or a field handler "
-                    "(binding / visitor)")
-            self._read = None
-        else:
-            if binding is not None or visitor is not None:
-                raise SofaRangeError(
-                    "a reader is the pull shape; drive it with next()/drive() "
-                    "rather than a push handler")
-            self._read = reader.read
+        if binding is None and visitor is None:
+            raise SofaRangeError("a decoder needs a field handler (binding / visitor)")
         if binding is not None:
             self._tables = _compiled_for(binding)
             self._bent = self._tables.bent
             self._btab = self._tables.btab
             self._bind_words(words, objects)
             self._tab = 0
-        self._chunk = chunk_size
         self._max_array_count = max_array_count
         self._max_string_len = max_string_len
         self._max_blob_len = max_blob_len
@@ -1888,7 +1873,6 @@ cdef class Decoder:
         self._pk_real = _PEND_NONE
         self._limit_msg = None
         self._keep = 0
-        self._floor = -1
         self._keep_cur_wtype = -1
 
     def __dealloc__(self):
@@ -1932,68 +1916,13 @@ cdef class Decoder:
 
     # --- byte sourcing ------------------------------------------------------
 
-    cdef bint _need(self, Py_ssize_t n) except -1:
-        # Ensure at least n bytes available at _pos, refilling from the reader.
-        # Everything the reader hands over is kept: on failure the bytes read so
-        # far stay buffered, which is what makes a suspension non-destructive.
-        cdef bytes data
-        cdef bytes buf
-        cdef bytearray acc
-        cdef Py_ssize_t pos = self._pos
-        cdef Py_ssize_t base
-        cdef Py_ssize_t want
-        cdef Py_ssize_t req
-        if self._n - pos >= n:
-            return True
-        # Compaction may only drop what can never be read again. With a resume
-        # transaction open that floor is the transaction's start, not the
-        # cursor: the bytes in between belong to the construct being parsed and
-        # a suspension has to be able to replay them (§5.2).
-        base = self._keep if self._floor < 0 else self._floor
-        buf = self._buf
-        if base:
-            buf = buf[base:]
-            pos -= base
-            self._keep -= base
-            if self._floor > 0:
-                self._floor -= base
-        want = pos + n
-        if PyBytes_GET_SIZE(buf) < want:
-            if self._read is None:
-                # Push mode: nothing to pull from. The bytes end here until the
-                # caller feeds more, which is exactly §5.2's INCOMPLETE.
-                self._rebind(buf)
-                self._pos = pos
-                return False
-            req = want - PyBytes_GET_SIZE(buf)
-            if req < <Py_ssize_t>self._chunk:
-                req = <Py_ssize_t>self._chunk
-            data = self._read(req)
-            if not data:
-                self._rebind(buf)
-                self._pos = pos
-                return False
-            buf = buf + data if PyBytes_GET_SIZE(buf) else data
-            if PyBytes_GET_SIZE(buf) < want:
-                # More than one read needed: accumulate in a bytearray from here,
-                # since repeated bytes+bytes would make a chunk-fed large payload
-                # quadratic. (One read is the common case and stays a plain
-                # concatenation — often not even that, on the first fill.)
-                acc = bytearray(buf)
-                while <Py_ssize_t>len(acc) < want:
-                    req = want - <Py_ssize_t>len(acc)
-                    if req < <Py_ssize_t>self._chunk:
-                        req = <Py_ssize_t>self._chunk
-                    data = self._read(req)
-                    if not data:
-                        self._rebind(bytes(acc))
-                        self._pos = pos
-                        return False
-                    acc += data
-                buf = bytes(acc)
-        self._rebind(buf)
-        self._pos = pos
-        return True
+    cdef inline bint _need(self, Py_ssize_t n) noexcept:
+        # Are n bytes available at _pos? There is nothing to pull from: the
+        # bytes are in the buffer or the caller has to feed more, which is
+        # exactly §5.2's INCOMPLETE. Compaction happens in feed(), between
+        # calls, so this never moves the cursor and never has to rebase a
+        # resume transaction underneath one.
+        return self._n - self._pos >= n
 
     cdef inline uint64_t _varint(self) except? 0xDEAD:
         # Fast path: a varint is at most 10 bytes, so with that many buffered the
@@ -2188,18 +2117,6 @@ cdef class Decoder:
         return 0
 
     # --- field iteration ----------------------------------------------------
-
-    @property
-    def field(self):
-        return self._cur
-
-    def next(self):
-        # Calls _next_wire directly rather than through _next_field: this is the
-        # pull API's per-field hot path, and the wrapper would add a second cdef
-        # call to every field of every message.
-        if self._next_wire(True) < 0:
-            return None
-        return self._cur
 
     cdef int _next_wire(self, bint want_field) except -2:
         # Parse one field header and publish its identity; returns the wire type,
@@ -2412,16 +2329,6 @@ cdef class Decoder:
             raise SofaLimitError(self._limit_msg)
         return None
 
-    def schema_bounded(self):
-        # Declare the current field schema-bounded, so the receiver-side caps do
-        # not apply to it (§6.2.1). See sofab.decoder.Decoder.schema_bounded for
-        # the contract — the declaration covers this field only, is a no-op on a
-        # field no cap has rejected, and is a promise that the caller enforces
-        # the schema bound itself (as INVALID, MESSAGE_SPEC §7.1).
-        if self._pk == _PEND_LIMIT:
-            self._pk = self._pk_real
-            self._limit_msg = None
-
     # --- skipping -----------------------------------------------------------
 
     cdef Py_ssize_t _farray_nbytes(self, uint64_t count, uint64_t elem_size) except -1:
@@ -2456,9 +2363,6 @@ cdef class Decoder:
         self._pk = _PEND_NONE
         return 0
 
-    def skip(self):
-        self._arm()
-        self._skip()
 
     cdef int _skip(self) except -1:
         cdef int target
@@ -2468,11 +2372,9 @@ cdef class Decoder:
         if self._cur_wtype == _WT_SEQUENCE_START:
             # Walking a whole sequence spans many fields, so unlike every other
             # call this one moves the field state — and lets _next_wire re-arm
-            # _keep — before it can suspend. _floor pins the refill path's
-            # compaction at the first byte *inside* the sequence for the
-            # duration, and the field state is put back here, so a re-issued
-            # skip() replays the whole sequence (§5.2).
-            self._floor = self._pos
+            # _keep — before it can suspend. The field state is put back here,
+            # so a re-issued skip replays the whole sequence (§5.2).
+            floor = self._pos
             depth = self._depth
             cur = self._cur
             cur_wtype = self._cur_wtype
@@ -2487,8 +2389,8 @@ cdef class Decoder:
                     if self._next_wire(False) < 0:
                         raise self._suspend("truncated sequence")
             except SofaIncompleteError:
-                self._pos = self._floor
-                self._keep = self._floor
+                self._pos = floor
+                self._keep = floor
                 self._depth = depth
                 self._cur = cur
                 self._cur_wtype = cur_wtype
@@ -2498,8 +2400,6 @@ cdef class Decoder:
                 self._pend_count = pend_count
                 self._pend_size = pend_size
                 raise
-            finally:
-                self._floor = -1
             # The walk asked for no Field objects, so ``_cur`` still names the
             # sequence that was just consumed. Publish the end marker the walk
             # stopped on, exactly as a Field-building walk would have left it —
@@ -2526,17 +2426,17 @@ cdef class Decoder:
         self._pk = _PEND_NONE   # committed only once the value is in hand (§5.2)
         return value
 
-    def unsigned(self):
+    def _unsigned(self):
         if self._pk != _PEND_SCALAR or self._pend_wtype != _WT_UNSIGNED:
             return self._mismatch()
         return PyLong_FromUnsignedLongLong(self._take_scalar())
 
-    def signed(self):
+    def _signed(self):
         if self._pk != _PEND_SCALAR or self._pend_wtype != _WT_SIGNED:
             return self._mismatch()
         return PyLong_FromLongLong(_zigzag_decode(self._take_scalar()))
 
-    def bool(self):
+    def _bool(self):
         if self._pk != _PEND_SCALAR or self._pend_wtype != _WT_UNSIGNED:
             return self._mismatch()
         return self._take_scalar() != 0
@@ -2563,18 +2463,18 @@ cdef class Decoder:
         self._pk = _PEND_NONE   # committed only once the payload is in hand
         return <const unsigned char*>PyBytes_AS_STRING(self._spill)
 
-    def float32(self):
+    def _float32(self):
         # Width is settled at header time (§4.6/§7), so _pend_size is 4 here.
         if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_FP32:
             return self._mismatch()
         return _unpack_f32(self._take_fixlen_ptr(4))
 
-    def float64(self):
+    def _float64(self):
         if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_FP64:
             return self._mismatch()
         return _unpack_f64(self._take_fixlen_ptr(8))
 
-    def fixlen_len(self):
+    def _fixlen_len(self):
         # Peek the current fixlen field's payload byte length (from its length
         # header) without consuming it — a following string()/bytes()/float* read
         # still takes the same field. Lets a caller bound a string/blob against its
@@ -2595,7 +2495,7 @@ cdef class Decoder:
             return None  # §7.3: not a fixlen field, so it has no fixlen length
         return self._pend_size
 
-    def string(self):
+    def _string(self):
         cdef Py_ssize_t n
         cdef const unsigned char* p
         if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_STRING:
@@ -2609,7 +2509,7 @@ cdef class Decoder:
         except UnicodeDecodeError as exc:
             raise SofaDecodeError("invalid UTF-8 in string field") from exc
 
-    def bytes(self):
+    def _bytes(self):
         cdef Py_ssize_t n
         cdef const unsigned char* p
         if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_BLOB:
@@ -2622,7 +2522,7 @@ cdef class Decoder:
 
     # --- array reads --------------------------------------------------------
 
-    def read_unsigned_array(self, elem_max=None):
+    def _read_unsigned_array(self, elem_max=None):
         # elem_max is the field's declared element width; see the pure engine's
         # Decoder.read_unsigned_array for what it buys (§7.1/§5.2, #267). The
         # pending value is cleared only once the payload has actually been
@@ -2643,7 +2543,7 @@ cdef class Decoder:
         self._pk = _PEND_NONE   # committed only once the payload is in hand
         return out
 
-    def read_signed_array(self, elem_min=None, elem_max=None):
+    def _read_signed_array(self, elem_min=None, elem_max=None):
         # The two halves of the declared width are independent: either may be
         # given on its own, in which case it bounds its own side and the other
         # stays at the widest an i64 element can be — passing one alone must not
@@ -2708,10 +2608,10 @@ cdef class Decoder:
                 _SetItemSteal(out, i, _NewF64(_unpack_f64(p + i * 8)))
         return out
 
-    def read_float32_array(self):
+    def _read_float32_array(self):
         return self._read_farray(_ST_FP32, 4)
 
-    def read_float64_array(self):
+    def _read_float64_array(self):
         return self._read_farray(_ST_FP64, 8)
 
     # --- push-feed driver (CORELIB_PLAN §5.2) -------------------------------
@@ -2799,8 +2699,6 @@ cdef class Decoder:
         """
         cdef bytes chunk
         cdef bytes buf
-        if self._read is not None:
-            raise SofaRangeError("feed() is the push shape; this decoder has a reader")
         if self._running:
             raise SofaRangeError("feed() is not re-entrant")
         if self._status == <int>Status.INVALID:
@@ -2815,7 +2713,6 @@ cdef class Decoder:
         self._rebind(buf + chunk if PyBytes_GET_SIZE(buf) else chunk)
         self._pos = 0
         self._keep = 0
-        self._floor = -1
         self._running = True
         try:
             self._drive_push()
@@ -2844,7 +2741,6 @@ cdef class Decoder:
         self._pk_real = _PEND_NONE
         self._limit_msg = None
         self._keep = 0
-        self._floor = -1
         self._keep_cur_wtype = -1
         self._status = <int>Status.COMPLETE
         self._err = None
@@ -3096,73 +2992,28 @@ cdef class Decoder:
         cdef object f = self._cur
         cdef object st
         if t == _WT_UNSIGNED:
-            visitor.on_unsigned(f.id, self.unsigned())
+            visitor.on_unsigned(f.id, self._unsigned())
         elif t == _WT_SIGNED:
-            visitor.on_signed(f.id, self.signed())
+            visitor.on_signed(f.id, self._signed())
         elif t == _WT_FIXLEN:
             st = f.subtype
             if st == _ST[_ST_FP32]:
-                visitor.on_float32(f.id, self.float32())
+                visitor.on_float32(f.id, self._float32())
             elif st == _ST[_ST_FP64]:
-                visitor.on_float64(f.id, self.float64())
+                visitor.on_float64(f.id, self._float64())
             elif st == _ST[_ST_STRING]:
-                visitor.on_string(f.id, self.string())
+                visitor.on_string(f.id, self._string())
             else:
-                visitor.on_bytes(f.id, self.bytes())
+                visitor.on_bytes(f.id, self._bytes())
         elif t == _WT_ARRAY_UNSIGNED:
-            visitor.on_unsigned_array(f.id, self.read_unsigned_array())
+            visitor.on_unsigned_array(f.id, self._read_unsigned_array())
         elif t == _WT_ARRAY_SIGNED:
-            visitor.on_signed_array(f.id, self.read_signed_array())
+            visitor.on_signed_array(f.id, self._read_signed_array())
         elif f.subtype == _ST[_ST_FP32]:
-            visitor.on_float32_array(f.id, self.read_float32_array())
+            visitor.on_float32_array(f.id, self._read_float32_array())
         else:
-            visitor.on_float64_array(f.id, self.read_float64_array())
+            visitor.on_float64_array(f.id, self._read_float64_array())
         return 0
-
-    # --- visitor driver -----------------------------------------------------
-
-    @cython.always_allow_keywords(True)
-    def drive(self, visitor):
-        # Dispatch on the C wire type rather than rich-comparing the WireType
-        # member against up to eight candidates per field.
-        cdef object f
-        cdef int t
-        cdef object st
-        while True:
-            t = self._next_wire(True)
-            if t < 0:
-                break
-            f = self._cur
-            if t == _WT_SEQUENCE_END:
-                visitor.on_sequence_end()
-            elif t == _WT_SEQUENCE_START:
-                if visitor.on_sequence_begin(f.id) is False:
-                    self.skip()
-            elif visitor.on_field(f) is False:
-                self.skip()
-            elif t == _WT_UNSIGNED:
-                visitor.on_unsigned(f.id, self.unsigned())
-            elif t == _WT_SIGNED:
-                visitor.on_signed(f.id, self.signed())
-            elif t == _WT_FIXLEN:
-                st = f.subtype
-                if st == _ST[_ST_FP32]:
-                    visitor.on_float32(f.id, self.float32())
-                elif st == _ST[_ST_FP64]:
-                    visitor.on_float64(f.id, self.float64())
-                elif st == _ST[_ST_STRING]:
-                    visitor.on_string(f.id, self.string())
-                else:
-                    visitor.on_bytes(f.id, self.bytes())
-            elif t == _WT_ARRAY_UNSIGNED:
-                visitor.on_unsigned_array(f.id, self.read_unsigned_array())
-            elif t == _WT_ARRAY_SIGNED:
-                visitor.on_signed_array(f.id, self.read_signed_array())
-            else:  # ARRAY_FIXLEN
-                if f.subtype == _ST[_ST_FP32]:
-                    visitor.on_float32_array(f.id, self.read_float32_array())
-                else:
-                    visitor.on_float64_array(f.id, self.read_float64_array())
 
 
 # Marker so callers / tests can assert which implementation is active.
