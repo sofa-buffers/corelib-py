@@ -36,7 +36,7 @@ from sofab.encoder import Encoder as PyEncoder
 __all__ = [
     "DBL_MAX", "DECODER_ENGINES", "ENCODER_ENGINES", "ENGINE_PAIRS", "FLT_MAX",
     "FP64_FROM_FLOAT", "FULL_SCALE_EXPECTED", "VECTORS", "VECTOR_DOC",
-    "Binding", "Recorder", "Slots", "Status",
+    "Binding", "Recorder", "Slots", "Status", "Visitor",
     "WireType",
     "bound", "build_full_scale", "encode", "pairs", "raise_for", "uvarint",
     "values", "verdict", "walk", "zzvarint",

@@ -17,10 +17,9 @@ from __future__ import annotations
 
 import enum
 import inspect
-import io
 
 import pytest
-from vectors import ChunkReader, reader
+from vectors import pairs, values, verdict
 
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
@@ -88,13 +87,9 @@ def test_varint_boundaries_roundtrip(dec_cls, chunk):
     """Decoding is unaffected by where a chunk boundary falls — the buffered
     fast path and the byte-at-a-time refill path must agree on every value."""
     data = _encode_all(NativeEncoder, lambda e, v: e.write_unsigned(1, v), BOUNDARY_VALUES)
-    src = reader(data) if chunk == 0 else ChunkReader(data, chunk)
-    dec = dec_cls(src)
-    for expected in BOUNDARY_VALUES:
-        field = dec.next()
-        assert field is not None and field.type == WireType.UNSIGNED
-        assert dec.unsigned() == expected
-    assert dec.next() is None
+    got = pairs(dec_cls, data, chunk=(None if chunk == 0 else chunk))
+    assert [f.type for f, _ in got] == [WireType.UNSIGNED] * len(BOUNDARY_VALUES)
+    assert [ev[2] for _, ev in got] == list(BOUNDARY_VALUES)
 
 
 @pytest.mark.parametrize("dec_cls", DECODERS)
@@ -104,20 +99,15 @@ def test_overlong_varint_rejected(dec_cls, chunk, tenth):
     """A tenth byte above 0x01 carries payload past bit 63 (or continues into an
     eleventh byte): INVALID, on the buffered path and the refilling one alike."""
     data = bytes([0x00]) + bytes([0xFF] * 9) + bytes([tenth])
-    src = reader(data) if chunk == 0 else ChunkReader(data, chunk)
-    dec = dec_cls(src)
-    assert dec.next() is not None
     with pytest.raises(SofaDecodeError):
-        dec.unsigned()
+        verdict(dec_cls, data, chunk=(None if chunk == 0 else chunk))
 
 
 @pytest.mark.parametrize("dec_cls", DECODERS)
 def test_max_u64_accepted(dec_cls):
     """The 10-byte encoding of 2**64-1 is valid and must not trip the check."""
     data = bytes([0x00]) + bytes([0xFF] * 9) + bytes([0x01])
-    dec = dec_cls(reader(data))
-    assert dec.next() is not None
-    assert dec.unsigned() == UNSIGNED_MAX
+    assert values(dec_cls, data) == [("u", 0, UNSIGNED_MAX)]
 
 
 # --- integer conversion: the domain edges -----------------------------------
@@ -129,9 +119,7 @@ def test_unsigned_domain_accepted(enc_cls, value):
     enc = enc_cls()
     enc.write_unsigned(1, value)
     enc.flush()
-    dec = NativeDecoder(reader(enc.getvalue()))
-    assert dec.next() is not None
-    assert dec.unsigned() == value
+    assert values(NativeDecoder, enc.getvalue())[0][2] == value
 
 
 @pytest.mark.parametrize("enc_cls", ENCODERS)
@@ -148,9 +136,7 @@ def test_signed_domain_accepted(enc_cls, value):
     enc = enc_cls()
     enc.write_signed(1, value)
     enc.flush()
-    dec = NativeDecoder(reader(enc.getvalue()))
-    assert dec.next() is not None
-    assert dec.signed() == value
+    assert values(NativeDecoder, enc.getvalue())[0][2] == value
 
 
 @pytest.mark.parametrize("enc_cls", ENCODERS)
@@ -202,12 +188,13 @@ def test_integral_values_are_accepted(enc_cls, value):
     enc.write_unsigned_array(3, [value])
     enc.write_signed_array(4, [value])
     enc.flush()
-    dec = NativeDecoder(reader(enc.getvalue()))
     expected = int(value)
-    assert (dec.next() is not None) and dec.unsigned() == expected
-    assert (dec.next() is not None) and dec.signed() == expected
-    assert (dec.next() is not None) and dec.read_unsigned_array() == [expected]
-    assert (dec.next() is not None) and dec.read_signed_array() == [expected]
+    assert values(NativeDecoder, enc.getvalue()) == [
+        ("u", 1, expected),
+        ("s", 2, expected),
+        ("ua", 3, (expected,)),
+        ("sa", 4, (expected,)),
+    ]
 
 
 @pytest.mark.parametrize("enc_cls", ENCODERS)
@@ -320,17 +307,17 @@ def test_array_bytes_match_over_both_output_models(enc_cls):
 @pytest.mark.parametrize("enc_cls", ENCODERS)
 def test_array_input_is_not_consumed_or_mutated(enc_cls):
     """The element loop may read the caller's list directly; it must not alter it."""
-    values = [1, 2, 3, UNSIGNED_MAX]
-    original = list(values)
+    elems = [1, 2, 3, UNSIGNED_MAX]
+    original = list(elems)
     enc = enc_cls()
-    enc.write_unsigned_array(1, values)
-    enc.write_unsigned_array(2, iter(values))     # a non-list iterable still works
+    enc.write_unsigned_array(1, elems)
+    enc.write_unsigned_array(2, iter(elems))      # a non-list iterable still works
     enc.flush()
-    assert values == original
-    dec = NativeDecoder(reader(enc.getvalue()))
-    for _ in range(2):
-        assert dec.next() is not None
-        assert dec.read_unsigned_array() == original
+    assert elems == original
+    assert values(NativeDecoder, enc.getvalue()) == [
+        ("ua", 1, tuple(original)),
+        ("ua", 2, tuple(original)),
+    ]
 
 
 # --- fixlen values built off the decode buffer -------------------------------
@@ -354,21 +341,8 @@ def test_fixlen_values_survive_chunking(dec_cls, chunk):
     enc.flush()
     data = enc.getvalue()
 
-    src = reader(data) if chunk == 0 else ChunkReader(data, chunk)
-    dec = dec_cls(src)
-    got = []
-    for _ in range(6):
-        field = dec.next()
-        assert field is not None
-        if field.subtype == FixlenSubtype.STRING:
-            got.append(dec.string())
-        elif field.subtype == FixlenSubtype.BLOB:
-            got.append(dec.bytes())
-        elif field.subtype == FixlenSubtype.FP32:
-            got.append(round(dec.float32(), 5))
-        else:
-            got.append(dec.float64())
-    assert dec.next() is None
+    ev = values(dec_cls, data, chunk=(None if chunk == 0 else chunk))
+    got = [round(e[2], 5) if e[0] == "f32" else e[2] for e in ev]
     assert got == [text, blob, round(3.14159, 5), 2.718281828459045, "", b""]
 
 
@@ -378,11 +352,8 @@ def test_invalid_utf8_string_is_rejected(dec_cls, chunk):
     """Validation applies to the payload however it was assembled."""
     payload = b"\xed\xa0\x80"                       # a surrogate, never valid UTF-8
     data = bytes([0x02, (len(payload) << 3) | FixlenSubtype.STRING]) + payload
-    src = reader(data) if chunk == 0 else ChunkReader(data, chunk)
-    dec = dec_cls(src)
-    assert dec.next() is not None
     with pytest.raises(SofaDecodeError):
-        dec.string()
+        verdict(dec_cls, data, chunk=(None if chunk == 0 else chunk))
 
 
 def test_decoded_string_outlives_the_buffer_it_came_from():
@@ -391,10 +362,7 @@ def test_decoded_string_outlives_the_buffer_it_came_from():
     for i in range(64):
         enc.write_string(1, f"value-{i}" * 4)
     enc.flush()
-    dec = NativeDecoder(io.BytesIO(enc.getvalue()))
-    seen = []
-    while dec.next() is not None:
-        seen.append(dec.string())
+    seen = [e[2] for e in values(NativeDecoder, enc.getvalue())]
     assert seen == [f"value-{i}" * 4 for i in range(64)]
 
 
@@ -422,22 +390,22 @@ def test_decoder_fields_carry_the_expected_metadata():
     enc.write_unsigned_array(3, [1, 2, 3])
     enc.write_float64_array(4, [1.0, 2.0])
     enc.flush()
-    dec = NativeDecoder(reader(enc.getvalue()))
+    got = pairs(NativeDecoder, enc.getvalue())
+    assert len(got) == 4
 
-    f = dec.next()
+    f, ev = got[0]
     assert (f.id, f.type, f.size, f.count, f.subtype) == (1, WireType.UNSIGNED, 0, 0, None)
-    assert dec.unsigned() == 5
-    f = dec.next()
+    assert ev == ("u", 1, 5)
+    f, ev = got[1]
     assert (f.id, f.type, f.size, f.subtype) == (2, WireType.FIXLEN, 3, FixlenSubtype.STRING)
-    assert dec.string() == "abc"
-    f = dec.next()
+    assert ev == ("str", 2, "abc")
+    f, ev = got[2]
     assert (f.id, f.type, f.count) == (3, WireType.ARRAY_UNSIGNED, 3)
-    assert dec.read_unsigned_array() == [1, 2, 3]
-    f = dec.next()
+    assert ev == ("ua", 3, (1, 2, 3))
+    f, ev = got[3]
     assert (f.id, f.type, f.count, f.size, f.subtype) == (
         4, WireType.ARRAY_FIXLEN, 2, 8, FixlenSubtype.FP64)
-    assert dec.read_float64_array() == [1.0, 2.0]
-    assert dec.next() is None
+    assert ev == ("f64a", 4, (1.0, 2.0))
 
 
 def test_field_stays_valid_after_the_decoder_moves_on():
@@ -446,11 +414,8 @@ def test_field_stays_valid_after_the_decoder_moves_on():
     enc.write_unsigned(1, 1)
     enc.write_unsigned(2, 2)
     enc.flush()
-    dec = NativeDecoder(reader(enc.getvalue()))
-    first = dec.next()
-    assert dec.unsigned() == 1
-    second = dec.next()
-    assert dec.unsigned() == 2
+    got = pairs(NativeDecoder, enc.getvalue())
+    first, second = got[0][0], got[1][0]
     assert (first.id, second.id) == (1, 2)
     assert first is not second
 
@@ -464,7 +429,7 @@ def test_call_shapes_match_the_pure_engine():
     everywhere the extension is missing and fail where it is present."""
     for pure_cls, native_cls, make in (
         (PyEncoder, NativeEncoder, lambda cls: cls()),
-        (PyDecoder, NativeDecoder, lambda cls: cls(reader(b"\x00\x01"))),
+        (PyDecoder, NativeDecoder, lambda cls: cls(visitor=_V())),
     ):
         public = {n for n in dir(pure_cls) if not n.startswith("_")}
         assert public == {n for n in dir(native_cls) if not n.startswith("_")}
