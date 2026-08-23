@@ -601,28 +601,6 @@ class Decoder:
         if field_id > ID_MAX:
             raise SofaDecodeError(f"id {field_id} out of range")
 
-        if wtype == _WT_SEQUENCE_END:
-            if self._depth <= 0:
-                raise SofaDecodeError("unbalanced sequence end")
-            self._depth -= 1
-            if want_field:
-                self._cur = Field(0, WireType.SEQUENCE_END)
-            return wtype
-
-        if wtype == _WT_SEQUENCE_START:
-            if self._depth >= MAX_DEPTH:
-                raise SofaDecodeError(f"nesting exceeds MAX_DEPTH={MAX_DEPTH}")
-            self._depth += 1
-            if want_field:
-                self._cur = Field(field_id, WireType.SEQUENCE_START)
-            return wtype
-
-        if wtype == _WT_UNSIGNED or wtype == _WT_SIGNED:
-            if want_field:
-                self._cur = Field(field_id, _WT[wtype])
-            self._pending = (_SCALAR, wtype)
-            return wtype
-
         if wtype == _WT_FIXLEN:
             # Same one-byte fast path as the header above, but this byte is not
             # guaranteed to be buffered, so the bound is tested first. A length
@@ -642,20 +620,24 @@ class Decoder:
                 length_header = self._varint()
             length = length_header >> 3
             subtype = length_header & 0x07
-            if subtype > _ST_BLOB:
-                raise SofaDecodeError(f"invalid fixlen subtype {subtype}")
-            if length > FIXLEN_MAX:
-                raise SofaDecodeError("fixlen length out of range")
-            # A wrong-width fp field is malformed regardless of what bytes
-            # follow, so this INVALID verdict must be reached at header time —
-            # before any payload read — so it takes precedence over the
-            # INCOMPLETE a truncated payload would otherwise raise (§7). Mirrors
-            # the eager element-width check on the fixlen-array path below. Do
-            # not eager-check STRING/BLOB: those are variable-length, so a
-            # truncated string/blob is legitimately INCOMPLETE.
-            if subtype == _ST_FP32 and length != 4:
-                raise SofaDecodeError("fp32 fixlen length must be 4")
-            if subtype == _ST_FP64 and length != 8:
+            # The two subtype families want different checks, and splitting on
+            # them costs one comparison instead of four. STRING (2) and BLOB (3)
+            # are variable-length, so only the format-wide ceiling binds them; a
+            # truncated one is legitimately INCOMPLETE. FP32 (0) and FP64 (1)
+            # carry one fixed width each, and a wrong one is malformed whatever
+            # follows — so that INVALID must be reached here, at header time,
+            # ahead of the INCOMPLETE a truncated payload would otherwise raise
+            # (§7). Mirrors the eager element-width check on the fixlen-array
+            # path below.
+            if subtype >= _ST_STRING:
+                if subtype > _ST_BLOB:
+                    raise SofaDecodeError(f"invalid fixlen subtype {subtype}")
+                if length > FIXLEN_MAX:
+                    raise SofaDecodeError("fixlen length out of range")
+            elif subtype == _ST_FP32:
+                if length != 4:
+                    raise SofaDecodeError("fp32 fixlen length must be 4")
+            elif length != 8:
                 raise SofaDecodeError("fp64 fixlen length must be 8")
             if want_field:
                 self._cur = Field(
@@ -690,6 +672,28 @@ class Decoder:
                         pending,
                     )
             self._pending = pending
+            return wtype
+
+        if wtype < _WT_FIXLEN:  # UNSIGNED (0) or SIGNED (1)
+            if want_field:
+                self._cur = Field(field_id, _WT[wtype])
+            self._pending = (_SCALAR, wtype)
+            return wtype
+
+        if wtype == _WT_SEQUENCE_END:
+            if self._depth <= 0:
+                raise SofaDecodeError("unbalanced sequence end")
+            self._depth -= 1
+            if want_field:
+                self._cur = Field(0, WireType.SEQUENCE_END)
+            return wtype
+
+        if wtype == _WT_SEQUENCE_START:
+            if self._depth >= MAX_DEPTH:
+                raise SofaDecodeError(f"nesting exceeds MAX_DEPTH={MAX_DEPTH}")
+            self._depth += 1
+            if want_field:
+                self._cur = Field(field_id, WireType.SEQUENCE_START)
             return wtype
 
         if wtype == _WT_ARRAY_UNSIGNED or wtype == _WT_ARRAY_SIGNED:
