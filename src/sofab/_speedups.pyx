@@ -627,6 +627,12 @@ cdef int _ST_BLOB = 3
 # IntEnum coercion on every field.
 cdef tuple _WT = tuple(WireType)
 cdef tuple _STATUS = tuple(Status)
+
+# The base class's no-op control hooks, to tell an overridden one from the
+# default without a getattr per decoder.
+from .visitor import Visitor as _Visitor
+cdef object _BASE_ON_FIELD = _Visitor.on_field
+cdef object _BASE_ON_SEQUENCE_BEGIN = _Visitor.on_sequence_begin
 cdef tuple _ST = tuple(FixlenSubtype)
 
 # Pending-value kinds (mirror the pure decoder's _SCALAR/_FIXLEN/_VARRAY/_FARRAY).
@@ -1814,6 +1820,12 @@ cdef class Decoder:
     # --- push mode (§5.2) ---------------------------------------------------
     cdef object _binding             # the Binding this table was compiled from
     cdef object _visitor
+    # Whether the visitor overrides the two control hooks. Both default to a
+    # no-op on the base class, and calling one that was never overridden costs a
+    # Python call per field for nothing. ``_wants_field`` also decides whether a
+    # Field object is built at all: it is the only thing that receives one.
+    cdef bint _wants_field
+    cdef bint _wants_seq_begin
     cdef object _objects             # list destination for string/blob fields
     cdef _Compiled _tables          # keeps the compiled table alive
     cdef _BEntry* _bent
@@ -1853,6 +1865,12 @@ cdef class Decoder:
         self._running = False
         self._binding = binding
         self._visitor = visitor
+        self._wants_field = False
+        self._wants_seq_begin = False
+        if visitor is not None:
+            self._wants_field = type(visitor).on_field is not _BASE_ON_FIELD
+            self._wants_seq_begin = (
+                type(visitor).on_sequence_begin is not _BASE_ON_SEQUENCE_BEGIN)
         self._objects = objects
         if binding is None and visitor is None:
             raise SofaRangeError("a decoder needs a field handler (binding / visitor)")
@@ -2779,7 +2797,7 @@ cdef class Decoder:
         cdef Py_ssize_t ei
         cdef _BEntry* e
         cdef object visitor = self._visitor
-        cdef bint want_field = visitor is not None
+        cdef bint want_field = self._wants_field
 
         rk = self._resume_kind
         if rk != _R_NONE:
@@ -2829,7 +2847,11 @@ cdef class Decoder:
                     if e.count_at >= 0:
                         self._words[e.count_at] += 1
                     continue
-                if visitor is not None and visitor.on_sequence_begin(self._cur.id) is not False:
+                if visitor is not None and (
+                    not self._wants_seq_begin
+                    or visitor.on_sequence_begin(
+                        PyLong_FromUnsignedLongLong(self._cur_id)) is not False
+                ):
                     # §4.9 opens a fresh id scope, so the enclosing table must
                     # not match inside it.
                     self._push_table(-1)
@@ -2851,7 +2873,7 @@ cdef class Decoder:
                 continue
 
             if visitor is not None:
-                if visitor.on_field(self._cur) is False:
+                if self._wants_field and visitor.on_field(self._cur) is False:
                     continue
                 try:
                     self._visit_value(visitor)
@@ -3014,32 +3036,34 @@ cdef class Decoder:
 
     cdef int _visit_value(self, object visitor) except -1:
         # The value half of a visitor dispatch. Every read is chosen by the
-        # field's own wire type, so none can hit the §7.3 mismatch path.
+        # field's own wire type, so none can hit the §7.3 mismatch path. The id
+        # and subtype come off the decoder's own state rather than a Field: the
+        # typed hooks take an id, not a Field, so unless on_field is overridden
+        # there is no reason to build one.
         cdef int t = self._cur_wtype
-        cdef object f = self._cur
-        cdef object st
+        cdef int st = self._pend_subtype
+        cdef object fid = PyLong_FromUnsignedLongLong(self._cur_id)
         if t == _WT_UNSIGNED:
-            visitor.on_unsigned(f.id, self._unsigned())
+            visitor.on_unsigned(fid, self._unsigned())
         elif t == _WT_SIGNED:
-            visitor.on_signed(f.id, self._signed())
+            visitor.on_signed(fid, self._signed())
         elif t == _WT_FIXLEN:
-            st = f.subtype
-            if st == _ST[_ST_FP32]:
-                visitor.on_float32(f.id, self._float32())
-            elif st == _ST[_ST_FP64]:
-                visitor.on_float64(f.id, self._float64())
-            elif st == _ST[_ST_STRING]:
-                visitor.on_string(f.id, self._string())
+            if st == _ST_FP32:
+                visitor.on_float32(fid, self._float32())
+            elif st == _ST_FP64:
+                visitor.on_float64(fid, self._float64())
+            elif st == _ST_STRING:
+                visitor.on_string(fid, self._string())
             else:
-                visitor.on_bytes(f.id, self._bytes())
+                visitor.on_bytes(fid, self._bytes())
         elif t == _WT_ARRAY_UNSIGNED:
-            visitor.on_unsigned_array(f.id, self._read_unsigned_array())
+            visitor.on_unsigned_array(fid, self._read_unsigned_array())
         elif t == _WT_ARRAY_SIGNED:
-            visitor.on_signed_array(f.id, self._read_signed_array())
-        elif f.subtype == _ST[_ST_FP32]:
-            visitor.on_float32_array(f.id, self._read_float32_array())
+            visitor.on_signed_array(fid, self._read_signed_array())
+        elif st == _ST_FP32:
+            visitor.on_float32_array(fid, self._read_float32_array())
         else:
-            visitor.on_float64_array(f.id, self._read_float64_array())
+            visitor.on_float64_array(fid, self._read_float64_array())
         return 0
 
 

@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import sys
 from array import array as _array
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from . import _core
 from .binding import (
@@ -69,8 +69,9 @@ from .types import (
     WireType,
 )
 
-if TYPE_CHECKING:
-    from .visitor import Visitor
+# Imported at runtime, not only for typing: the driver compares a visitor's
+# control hooks against the base class's to tell an override from the default.
+from .visitor import Visitor
 
 # Pending-value kinds the consume methods dispatch on.
 _SCALAR = 0
@@ -176,12 +177,27 @@ class Decoder:
         # unboxed for the caller that gets no Field.
         self._cur_id = 0
         self._cur_subtype = -1
+        # The wire type _visit_value was last entered with, so a resumed visit
+        # picks up the same dispatch without a Field to read it off.
+        self._cur_wtype_resume = -1
         # Whether _next_wire maintains the two above. Only a binding resolves a
         # field by id without a Field to read it from.
-        self._track_ids = binding is not None
+        self._track_ids = binding is not None or visitor is not None
 
         self._binding = binding
         self._visitor = visitor
+        # Whether the visitor overrides the two control hooks. Both default to a
+        # no-op on the base class, and calling one that was never overridden
+        # costs a Python call per field for nothing. ``_wants_field`` also
+        # decides whether a Field object is built at all: it is the only thing
+        # that receives one, and the typed hooks take an id.
+        self._wants_field = (
+            visitor is not None and type(visitor).on_field is not Visitor.on_field
+        )
+        self._wants_seq_begin = (
+            visitor is not None
+            and type(visitor).on_sequence_begin is not Visitor.on_sequence_begin
+        )
         # The active table and the stack of enclosing ones. A sequence opens a
         # fresh id scope (§4.9), so descending *replaces* the table rather than
         # layering onto it — an id bound in the parent must not match inside.
@@ -708,40 +724,42 @@ class Decoder:
         # stay pending so the retry skips it again from its first byte (§5.2).
         self._pending = None
 
-    def _skip(self) -> None:
-        """Skip the current field's value, or an entire (nested) sequence if the
-        current field is a sequence start.
+    def _skip_sequence(self) -> None:
+        """Skip an entire (nested) sequence, from the start marker just read to
+        its matching end.
+
+        The driver is the only caller and reaches it only on a sequence start —
+        a declined value needs no skip at all, because it stays pending and the
+        next header discards it.
 
         Suspends as a unit: if the bytes run out part-way, nothing is consumed
-        and the same ``skip()`` can be re-issued when more arrive (§5.2).
+        and the same skip can be re-issued when more arrive (§5.2).
         """
-        self._keep = self._pos
-        if self._cur is not None and self._cur.type == WireType.SEQUENCE_START:
-            # Walking a whole sequence spans many fields, so unlike every other
-            # call this one moves the field state — and lets ``next()`` re-arm
-            # ``_keep`` — before it can suspend. The field state is put back
-            # here, so a re-issued skip replays the whole sequence (§5.2).
-            floor = self._pos
-            depth, cur, pending = self._depth, self._cur, self._pending
-            try:
-                target = depth - 1
-                while self._depth > target:
-                    # The walk discards every field it passes, so it asks for no
-                    # Field objects. Defensive: at EOF with an open sequence,
-                    # _next_wire itself raises "truncated: unbalanced sequence",
-                    # so it never returns -1 here.
-                    if self._next_wire(False) < 0:  # pragma: no cover
-                        raise self._suspend("truncated sequence")
-            except SofaIncompleteError:
-                self._pos = self._keep = floor
-                self._depth, self._cur, self._pending = depth, cur, pending
-                raise
-            # The walk built no Field, so ``_cur`` still names the sequence that
-            # was just consumed — which would make a second skip() walk the
-            # *next* field's bytes as if they were a sequence. Publish the end
-            # marker the walk stopped on, exactly as a Field-building walk would
-            # have left it. One object per skip, not one per field.
-            self._cur = Field(0, WireType.SEQUENCE_END)
+        # Walking a whole sequence spans many fields, so unlike every other call
+        # this one moves the field state — and lets _next_wire re-arm ``_keep`` —
+        # before it can suspend. The field state is put back here, so a re-issued
+        # skip replays the whole sequence (§5.2).
+        self._keep = floor = self._pos
+        depth, cur, pending = self._depth, self._cur, self._pending
+        try:
+            target = depth - 1
+            while self._depth > target:
+                # The walk discards every field it passes, so it asks for no
+                # Field objects. Defensive: at EOF with an open sequence,
+                # _next_wire itself raises "truncated: unbalanced sequence",
+                # so it never returns -1 here.
+                if self._next_wire(False) < 0:  # pragma: no cover
+                    raise self._suspend("truncated sequence")
+        except SofaIncompleteError:
+            self._pos = self._keep = floor
+            self._depth, self._cur, self._pending = depth, cur, pending
+            raise
+        # The walk built no Field, so ``_cur`` still names the sequence that was
+        # just consumed. Publish the end marker the walk stopped on, exactly as a
+        # Field-building walk would have left it, so a visitor that keeps the
+        # last Field does not see a stale sequence start. One object per skip,
+        # not one per field.
+        self._cur = Field(0, WireType.SEQUENCE_END)
 
     # --- push-feed driver (CORELIB_PLAN §5.2) -------------------------------
     #
@@ -897,19 +915,18 @@ class Decoder:
                     assert entry is not None
                     self._take_bound(entry)
                 elif rk == _R_VISIT:
-                    cur = self._cur
-                    assert visitor is not None and cur is not None
-                    self._visit_value(visitor, cur)
+                    assert visitor is not None
+                    self._visit_value(visitor, self._cur_wtype_resume)
                 else:
-                    self._skip()
+                    self._skip_sequence()
             except SofaIncompleteError:
                 self._resume_kind = rk
                 raise
 
-        # A Field is built only for a visitor, the one consumer that takes one.
-        # A bound decode never looks at one, and not building it is most of what
-        # makes that path fast (see _next_wire).
-        want_field = visitor is not None
+        # A Field is built only for a visitor that overrides ``on_field`` — the
+        # one consumer that takes one. Not building it is most of what makes the
+        # other paths fast (see _next_wire).
+        want_field = self._wants_field
         while True:
             t = self._next_wire(want_field)
             if t < 0:
@@ -944,14 +961,9 @@ class Decoder:
                     if c >= 0:
                         self._wu[c] = self._wu[c] + 1
                     continue
-                # A visitor implies a Field was built, and that Field is where
-                # the id comes from — ``_cur_id`` is only maintained for a
-                # binding (see next()).
-                cur = self._cur
-                if (
-                    visitor is not None
-                    and cur is not None
-                    and visitor.on_sequence_begin(cur.id) is not False
+                if visitor is not None and (
+                    not self._wants_seq_begin
+                    or visitor.on_sequence_begin(self._cur_id) is not False
                 ):
                     # §4.9 opens a fresh id scope, so the enclosing table must
                     # not match inside it.
@@ -959,7 +971,7 @@ class Decoder:
                     self._bmap = None
                     continue
                 try:
-                    self._skip()
+                    self._skip_sequence()
                 except SofaIncompleteError:
                     self._resume_kind = _R_SKIP
                     raise
@@ -975,12 +987,13 @@ class Decoder:
                 continue
 
             if visitor is not None:
-                f = self._cur
-                assert f is not None
-                if visitor.on_field(f) is False:
-                    continue
+                if self._wants_field:
+                    f = self._cur
+                    assert f is not None
+                    if visitor.on_field(f) is False:
+                        continue
                 try:
-                    self._visit_value(visitor, f)
+                    self._visit_value(visitor, t)
                 except SofaIncompleteError:
                     self._resume_kind = _R_VISIT
                     raise
@@ -1118,45 +1131,51 @@ class Decoder:
     # the driver (see _drive_push), and a visitor declares nothing about a
     # field's type at all — it is simply handed what the wire carried.
 
-    def _visit_value(self, visitor: Visitor, f: Field) -> None:
-        """Hand the current field's value to ``visitor``'s typed hook."""
-        t = f.type
+    def _visit_value(self, visitor: Visitor, t: int) -> None:
+        """Hand the current field's value to ``visitor``'s typed hook.
+
+        The id and subtype come off the decoder's own state rather than a Field:
+        the typed hooks take an id, so unless ``on_field`` is overridden there is
+        no reason to have built one.
+        """
+        self._cur_wtype_resume = t
         pending = self._pending
         assert pending is not None
+        fid = self._cur_id
         if t == WireType.UNSIGNED:
-            visitor.on_unsigned(f.id, self._take_scalar_matched())
+            visitor.on_unsigned(fid, self._take_scalar_matched())
         elif t == WireType.SIGNED:
             raw = self._take_scalar_matched()
-            visitor.on_signed(f.id, (raw >> 1) ^ -(raw & 1))
+            visitor.on_signed(fid, (raw >> 1) ^ -(raw & 1))
         elif t == WireType.FIXLEN:
-            self._visit_fixlen(visitor, f, pending)
+            self._visit_fixlen(visitor, fid, pending)
         elif t == WireType.ARRAY_UNSIGNED:
-            visitor.on_unsigned_array(f.id, self._take_varints(pending[2], False))
+            visitor.on_unsigned_array(fid, self._take_varints(pending[2], False))
         elif t == WireType.ARRAY_SIGNED:
-            visitor.on_signed_array(f.id, self._take_varints(pending[2], True))
-        elif f.subtype == FixlenSubtype.FP32:
-            visitor.on_float32_array(f.id, self._take_farray_values(pending, 4))
+            visitor.on_signed_array(fid, self._take_varints(pending[2], True))
+        elif pending[1] == FixlenSubtype.FP32:
+            visitor.on_float32_array(fid, self._take_farray_values(pending, 4))
         else:
-            visitor.on_float64_array(f.id, self._take_farray_values(pending, 8))
+            visitor.on_float64_array(fid, self._take_farray_values(pending, 8))
 
-    def _visit_fixlen(self, visitor: Visitor, f: Field, pending: tuple[Any, ...]) -> None:
+    def _visit_fixlen(self, visitor: Visitor, fid: int, pending: tuple[Any, ...]) -> None:
         if pending[0] == _LIMIT:
             # A parked receiver cap (§6.2.1): the field is being refused, and the
             # walk over its payload is exactly what the cap exists to prevent.
             raise SofaLimitError(pending[1])
         subtype = pending[1]
         if subtype == FixlenSubtype.FP32:
-            visitor.on_float32(f.id, _core.unpack_f32(self._take_fixlen_matched(4)))
+            visitor.on_float32(fid, _core.unpack_f32(self._take_fixlen_matched(4)))
         elif subtype == FixlenSubtype.FP64:
-            visitor.on_float64(f.id, _core.unpack_f64(self._take_fixlen_matched(8)))
+            visitor.on_float64(fid, _core.unpack_f64(self._take_fixlen_matched(8)))
         elif subtype == FixlenSubtype.STRING:
             data = self._take_fixlen_matched(pending[2])
             try:
-                visitor.on_string(f.id, data.decode("utf-8"))
+                visitor.on_string(fid, data.decode("utf-8"))
             except UnicodeDecodeError as exc:
                 raise SofaDecodeError("invalid UTF-8 in string field") from exc
         else:
-            visitor.on_bytes(f.id, self._take_fixlen_matched(pending[2]))
+            visitor.on_bytes(fid, self._take_fixlen_matched(pending[2]))
 
     def _take_varints(self, count: int, zigzag: bool) -> list[int]:
         """The whole pending integer array, as a list (the visitor's shape)."""

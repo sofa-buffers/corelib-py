@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 from vectors import VECTORS
 
-from sofab import Decoder, Status, Visitor
+from sofab import Decoder, Field, Status, Visitor, WireType
 
 _IDS = [v["name"] for v in VECTORS]
 
@@ -156,3 +156,53 @@ def test_default_visitor_consumes_everything():
         next(v for v in VECTORS if v["name"] == "full_scale_example")["serialized"]["hex"]
     )
     assert Decoder(visitor=Visitor()).feed(data) is Status.COMPLETE
+
+
+# --- the elision contract both engines rely on ------------------------------
+
+
+def test_the_base_control_hooks_do_not_decline():
+    """``on_field`` and ``on_sequence_begin`` default to "proceed".
+
+    This is what lets the driver skip calling them at all when a visitor leaves
+    them alone — and, for ``on_field``, skip building the Field they are the only
+    consumer of. The saving is only sound because the calls it removes could not
+    have changed the outcome, so the base returns are pinned here: they are no
+    longer reached through a decode.
+    """
+    base = Visitor()
+    assert base.on_field(Field(1, WireType.UNSIGNED)) is not False
+    assert base.on_sequence_begin(1) is not False
+
+
+class _Delegating(Visitor):
+    """Overrides the control hooks but defers to the base for the verdict — the
+    case the ``is not Visitor.on_field`` test must treat as an override."""
+
+    def __init__(self):
+        self.fields = []
+        self.seqs = []
+
+    def on_field(self, field):
+        self.fields.append(field.id)
+        return super().on_field(field)
+
+    def on_sequence_begin(self, field_id):
+        self.seqs.append(field_id)
+        return super().on_sequence_begin(field_id)
+
+
+def test_a_hook_that_delegates_to_the_base_still_receives_every_call():
+    from sofab import Encoder
+
+    enc = Encoder()
+    enc.write_unsigned(1, 7)
+    enc.write_sequence_begin_lazy(2)
+    enc.write_unsigned(3, 8)
+    enc.write_sequence_end()
+    enc.flush()
+
+    v = _Delegating()
+    assert Decoder(visitor=v).feed(enc.getvalue()) is Status.COMPLETE
+    assert v.fields == [1, 3]
+    assert v.seqs == [2]
