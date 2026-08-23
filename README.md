@@ -261,6 +261,35 @@ there for the bound and the storage, not for speed.
 `on_array_begin` is not called for float arrays: they carry no declared width and
 are already moved in one piece.
 
+#### Bounding what a decode holds: `reassembly`
+
+A construct split across two fed chunks has to be joined somewhere. By default
+the decoder joins it in a `bytearray` of its own, which grows to whatever the
+message says — convenient, and not what CORELIB_PLAN §6.6.2 asks for:
+
+> A payload split across fed chunks has to be joined somewhere. That somewhere is
+> storage the caller supplied [...] A codec **MUST NOT** grow a private
+> accumulator instead.
+
+Pass one and it does not:
+
+```python
+dec = Decoder(visitor=handler, reassembly=bytearray(64 * 1024))
+```
+
+The pieces are copied into your buffer as they arrive, and a construct that does
+not fit is `SofaRangeError` — **refused, never accommodated**. That is what lets
+you bound a decode's memory by construction instead of by measurement: whatever
+the sender claims, this decoder holds your 64 KiB and nothing more.
+
+It also makes §6's chunk-lifetime promise literal. Without a reassembly buffer a
+`bytes` chunk is read where it lies and kept until the next `feed`; with one, the
+unconsumed tail is copied out before `feed` returns, so the chunk is yours again
+the moment it does — overwrite it in place if you like.
+
+Nothing else changes: same verdicts, same values, same chunking-independence. A
+message that arrives in one piece never touches the buffer at all.
+
 ### Decode into your own storage (`Binding`)
 
 A `Visitor` costs one Python call per field. A **`Binding`** costs none: declare

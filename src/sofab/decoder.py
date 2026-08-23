@@ -263,12 +263,13 @@ class Decoder:
         self._rstart = 0
         self._rend = 0
         if reassembly is not None:
-            view = memoryview(reassembly)
-            if view.readonly or not view.c_contiguous or view.itemsize != 1:
-                raise SofaRangeError(
-                    "reassembly must be a writable, contiguous buffer of bytes"
-                )
-            self._rbuf = view.cast("B") if view.format != "B" else view
+            # A bytearray, not any writable buffer: both engines index it
+            # directly, and the accelerator reaches its bytes through
+            # PyByteArray_AS_STRING. Widening this would mean two buffer
+            # protocols where §5.3 wants one behaviour.
+            if not isinstance(reassembly, bytearray):
+                raise SofaRangeError("reassembly must be a bytearray")
+            self._rbuf = reassembly
         self._buf: bytes | bytearray = b""
         # len(self._buf), kept in step with it. The buffer only ever changes in
         # feed() and reset(), while the walk asks for its length constantly —
@@ -997,6 +998,8 @@ class Decoder:
         # chunk — a 1 MB blob fed in 4 KiB pieces costs ~122 MB of copying that
         # way.
         if self._rbuf is not None:
+            # Sets _pos itself: with a carry the walk resumes where the held
+            # bytes start, which is not the front of the buffer.
             self._reassemble(data)
         else:
             buf = self._buf
@@ -1011,8 +1014,8 @@ class Decoder:
                     del buf[: self._pos]
                 buf += data
             self._n = len(buf)
-        self._pos = 0
-        self._keep = 0
+            self._pos = 0
+        self._keep = self._pos
         self._running = True
         try:
             if self._drive_push():
@@ -1047,6 +1050,8 @@ class Decoder:
             buf = data if isinstance(data, bytes) else bytes(data)
             self._buf = buf
             self._n = len(buf)
+            self._rstart = self._rend = 0
+            self._pos = 0
             return
         r = self._rbuf
         assert r is not None

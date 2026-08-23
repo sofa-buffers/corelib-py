@@ -1794,6 +1794,11 @@ cdef class Decoder:
     # construct is being accumulated across chunks (appended to, never
     # rebuilt). See feed().
     cdef object _buf
+    # The caller's reassembly buffer, and the span of it holding a construct
+    # that spans a chunk boundary. See the pure engine for what it is for.
+    cdef object _rbuf
+    cdef Py_ssize_t _rstart
+    cdef Py_ssize_t _rend
     # Owns a fixlen payload that had to be assembled across refills, for as long
     # as a pointer into it can still be in use (see _take_fixlen_ptr).
     cdef bytes _spill
@@ -1856,7 +1861,8 @@ cdef class Decoder:
     cdef bint _running
 
     def __cinit__(self, *, binding=None, visitor=None, words=None, objects=None,
-                  max_array_count=None, max_string_len=None, max_blob_len=None):
+                  max_array_count=None, max_string_len=None, max_blob_len=None,
+                  reassembly=None):
         self._tables = None
         self._bent = NULL
         self._btab = NULL
@@ -1871,6 +1877,13 @@ cdef class Decoder:
         self._resume_kind = _R_NONE
         self._resume_entry = -1
         self._running = False
+        self._rbuf = None
+        self._rstart = 0
+        self._rend = 0
+        if reassembly is not None:
+            if type(reassembly) is not bytearray:
+                raise SofaRangeError("reassembly must be a bytearray")
+            self._rbuf = reassembly
         self._binding = binding
         self._visitor = visitor
         self._wants_field = False
@@ -2741,18 +2754,22 @@ cdef class Decoder:
         # extends, at amortised O(len(chunk)). Rebuilding ``carry + chunk``
         # instead would copy the whole carry per chunk — a 1 MB blob fed in
         # 4 KiB pieces costs ~122 MB of copying that way.
-        buf = self._buf
-        if self._pos >= self._n:
-            self._rebind(data if type(data) is bytes else bytes(data))
+        if self._rbuf is not None:
+            # Sets _pos itself -- see the pure engine.
+            self._reassemble(data)
         else:
-            if type(buf) is not bytearray:
-                buf = bytearray(buf)
-            if self._pos:
-                del buf[:self._pos]
-            buf += data
-            self._rebind(buf)      # += may have moved the storage
-        self._pos = 0
-        self._keep = 0
+            buf = self._buf
+            if self._pos >= self._n:
+                self._rebind(data if type(data) is bytes else bytes(data))
+            else:
+                if type(buf) is not bytearray:
+                    buf = bytearray(buf)
+                if self._pos:
+                    del buf[:self._pos]
+                buf += data
+                self._rebind(buf)      # += may have moved the storage
+            self._pos = 0
+        self._keep = self._pos
         self._running = True
         try:
             if self._drive_push():
@@ -2767,14 +2784,75 @@ cdef class Decoder:
             return Status.INVALID
         finally:
             self._running = False
+            if self._rbuf is not None:
+                self._retain()
         self._status = <int>Status.COMPLETE
         return Status.COMPLETE
+
+    cdef int _reassemble(self, object data) except -1:
+        # Put ``data`` where the walk can reach it, using only the caller's
+        # reassembly buffer (§6.6). Mirrors Decoder._reassemble.
+        cdef Py_ssize_t held = self._rend - self._rstart
+        cdef Py_ssize_t n
+        cdef object r
+        if not held:
+            self._rebind(data if type(data) is bytes else bytes(data))
+            self._rstart = 0
+            self._rend = 0
+            self._pos = 0
+            return 0
+        r = self._rbuf
+        n = len(data)
+        if self._rend + n > len(r):
+            if self._rstart:
+                r[:held] = r[self._rstart:self._rend]
+                self._rstart = 0
+                self._rend = held
+            if held + n > len(r):
+                raise SofaRangeError(
+                    "reassembly buffer holds %d bytes; the construct spanning "
+                    "this chunk needs %d" % (len(r), held + n))
+        r[self._rend:self._rend + n] = data
+        self._rend += n
+        self._rebind(r)
+        # _rebind takes the whole bytearray's length; only _rend of it is data.
+        self._n = self._rend
+        self._pos = self._rstart
+        return 0
+
+    cdef int _retain(self) except -1:
+        # Keep what this feed did not consume and let the chunk go, so §6's
+        # chunk-lifetime promise holds. Mirrors Decoder._retain.
+        cdef object r = self._rbuf
+        cdef Py_ssize_t carry = self._n - self._pos
+        if not carry:
+            self._rstart = 0
+            self._rend = 0
+            self._rebind(b"")
+            self._pos = 0
+            return 0
+        if self._buf is r:
+            self._rstart = self._pos
+            return 0
+        if carry > len(r):
+            raise SofaRangeError(
+                "reassembly buffer holds %d bytes; the construct spanning "
+                "this chunk needs %d" % (len(r), carry))
+        r[:carry] = self._buf[self._pos:self._n]
+        self._rstart = 0
+        self._rend = carry
+        self._rebind(r)
+        self._n = carry          # see _reassemble
+        self._pos = 0
+        return 0
 
     def reset(self):
         """Forget the stream and start a new message, keeping the compiled
         binding and its destinations. See the pure engine for the contract."""
         self._rebind(b"")
         self._pos = 0
+        self._rstart = 0
+        self._rend = 0
         self._depth = 0
         self._cur = None
         self._cur_wtype = -1
