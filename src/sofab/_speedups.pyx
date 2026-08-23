@@ -635,6 +635,7 @@ from .visitor import Visitor as _Visitor
 cdef object _BASE_ON_FIELD = _Visitor.on_field
 cdef object _BASE_ON_SEQUENCE_BEGIN = _Visitor.on_sequence_begin
 cdef object _BASE_ON_ARRAY_BEGIN = _Visitor.on_array_begin
+cdef object _BASE_ON_BLOB_BEGIN = _Visitor.on_blob_begin
 cdef object _INT64_MAX_OBJ = INT64_MAX
 cdef tuple _ST = tuple(FixlenSubtype)
 
@@ -1794,6 +1795,11 @@ cdef class Decoder:
     # construct is being accumulated across chunks (appended to, never
     # rebuilt). See feed().
     cdef object _buf
+    # The caller's reassembly buffer, and the span of it holding a construct
+    # that spans a chunk boundary. See the pure engine for what it is for.
+    cdef object _rbuf
+    cdef Py_ssize_t _rstart
+    cdef Py_ssize_t _rend
     # Owns a fixlen payload that had to be assembled across refills, for as long
     # as a pointer into it can still be in use (see _take_fixlen_ptr).
     cdef bytes _spill
@@ -1834,6 +1840,7 @@ cdef class Decoder:
     cdef bint _wants_field
     cdef bint _wants_seq_begin
     cdef bint _wants_array_begin
+    cdef bint _wants_blob_begin
     cdef object _objects             # list destination for string/blob fields
     cdef _Compiled _tables          # keeps the compiled table alive
     cdef _BEntry* _bent
@@ -1856,7 +1863,8 @@ cdef class Decoder:
     cdef bint _running
 
     def __cinit__(self, *, binding=None, visitor=None, words=None, objects=None,
-                  max_array_count=None, max_string_len=None, max_blob_len=None):
+                  max_array_count=None, max_string_len=None, max_blob_len=None,
+                  reassembly=None):
         self._tables = None
         self._bent = NULL
         self._btab = NULL
@@ -1871,17 +1879,27 @@ cdef class Decoder:
         self._resume_kind = _R_NONE
         self._resume_entry = -1
         self._running = False
+        self._rbuf = None
+        self._rstart = 0
+        self._rend = 0
+        if reassembly is not None:
+            if type(reassembly) is not bytearray:
+                raise SofaRangeError("reassembly must be a bytearray")
+            self._rbuf = reassembly
         self._binding = binding
         self._visitor = visitor
         self._wants_field = False
         self._wants_seq_begin = False
         self._wants_array_begin = False
+        self._wants_blob_begin = False
         if visitor is not None:
             self._wants_field = type(visitor).on_field is not _BASE_ON_FIELD
             self._wants_seq_begin = (
                 type(visitor).on_sequence_begin is not _BASE_ON_SEQUENCE_BEGIN)
             self._wants_array_begin = (
                 type(visitor).on_array_begin is not _BASE_ON_ARRAY_BEGIN)
+            self._wants_blob_begin = (
+                type(visitor).on_blob_begin is not _BASE_ON_BLOB_BEGIN)
         self._objects = objects
         if binding is None and visitor is None:
             raise SofaRangeError("a decoder needs a field handler (binding / visitor)")
@@ -2741,18 +2759,22 @@ cdef class Decoder:
         # extends, at amortised O(len(chunk)). Rebuilding ``carry + chunk``
         # instead would copy the whole carry per chunk — a 1 MB blob fed in
         # 4 KiB pieces costs ~122 MB of copying that way.
-        buf = self._buf
-        if self._pos >= self._n:
-            self._rebind(data if type(data) is bytes else bytes(data))
+        if self._rbuf is not None:
+            # Sets _pos itself -- see the pure engine.
+            self._reassemble(data)
         else:
-            if type(buf) is not bytearray:
-                buf = bytearray(buf)
-            if self._pos:
-                del buf[:self._pos]
-            buf += data
-            self._rebind(buf)      # += may have moved the storage
-        self._pos = 0
-        self._keep = 0
+            buf = self._buf
+            if self._pos >= self._n:
+                self._rebind(data if type(data) is bytes else bytes(data))
+            else:
+                if type(buf) is not bytearray:
+                    buf = bytearray(buf)
+                if self._pos:
+                    del buf[:self._pos]
+                buf += data
+                self._rebind(buf)      # += may have moved the storage
+            self._pos = 0
+        self._keep = self._pos
         self._running = True
         try:
             if self._drive_push():
@@ -2767,14 +2789,75 @@ cdef class Decoder:
             return Status.INVALID
         finally:
             self._running = False
+            if self._rbuf is not None:
+                self._retain()
         self._status = <int>Status.COMPLETE
         return Status.COMPLETE
+
+    cdef int _reassemble(self, object data) except -1:
+        # Put ``data`` where the walk can reach it, using only the caller's
+        # reassembly buffer (§6.6). Mirrors Decoder._reassemble.
+        cdef Py_ssize_t held = self._rend - self._rstart
+        cdef Py_ssize_t n
+        cdef object r
+        if not held:
+            self._rebind(data if type(data) is bytes else bytes(data))
+            self._rstart = 0
+            self._rend = 0
+            self._pos = 0
+            return 0
+        r = self._rbuf
+        n = len(data)
+        if self._rend + n > len(r):
+            if self._rstart:
+                r[:held] = r[self._rstart:self._rend]
+                self._rstart = 0
+                self._rend = held
+            if held + n > len(r):
+                raise SofaRangeError(
+                    "reassembly buffer holds %d bytes; the construct spanning "
+                    "this chunk needs %d" % (len(r), held + n))
+        r[self._rend:self._rend + n] = data
+        self._rend += n
+        self._rebind(r)
+        # _rebind takes the whole bytearray's length; only _rend of it is data.
+        self._n = self._rend
+        self._pos = self._rstart
+        return 0
+
+    cdef int _retain(self) except -1:
+        # Keep what this feed did not consume and let the chunk go, so §6's
+        # chunk-lifetime promise holds. Mirrors Decoder._retain.
+        cdef object r = self._rbuf
+        cdef Py_ssize_t carry = self._n - self._pos
+        if not carry:
+            self._rstart = 0
+            self._rend = 0
+            self._rebind(b"")
+            self._pos = 0
+            return 0
+        if self._buf is r:
+            self._rstart = self._pos
+            return 0
+        if carry > len(r):
+            raise SofaRangeError(
+                "reassembly buffer holds %d bytes; the construct spanning "
+                "this chunk needs %d" % (len(r), carry))
+        r[:carry] = self._buf[self._pos:self._n]
+        self._rstart = 0
+        self._rend = carry
+        self._rebind(r)
+        self._n = carry          # see _reassemble
+        self._pos = 0
+        return 0
 
     def reset(self):
         """Forget the stream and start a new message, keeping the compiled
         binding and its destinations. See the pure engine for the contract."""
         self._rebind(b"")
         self._pos = 0
+        self._rstart = 0
+        self._rend = 0
         self._depth = 0
         self._cur = None
         self._cur_wtype = -1
@@ -3086,6 +3169,33 @@ cdef class Decoder:
             return lo >= -(<int64_t>1 << (bits - 1)) and <int64_t>hi < (<int64_t>1 << (bits - 1))
         return hi < (<uint64_t>1 << bits) if bits < 64 else True
 
+    cdef int _take_blob_into(self, object dst, Py_ssize_t size) except -1:
+        # Copy a blob's payload into the caller's buffer (§6.6.3) -- no bytes
+        # built on the way, which is the point: the only size a codec could
+        # build one from is the wire's.
+        cdef Py_buffer view
+        cdef const unsigned char* p
+        try:
+            PyObject_GetBuffer(dst, &view, PyBUF_WRITABLE | PyBUF_SIMPLE)
+        except (BufferError, TypeError) as exc:
+            raise SofaRangeError(
+                "on_blob_begin returned a destination that is not a writable, "
+                "contiguous buffer") from exc
+        try:
+            if view.itemsize != 1:
+                raise SofaRangeError(
+                    "on_blob_begin's destination must hold single bytes")
+            if view.len < size:
+                raise SofaRangeError(
+                    "on_blob_begin returned %d bytes for a blob of %d"
+                    % (view.len, size))
+            p = self._take_fixlen_ptr(size)
+            memcpy(view.buf, <const void*>p, size)
+            self._spill = None
+        finally:
+            PyBuffer_Release(&view)
+        return 0
+
     cdef int _visit_varints(self, object visitor, object fid, int wtype,
                             bint zigzag) except -1:
         # Deliver an integer array by whichever route on_array_begin asked for
@@ -3163,6 +3273,7 @@ cdef class Decoder:
         cdef int t = self._cur_wtype
         cdef int st = self._pend_subtype
         cdef object fid = PyLong_FromUnsignedLongLong(self._cur_id)
+        cdef object dst
         if t == _WT_UNSIGNED:
             visitor.on_unsigned(fid, self._unsigned())
         elif t == _WT_SIGNED:
@@ -3175,6 +3286,11 @@ cdef class Decoder:
             elif st == _ST_STRING:
                 visitor.on_string(fid, self._string())
             else:
+                if self._wants_blob_begin:
+                    dst = visitor.on_blob_begin(fid, self._pend_size)
+                    if dst is not None:
+                        self._take_blob_into(dst, <Py_ssize_t>self._pend_size)
+                        return 0
                 visitor.on_bytes(fid, self._bytes())
         elif t == _WT_ARRAY_UNSIGNED:
             self._visit_varints(visitor, fid, t, False)

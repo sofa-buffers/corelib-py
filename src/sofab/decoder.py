@@ -118,6 +118,23 @@ _ST_BLOB = int(FixlenSubtype.BLOB)
 _I64_MIN = -(1 << 63)
 
 
+def _writable(dst: Any, who: str) -> memoryview:
+    """The caller's destination as a memoryview, or the §6.3 verdict on why not."""
+    try:
+        view = memoryview(dst)
+    except TypeError as exc:
+        raise SofaRangeError(
+            f"{who} returned a destination that is not a writable, "
+            "contiguous buffer"
+        ) from exc
+    if view.readonly or not view.c_contiguous:
+        raise SofaRangeError(
+            f"{who} returned a destination that is not a writable, "
+            "contiguous buffer"
+        )
+    return view
+
+
 def _width_fits(itemsize: int, zigzag: bool, lo: int | None, hi: int | None) -> bool:
     """Does the declared element width fit an ``itemsize``-byte slot?"""
     bits = itemsize * 8
@@ -184,12 +201,16 @@ class Decoder:
         "_objects",
         "_pending",
         "_pos",
+        "_rbuf",
+        "_rend",
+        "_rstart",
         "_resume_entry",
         "_resume_kind",
         "_running",
         "_status",
         "_visitor",
         "_wants_array_begin",
+        "_wants_blob_begin",
         "_wants_field",
         "_wants_seq_begin",
         "_wd",
@@ -208,6 +229,7 @@ class Decoder:
         max_array_count: int | None = None,
         max_string_len: int | None = None,
         max_blob_len: int | None = None,
+        reassembly: Any = None,
     ) -> None:
         """Build a push decoder around a field handler (CORELIB_PLAN §5.2).
 
@@ -251,6 +273,21 @@ class Decoder:
             or max_string_len is not None
             or max_blob_len is not None
         )
+        # The caller's reassembly buffer, and the span of it currently holding a
+        # construct that spans a chunk boundary. Optional: without one the
+        # decoder joins the pieces in a bytearray of its own, which is
+        # convenient and is NOT what §6.6 asks for -- see the parameter's note.
+        self._rbuf: Any = None
+        self._rstart = 0
+        self._rend = 0
+        if reassembly is not None:
+            # A bytearray, not any writable buffer: both engines index it
+            # directly, and the accelerator reaches its bytes through
+            # PyByteArray_AS_STRING. Widening this would mean two buffer
+            # protocols where §5.3 wants one behaviour.
+            if not isinstance(reassembly, bytearray):
+                raise SofaRangeError("reassembly must be a bytearray")
+            self._rbuf = reassembly
         self._buf: bytes | bytearray = b""
         # len(self._buf), kept in step with it. The buffer only ever changes in
         # feed() and reset(), while the walk asks for its length constantly —
@@ -293,6 +330,10 @@ class Decoder:
         self._wants_array_begin = (
             visitor is not None
             and type(visitor).on_array_begin is not Visitor.on_array_begin
+        )
+        self._wants_blob_begin = (
+            visitor is not None
+            and type(visitor).on_blob_begin is not Visitor.on_blob_begin
         )
         # The active table and the stack of enclosing ones. A sequence opens a
         # fresh id scope (§4.9), so descending *replaces* the table rather than
@@ -978,20 +1019,25 @@ class Decoder:
         # Rebuilding ``carry + chunk`` instead would copy the whole carry per
         # chunk — a 1 MB blob fed in 4 KiB pieces costs ~122 MB of copying that
         # way.
-        buf = self._buf
-        if self._pos >= self._n:
-            buf = data if isinstance(data, bytes) else bytes(data)
-            self._buf = buf
+        if self._rbuf is not None:
+            # Sets _pos itself: with a carry the walk resumes where the held
+            # bytes start, which is not the front of the buffer.
+            self._reassemble(data)
         else:
-            if not isinstance(buf, bytearray):
-                buf = bytearray(buf)
+            buf = self._buf
+            if self._pos >= self._n:
+                buf = data if isinstance(data, bytes) else bytes(data)
                 self._buf = buf
-            if self._pos:
-                del buf[: self._pos]
-            buf += data
-        self._n = len(buf)
-        self._pos = 0
-        self._keep = 0
+            else:
+                if not isinstance(buf, bytearray):
+                    buf = bytearray(buf)
+                    self._buf = buf
+                if self._pos:
+                    del buf[: self._pos]
+                buf += data
+            self._n = len(buf)
+            self._pos = 0
+        self._keep = self._pos
         self._running = True
         try:
             if self._drive_push():
@@ -1006,8 +1052,82 @@ class Decoder:
             return Status.INVALID
         finally:
             self._running = False
+            if self._rbuf is not None:
+                self._retain()
         self._status = Status.COMPLETE
         return Status.COMPLETE
+
+    def _reassemble(self, data: Any) -> None:
+        """Put ``data`` where the walk can reach it, using only the caller's
+        reassembly buffer (§6.6).
+
+        With nothing carried the chunk is used where it lies, for the duration
+        of the call; :meth:`_retain` copies out whatever survives it. With a
+        carry the chunk is appended **into the caller's buffer**, which is never
+        grown — a construct that does not fit is refused (§6.6.2), which is what
+        lets a caller bound a decode's memory by construction.
+        """
+        held = self._rend - self._rstart
+        if not held:
+            buf = data if isinstance(data, bytes) else bytes(data)
+            self._buf = buf
+            self._n = len(buf)
+            self._rstart = self._rend = 0
+            self._pos = 0
+            return
+        r = self._rbuf
+        assert r is not None
+        n = len(data)
+        if self._rend + n > len(r):
+            # Slide what is held back to the front and try again; only then is
+            # the buffer genuinely too small.
+            if self._rstart:
+                r[:held] = r[self._rstart : self._rend]
+                self._rstart, self._rend = 0, held
+            if held + n > len(r):
+                raise SofaRangeError(
+                    f"reassembly buffer holds {len(r)} bytes; the construct "
+                    f"spanning this chunk needs {held + n}"
+                )
+        r[self._rend : self._rend + n] = data
+        self._rend += n
+        self._buf = r
+        self._n = self._rend
+        self._pos = self._rstart
+
+    def _retain(self) -> None:
+        """Keep whatever this feed did not consume, and let the chunk go.
+
+        Runs on the way out of every feed. The unconsumed tail is the caller's
+        chunk until this copies it into the caller's *reassembly* buffer, which
+        is what makes §6's chunk-lifetime promise true: once ``feed`` returns,
+        the decoder holds nothing of what was handed to it.
+        """
+        r = self._rbuf
+        assert r is not None
+        carry = self._n - self._pos
+        if not carry:
+            self._rstart = self._rend = 0
+            self._buf = b""
+            self._n = 0
+            self._pos = 0
+            return
+        if self._buf is r:
+            # Already in place; remember where, so the next chunk appends
+            # instead of re-copying what is held (a megabyte fed in kibibytes
+            # would otherwise cost a copy of the whole carry per chunk).
+            self._rstart = self._pos
+            return
+        if carry > len(r):
+            raise SofaRangeError(
+                f"reassembly buffer holds {len(r)} bytes; the construct "
+                f"spanning this chunk needs {carry}"
+            )
+        r[:carry] = self._buf[self._pos : self._n]
+        self._rstart, self._rend = 0, carry
+        self._buf = r
+        self._n = carry
+        self._pos = 0
 
     def reset(self) -> None:
         """Forget the stream and start a new message, keeping the handler and
@@ -1018,6 +1138,7 @@ class Decoder:
         self._buf = b""
         self._n = 0
         self._pos = 0
+        self._rstart = self._rend = 0
         self._depth = 0
         self._cur = None
         self._pending = None
@@ -1313,6 +1434,11 @@ class Decoder:
                 # A parked receiver cap (§6.2.1): the field is being refused, and
                 # the walk over its payload is what the cap exists to prevent.
                 raise SofaLimitError(pending[1])
+            if self._wants_blob_begin and pending[1] == _ST_BLOB:
+                dst = visitor.on_blob_begin(fid, pending[2])
+                if dst is not None:
+                    self._take_blob_into(dst, pending[2])
+                    return
             self._keep = pos = self._pos
             end = pos + pending[2]
             if end > self._n:
@@ -1346,6 +1472,30 @@ class Decoder:
             visitor.on_float32_array(fid, self._take_farray_values(pending, 4))
         else:
             visitor.on_float64_array(fid, self._take_farray_values(pending, 8))
+
+    def _take_blob_into(self, dst: Any, size: int) -> None:
+        """Copy a blob's payload into the caller's buffer (§6.6.3).
+
+        No ``bytes`` is built on the way -- which is the point: the only size a
+        codec could build one from is the wire's, and a megabyte blob would cost
+        a megabyte allocation per message.
+        """
+        view = _writable(dst, "on_blob_begin")
+        if view.itemsize != 1:
+            raise SofaRangeError(
+                "on_blob_begin's destination must hold single bytes"
+            )
+        if view.nbytes < size:
+            raise SofaRangeError(
+                f"on_blob_begin returned {view.nbytes} bytes for a blob of {size}"
+            )
+        self._keep = pos = self._pos
+        end = pos + size
+        if end > self._n:
+            raise self._suspend("truncated payload")
+        view[:size] = memoryview(self._buf)[pos:end]
+        self._pos = end
+        self._pending = None  # committed once the payload is in hand (§5.2)
 
     def _visit_varints(
         self, visitor: Visitor, fid: int, wtype: int, count: int, zigzag: bool
@@ -1383,18 +1533,7 @@ class Decoder:
         # not one element ever boxed. The buffer is the caller's, so a short one
         # is refused rather than grown (§6.6) -- and every verdict below is
         # reached here, at the count header, before an element is read.
-        try:
-            view = memoryview(dst)
-        except TypeError as exc:
-            raise SofaRangeError(
-                "on_array_begin returned a destination that is not a writable, "
-                "contiguous buffer"
-            ) from exc
-        if view.readonly or not view.c_contiguous:
-            raise SofaRangeError(
-                "on_array_begin returned a destination that is not a writable, "
-                "contiguous buffer"
-            )
+        view = _writable(dst, "on_array_begin")
         isz = view.itemsize
         if isz not in (1, 2, 4, 8):
             raise SofaRangeError(

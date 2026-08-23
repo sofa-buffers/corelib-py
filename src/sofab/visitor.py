@@ -90,6 +90,32 @@ class Visitor:
         """
         return None
 
+    def on_blob_begin(self, field_id: int, size: int) -> Any:
+        """A blob's length has been read; no payload byte has been copied yet.
+
+        Return ``None`` to take the default — a ``bytes``, handed to
+        :meth:`on_bytes`. Return a writable, contiguous buffer of at least
+        ``size`` bytes and the decoder copies the payload straight into it and
+        does **not** call :meth:`on_bytes`. One too short is
+        :class:`sofab.SofaRangeError`; the decoder never grows one
+        (CORELIB_PLAN §6.6), and the refusal comes at the length word, before a
+        byte is written.
+
+        This is §6.6.3's second shape for an aggregate: a callback carrying a
+        whole blob obliges the codec to build one, and the only size available
+        to build it from is the wire's. A megabyte blob costs a megabyte
+        allocation per message that way; into a destination it costs none.
+
+        Called again for the same blob if a chunk boundary suspends the copy, so
+        return the same answer each time; the decoder restarts the payload from
+        its first byte.
+
+        Not offered for strings. A string the handler reads must be validated
+        (§6.7.2), and this port validates by decoding, which builds the ``str``
+        a destination exists to avoid — so there would be nothing to save.
+        """
+        return None
+
     # --- typed value hooks --------------------------------------------------
 
     def on_unsigned(self, field_id: int, value: int) -> None:
