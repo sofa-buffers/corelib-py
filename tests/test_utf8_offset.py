@@ -33,17 +33,14 @@ vectors README's chunk-boundary-independence rule).
 
 from __future__ import annotations
 
-import io
-
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
-from vectors import ChunkReader, uvarint
+from vectors import Recorder, Status, raise_for, uvarint, values, verdict, walk
 
 from sofab import (
     Encoder,
     FixlenSubtype,
     SofaDecodeError,
-    SofaIncompleteError,
     SofaRangeError,
     WireType,
 )
@@ -76,64 +73,22 @@ def _ascii_blob(n: int) -> bytes:
     return _fixlen(1, FixlenSubtype.BLOB, b"a" * n)
 
 
-class StallingReader:
-    """A ``read(n)`` source that hands over ``chunk`` bytes, then stalls once.
+def _stalling(engine, data: bytes, chunk: int = 1):
+    """Feed ``data`` ``chunk`` bytes at a time, with an empty feed between each.
 
     Returning ``b""`` before the message ends is what puts the decoder in §5.2's
-    INCOMPLETE state — the shape a non-blocking socket has and the one a
-    ``BytesIO`` can never produce. Alternating stall/deliver drives a suspension
-    at *every* byte boundary of the message, so a resumed read starts from every
-    possible offset into the payload.
+    INCOMPLETE state — the shape a non-blocking socket has. Alternating
+    stall/deliver drives a suspension at *every* byte boundary of the message, so
+    a resumed read starts from every possible offset into the payload.
     """
-
-    def __init__(self, data: bytes, chunk: int = 1) -> None:
-        self._data = bytes(data)
-        self._pos = 0
-        self._chunk = chunk
-        self._stall = True
-
-    def read(self, n: int) -> bytes:
-        self._stall = not self._stall
-        if self._stall or self._pos >= len(self._data):
-            return b""
-        end = min(self._pos + min(n, self._chunk), len(self._data))
-        out = self._data[self._pos : end]
-        self._pos = end
-        return out
-
-
-def _drive_stalling(dec, *, reads: int):
-    """Pull ``reads`` fields, retrying every INCOMPLETE, and return the values.
-
-    Every retry re-issues the *same* call: §5.2 says a suspended call consumed
-    nothing, so this loop is the whole contract for a stalling source. ``None``
-    from :meth:`next` is the between-fields half of the same answer (the bytes
-    stopped exactly on a field boundary), so it is retried too. The retry budget
-    is finite so a decoder that never makes progress fails the test instead of
-    hanging it.
-    """
-    out = []
-    budget = 10_000
-    while len(out) < reads:
-        try:
-            field = dec.next()
-        except SofaIncompleteError:
-            field = None
-        if field is None:
-            budget -= 1
-            assert budget > 0, "decoder made no progress"
-            continue
-        while True:
-            try:
-                if field.subtype == FixlenSubtype.STRING:
-                    out.append(dec.string())
-                else:
-                    out.append(dec.bytes())
-                break
-            except SofaIncompleteError:
-                budget -= 1
-                assert budget > 0, "decoder made no progress"
-    return out
+    rec = Recorder()
+    dec = engine(visitor=rec)
+    status = Status.COMPLETE
+    for off in range(0, len(data), chunk):
+        dec.feed(b"")
+        status = dec.feed(data[off : off + chunk])
+    raise_for(status, dec)
+    return [e[2] for e in rec.events]
 
 
 # --- an invalid payload far into the buffer ----------------------------------
@@ -150,12 +105,12 @@ def test_invalid_payload_behind_valid_bytes_is_invalid(engine, payload, pad):
     is exactly the range bug the shared vectors cannot catch.
     """
     data = _ascii_blob(pad) + _fixlen(0, FixlenSubtype.STRING, payload)
-    dec = engine(io.BytesIO(data))
-    assert dec.next() is not None
-    assert dec.bytes() == b"a" * pad  # the padding itself is intact
-    assert dec.next() is not None
     with pytest.raises(SofaDecodeError):
-        dec.string()
+        verdict(engine, data)
+    # ... and the padding itself is intact, so the failure really is the string.
+    status, rec, _dec = walk(engine, _ascii_blob(pad))
+    assert status is Status.COMPLETE
+    assert rec.events == [("blob", 1, b"a" * pad)]
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -166,11 +121,8 @@ def test_invalid_payload_far_in_is_invalid_when_chunk_fed(engine, payload, chunk
     different buffer offset on every chunk size, and none of them may change the
     verdict."""
     data = _ascii_blob(300) + _fixlen(0, FixlenSubtype.STRING, payload)
-    dec = engine(ChunkReader(data, chunk))
-    dec.next(); dec.skip()
-    assert dec.next() is not None
     with pytest.raises(SofaDecodeError):
-        dec.string()
+        verdict(engine, data, chunk=chunk)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -180,10 +132,8 @@ def test_invalid_payload_far_in_is_invalid_through_a_stalling_reader(engine, pay
     payload and resumes it from its first byte over and over; INVALID must still
     be the verdict, never a truncation-shaped success."""
     data = _ascii_blob(40) + _fixlen(0, FixlenSubtype.STRING, payload)
-    dec = engine(StallingReader(data))
-    assert _drive_stalling(dec, reads=1) == [b"a" * 40]
     with pytest.raises(SofaDecodeError):
-        _drive_stalling(dec, reads=1)
+        _stalling(engine, data)
 
 
 # --- a valid payload behind bytes that are not UTF-8 at all ------------------
@@ -198,12 +148,7 @@ def test_valid_string_behind_a_non_utf8_blob_still_decodes(engine):
     junk = bytes(range(0x80, 0x100))  # every byte here is an invalid UTF-8 lead
     data = _fixlen(1, FixlenSubtype.BLOB, junk) + _fixlen(0, FixlenSubtype.STRING,
                                                           VALID_TEXT.encode())
-    dec = engine(io.BytesIO(data))
-    dec.next()
-    assert dec.bytes() == junk
-    dec.next()
-    assert dec.string() == VALID_TEXT
-    assert dec.next() is None
+    assert values(engine, data) == [("blob", 1, junk), ("str", 0, VALID_TEXT)]
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -217,8 +162,7 @@ def test_valid_multibyte_string_split_across_chunks_stays_incomplete(engine, chu
     judged what it had so far would call a half-delivered ``\U0001f600``
     malformed."""
     data = _fixlen(0, FixlenSubtype.STRING, VALID_TEXT.encode())
-    dec = engine(StallingReader(data, chunk))
-    assert _drive_stalling(dec, reads=1) == [VALID_TEXT]
+    assert _stalling(engine, data, chunk) == [VALID_TEXT]
 
 
 # --- validation stops at the payload end -------------------------------------
@@ -237,19 +181,18 @@ def test_validation_stops_at_the_declared_payload_end(engine):
     assert tail[0] == 0xAC  # the byte that would complete E2 82
     data = _fixlen(0, FixlenSubtype.STRING, b"\xe2\x82") + tail
 
-    dec = engine(io.BytesIO(data))
-    dec.next()
     with pytest.raises(SofaDecodeError):
-        dec.string()
+        verdict(engine, data)
 
-    # And the framing itself is sound: skipping the same field walks straight
-    # onto the array, so the case above really is about validation range only.
-    dec = engine(io.BytesIO(data))
-    dec.next(); dec.skip()
-    field = dec.next()
-    assert field is not None and field.id == 21
-    assert dec.read_signed_array() == []
-    assert dec.next() is None
+    # And the framing itself is sound: a handler that declines the string walks
+    # straight onto the array, so the case above really is about validation
+    # range only.
+    status, rec, _dec = walk(
+        engine, data,
+        recorder=Recorder(decline=lambda f: f.subtype == FixlenSubtype.STRING),
+    )
+    assert status is Status.COMPLETE
+    assert rec.events == [("sa", 21, ())]
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -257,10 +200,8 @@ def test_validation_stops_at_the_payload_end_with_trailing_bytes(engine):
     """The same, with the completing byte outside the message entirely: trailing
     bytes are in the decode buffer but belong to no field this decoder read."""
     data = _fixlen(0, FixlenSubtype.STRING, b"\xe2\x82") + b"\xac"
-    dec = engine(io.BytesIO(data))
-    dec.next()
     with pytest.raises(SofaDecodeError):
-        dec.string()
+        verdict(engine, data)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -269,11 +210,8 @@ def test_payload_ending_exactly_at_the_buffer_end_is_still_validated(engine):
     byte fed. A validator that stopped one byte short would miss the lone ``FF``
     and accept."""
     data = _ascii_blob(64) + _fixlen(0, FixlenSubtype.STRING, b"ok\xff")
-    dec = engine(io.BytesIO(data))
-    dec.next(); dec.skip()
-    dec.next()
     with pytest.raises(SofaDecodeError):
-        dec.string()
+        verdict(engine, data)
 
 
 # --- the encode side is offset-independent too --------------------------------
