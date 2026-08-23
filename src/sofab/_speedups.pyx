@@ -2719,7 +2719,9 @@ cdef class Decoder:
         self._keep = 0
         self._running = True
         try:
-            self._drive_push()
+            if self._drive_push():
+                self._status = <int>Status.INCOMPLETE
+                return Status.INCOMPLETE
         except SofaIncompleteError:
             self._status = <int>Status.INCOMPLETE
             return Status.INCOMPLETE
@@ -2753,7 +2755,28 @@ cdef class Decoder:
         self._tsp = 0
         self._tab = 0 if self._binding is not None else -1
 
+    cdef inline bint _value_ready(self) noexcept:
+        # Are all of the pending value's bytes buffered? Only asked for the two
+        # kinds whose length is known from the header — a fixlen payload and a
+        # fixlen array. It is a cheap stand-in for attempting the read and
+        # catching its suspension: a payload larger than one chunk would
+        # otherwise raise once per chunk, and a 1 MB blob fed in 4 KiB pieces
+        # spends more on the exception machinery than on the bytes. Every other
+        # kind answers True and takes the ordinary path.
+        cdef uint64_t want
+        if self._pk == _PEND_FIXLEN:
+            return <uint64_t>(self._n - self._pos) >= self._pend_size
+        if self._pk == _PEND_FARRAY:
+            if self._pend_size and self._pend_count > _SSIZE_MAX / self._pend_size:
+                return False   # unsatisfiable; the read path reports it
+            want = self._pend_count * self._pend_size
+            return <uint64_t>(self._n - self._pos) >= want
+        return True
+
     cdef int _drive_push(self) except -1:
+        # Returns 1 when it stopped short of a value whose bytes have not all
+        # arrived — the cheap half of INCOMPLETE, with no exception raised.
+        # Every other suspension still comes through SofaIncompleteError.
         cdef int t, rk
         cdef Py_ssize_t ei
         cdef _BEntry* e
@@ -2764,6 +2787,8 @@ cdef class Decoder:
         if rk != _R_NONE:
             # A value read ran out of bytes last time. Finish *it* — walking on
             # to the next header would auto-skip the value the caller is owed.
+            if rk != _R_SKIP and not self._value_ready():
+                return 1
             self._resume_kind = _R_NONE
             try:
                 if rk == _R_BOUND:
@@ -2819,6 +2844,10 @@ cdef class Decoder:
                 continue
 
             if ei >= 0:
+                if not self._value_ready():
+                    self._resume_kind = _R_BOUND
+                    self._resume_entry = ei
+                    return 1
                 try:
                     self._take_bound(&self._bent[ei])
                 except SofaIncompleteError:
@@ -2830,6 +2859,9 @@ cdef class Decoder:
             if visitor is not None:
                 if visitor.on_field(self._cur) is False:
                     continue
+                if not self._value_ready():
+                    self._resume_kind = _R_VISIT
+                    return 1
                 try:
                     self._visit_value(visitor)
                 except SofaIncompleteError:

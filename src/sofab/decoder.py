@@ -822,7 +822,9 @@ class Decoder:
         self._keep = 0
         self._running = True
         try:
-            self._drive_push()
+            if self._drive_push():
+                self._status = Status.INCOMPLETE
+                return Status.INCOMPLETE
         except SofaIncompleteError:
             self._status = Status.INCOMPLETE
             return Status.INCOMPLETE
@@ -854,12 +856,39 @@ class Decoder:
         self._bmap = self._binding._by_id if self._binding is not None else None
         self._bstack.clear()
 
-    def _drive_push(self) -> None:
+    def _value_ready(self) -> bool:
+        """Are all of the pending value's bytes buffered?
+
+        Only asked for the two kinds whose length is known from the header —
+        a fixlen payload and a fixlen array. It is a *cheap* stand-in for
+        attempting the read and catching its suspension: a payload larger than
+        one chunk would otherwise raise once per chunk, and a 1 MB blob fed in
+        4 KiB pieces spends more on the exception machinery than on the bytes.
+        Every other kind answers ``True`` and takes the ordinary path.
+        """
+        pending = self._pending
+        if pending is None:
+            return True
+        kind = pending[0]
+        have = len(self._buf) - self._pos
+        if kind == _FIXLEN:
+            return bool(have >= pending[2])
+        if kind == _FARRAY:
+            return bool(have >= pending[2] * pending[3])
+        return True
+
+    def _drive_push(self) -> bool:
+        """Walk the fed bytes. Returns ``True`` if it stopped short of a value
+        whose bytes have not all arrived — the cheap half of INCOMPLETE, with no
+        exception raised. Every other suspension still comes through
+        :class:`SofaIncompleteError`."""
         visitor = self._visitor
         rk = self._resume_kind
         if rk != _R_NONE:
             # A value read ran out of bytes last time. Finish *it* — walking on
-            # to next() would auto-skip the value the caller is still owed.
+            # to the next header would auto-skip the value the caller is owed.
+            if rk != _R_SKIP and not self._value_ready():
+                return True
             self._resume_kind = _R_NONE
             try:
                 if rk == _R_BOUND:
@@ -883,7 +912,7 @@ class Decoder:
         while True:
             t = self._next_wire(want_field)
             if t < 0:
-                return
+                return False
 
             if t == WireType.SEQUENCE_END:
                 if self._bstack:
@@ -936,6 +965,10 @@ class Decoder:
                 continue
 
             if entry is not None:
+                if not self._value_ready():
+                    self._resume_kind = _R_BOUND
+                    self._resume_entry = entry
+                    return True
                 try:
                     self._take_bound(entry)
                 except SofaIncompleteError:
@@ -949,6 +982,9 @@ class Decoder:
                 assert f is not None
                 if visitor.on_field(f) is False:
                     continue
+                if not self._value_ready():
+                    self._resume_kind = _R_VISIT
+                    return True
                 try:
                     self._visit_value(visitor, f)
                 except SofaIncompleteError:
