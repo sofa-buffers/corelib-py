@@ -310,7 +310,7 @@ class Binding:
         ``maxlen`` is the schema's declared byte length, or ``0`` for a field the
         schema leaves unbounded. Declaring it makes the field **schema-bounded**:
         a longer payload is INVALID (MESSAGE_SPEC §7.1) and the receiver-side
-        ``max_string_len`` cap no longer applies to it (§6.2.1). Left at ``0``
+        ``max_dyn_string_len`` cap no longer applies to it (§6.2.1). Left at ``0``
         the cap applies as usual."""
         return self._add(K_STRING, field_id, at, maxlen, count_at, None)
 

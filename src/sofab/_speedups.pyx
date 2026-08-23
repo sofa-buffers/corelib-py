@@ -53,6 +53,11 @@ from cpython.bytearray cimport PyByteArray_AS_STRING, PyByteArray_GET_SIZE
 from cpython.list cimport PyList_Append, PyList_GET_ITEM, PyList_GET_SIZE, PyList_New
 from cpython.buffer cimport (PyObject_GetBuffer, PyBuffer_Release,
                              PyBUF_WRITABLE, PyBUF_SIMPLE)
+cdef extern from "Python.h":
+    # One object over the memory, with no Py_buffer round trip and no slice of a
+    # parent view -- the flush path builds one of these per drain.
+    object PyMemoryView_FromMemory(char* mem, Py_ssize_t size, int flags)
+    int PyBUF_READ
 from cpython.long cimport PyLong_FromUnsignedLongLong, PyLong_FromLongLong
 from cpython.ref cimport PyObject, Py_INCREF
 from libc.stdint cimport (uint8_t, uint16_t, uint32_t, uint64_t,
@@ -636,6 +641,8 @@ cdef object _BASE_ON_FIELD = _Visitor.on_field
 cdef object _BASE_ON_SEQUENCE_BEGIN = _Visitor.on_sequence_begin
 cdef object _BASE_ON_ARRAY_BEGIN = _Visitor.on_array_begin
 cdef object _BASE_ON_BLOB_BEGIN = _Visitor.on_blob_begin
+cdef object _ARRAY_MAX_OBJ = _ARRAY_MAX
+cdef object _FIXLEN_MAX_OBJ = _FIXLEN_MAX
 cdef object _INT64_MAX_OBJ = INT64_MAX
 cdef tuple _ST = tuple(FixlenSubtype)
 
@@ -938,6 +945,9 @@ cdef class Encoder:
     # output buffer (always installed: the convenience constructors install a
     # scratch buffer, over_buffer the caller's)
     cdef object _fixed_obj          # the bytearray being written into (keeps it alive)
+    # One memoryview per installation, so a flush costs a slice of it rather than
+    # a fresh view plus a slice. The blob-streaming row flushes ~977 times.
+    cdef object _fixed_view
     # The convenience constructors' scratch: one fixed block, allocated at
     # construction and never resized (S5.1 -- an output buffer is never grown).
     # Raw C memory rather than a bytearray because nothing outside the encoder
@@ -979,6 +989,7 @@ cdef class Encoder:
 
     def __cinit__(self):
         self._fixed_obj = None
+        self._fixed_view = None
         self._scratch = NULL
         self._fixed_ptr = NULL
         self._fixed_cap = 0
@@ -1061,6 +1072,7 @@ cdef class Encoder:
                 "MIN_OUTPUT_BUFFER=%d usable byte(s), got %d"
                 % (_MIN_OUTPUT_BUFFER, size - <Py_ssize_t>offset))
         self._fixed_obj = buffer
+        self._fixed_view = memoryview(buffer)
         self._fixed_ptr = <unsigned char*>PyByteArray_AS_STRING(buffer)
         self._fixed_cap = <size_t>size
         self._cursor = <size_t>offset
@@ -1130,12 +1142,28 @@ cdef class Encoder:
         if self._writer is None and self._flush_sink is None:
             raise SofaBufferError("encoder buffer full")
         installs = self._installs
-        snapshot = PyBytes_FromStringAndSize(<char*>self._fixed_ptr, <Py_ssize_t>self._cursor)
-        if self._writer is not None:
-            self._writer.write(snapshot)
+        # §5.1.6: the sink is handed the installed buffer itself, never a copy of
+        # it and never any other memory -- see the pure engine for why a copy is
+        # both "other memory" and the thing that makes §5.1.5's take-the-buffer
+        # half unreachable.
+        cdef Py_ssize_t used = <Py_ssize_t>self._cursor
+        # A caller-installed buffer keeps its object behind the view, so a sink
+        # can see whose buffer it holds and the bytearray stays alive while it
+        # does. The scratch shape has no such object -- one memoryview straight
+        # over the memory then, which is also the cheaper of the two and the one
+        # the streaming rows take.
+        if self._fixed_view is not None:
+            view = self._fixed_view[0:used]
         else:
-            self._flush_sink(snapshot)
+            view = PyMemoryView_FromMemory(<char*>self._fixed_ptr, used, PyBUF_READ)
+        if self._writer is not None:
+            self._writer.write(view)
+        else:
+            self._flush_sink(view)
         if self._installs == installs:
+            # The sink copied, so the buffer is ours again and the export has to
+            # go -- it would otherwise block the next buffer_set.
+            view.release()
             self._cursor = 0
         return 0
 
@@ -1787,9 +1815,9 @@ cdef class Decoder:
     # and without this the header walk touches a Python attribute per string,
     # blob and array field only to find None there.
     cdef bint _capped
-    cdef object _max_array_count
-    cdef object _max_string_len
-    cdef object _max_blob_len
+    cdef object _max_dyn_array_count
+    cdef object _max_dyn_string_len
+    cdef object _max_dyn_blob_len
     # Owns the storage the pointer indexes into. ``bytes`` while a chunk is
     # being consumed whole (adopted, never copied); a ``bytearray`` while a
     # construct is being accumulated across chunks (appended to, never
@@ -1863,7 +1891,9 @@ cdef class Decoder:
     cdef bint _running
 
     def __cinit__(self, *, binding=None, visitor=None, words=None, objects=None,
-                  max_array_count=None, max_string_len=None, max_blob_len=None,
+                  max_dyn_array_count=_ARRAY_MAX_OBJ,
+                  max_dyn_string_len=_FIXLEN_MAX_OBJ,
+                  max_dyn_blob_len=_FIXLEN_MAX_OBJ,
                   reassembly=None):
         self._tables = None
         self._bent = NULL
@@ -1909,11 +1939,27 @@ cdef class Decoder:
             self._btab = self._tables.btab
             self._bind_words(words, objects)
             self._tab = 0
-        self._capped = (max_array_count is not None or max_string_len is not None
-                        or max_blob_len is not None)
-        self._max_array_count = max_array_count
-        self._max_string_len = max_string_len
-        self._max_blob_len = max_blob_len
+        # §6.2.1: no unset state and no unlimited mode. None is refused rather
+        # than read as "no limit"; the defaults are the format ceilings above
+        # which the value is already INVALID, which is the widest a limit can be
+        # while still being one. See the pure engine for the full note.
+        # Written out rather than looped: a decoder is constructed per message on
+        # the one-shot path, and a Python-level loop over three tuples is a
+        # measurable share of that.
+        # The identity test is not a shortcut past the check: a default IS the
+        # ceiling object, and the ceiling is what the check would accept.
+        if max_dyn_array_count is not _ARRAY_MAX_OBJ:
+            self._check_limit("max_dyn_array_count", max_dyn_array_count, _ARRAY_MAX_OBJ)
+        if max_dyn_string_len is not _FIXLEN_MAX_OBJ:
+            self._check_limit("max_dyn_string_len", max_dyn_string_len, _FIXLEN_MAX_OBJ)
+        if max_dyn_blob_len is not _FIXLEN_MAX_OBJ:
+            self._check_limit("max_dyn_blob_len", max_dyn_blob_len, _FIXLEN_MAX_OBJ)
+        self._capped = (max_dyn_array_count < _ARRAY_MAX_OBJ
+                        or max_dyn_string_len < _FIXLEN_MAX_OBJ
+                        or max_dyn_blob_len < _FIXLEN_MAX_OBJ)
+        self._max_dyn_array_count = max_dyn_array_count
+        self._max_dyn_string_len = max_dyn_string_len
+        self._max_dyn_blob_len = max_dyn_blob_len
         self._buf = b""
         self._p = <const unsigned char*>PyBytes_AS_STRING(self._buf)
         self._n = 0
@@ -1937,6 +1983,14 @@ cdef class Decoder:
             PyBuffer_Release(self._wview)
             free(self._wview)
             self._wview = NULL
+
+    cdef inline int _check_limit(self, str name, object value, object ceiling) except -1:
+        # §6.2.1: no unset state, no unlimited mode, and a domain of 0..ceiling.
+        if value is None:
+            raise SofaRangeError("%s has no unset state (§6.2.1)" % name)
+        if value < 0 or value > ceiling:
+            raise SofaRangeError("%s=%s is outside 0..%s" % (name, value, ceiling))
+        return 0
 
     cdef inline void _rebind(self, object newbuf):
         self._buf = newbuf
@@ -2239,9 +2293,9 @@ cdef class Decoder:
             cap = _NONE
             if self._capped:
                 if subtype == _ST_STRING:
-                    cap = self._max_string_len
+                    cap = self._max_dyn_string_len
                 elif subtype == _ST_BLOB:
-                    cap = self._max_blob_len
+                    cap = self._max_dyn_blob_len
             if want_field or cap is not None:
                 # One boxed length, reused: it is the Field's ``size`` and the
                 # value a configured cap is compared against and named in its
@@ -2253,10 +2307,10 @@ cdef class Decoder:
                                          _WT[_WT_FIXLEN], boxed, _ZERO, _ST[subtype])
                 if cap is not None and boxed > cap:
                     if subtype == _ST_STRING:
-                        self._park_limit("string length %d exceeds max_string_len %s"
+                        self._park_limit("string length %d exceeds max_dyn_string_len %s"
                                          % (boxed, cap))
                     else:
-                        self._park_limit("blob length %d exceeds max_blob_len %s"
+                        self._park_limit("blob length %d exceeds max_dyn_blob_len %s"
                                          % (boxed, cap))
             return wtype
 
@@ -2292,15 +2346,15 @@ cdef class Decoder:
             self._pk = _PEND_VARRAY
             self._pend_wtype = wtype
             self._pend_count = count
-            cap = self._max_array_count if self._capped else _NONE
-            if want_field or cap is not None:
+            cap = self._max_dyn_array_count if self._capped else _NONE
+            if want_field or cap is not _NONE:
                 boxed = PyLong_FromUnsignedLongLong(count)   # see the fixlen branch
                 if want_field:
                     self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
                                          _WT[wtype], _ZERO, boxed, _NONE)
                 # Parked, not raised — see the fixlen branch above (§6.2.1).
                 if cap is not None and boxed > cap:
-                    self._park_limit("array count %d exceeds max_array_count %s" % (boxed, cap))
+                    self._park_limit("array count %d exceeds max_dyn_array_count %s" % (boxed, cap))
             return wtype
 
         # wtype == _WT_ARRAY_FIXLEN
@@ -2329,8 +2383,8 @@ cdef class Decoder:
         self._pend_subtype = subtype
         self._pend_count = count
         self._pend_size = elem_size
-        cap = self._max_array_count if self._capped else _NONE
-        if want_field or cap is not None:
+        cap = self._max_dyn_array_count if self._capped else _NONE
+        if want_field or cap is not _NONE:
             boxed = PyLong_FromUnsignedLongLong(count)      # see the fixlen branch
             if want_field:
                 self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
@@ -2339,7 +2393,7 @@ cdef class Decoder:
                                      _ST[subtype])
             # Parked, not raised — see the fixlen branch above (§6.2.1).
             if cap is not None and boxed > cap:
-                self._park_limit("array count %d exceeds max_array_count %s" % (boxed, cap))
+                self._park_limit("array count %d exceeds max_dyn_array_count %s" % (boxed, cap))
         return wtype
 
     # --- receiver caps vs. schema bounds (§6.2.1) ---------------------------
@@ -3209,6 +3263,9 @@ cdef class Decoder:
         cdef bint bounded
         cdef int64_t clo = INT64_MIN
         cdef uint64_t chi = <uint64_t>0xFFFFFFFFFFFFFFFF
+        # The receiver limit first (§6.2.1) — see the pure engine for why.
+        if self._pk == _PEND_LIMIT:
+            raise SofaLimitError(self._limit_msg)
         if self._wants_array_begin:
             spec = visitor.on_array_begin(fid, _WT[wtype], count)
             if spec is not None:
@@ -3286,7 +3343,12 @@ cdef class Decoder:
             elif st == _ST_STRING:
                 visitor.on_string(fid, self._string())
             else:
-                if self._wants_blob_begin:
+                # The receiver limit first (§6.2.1): a parked rejection means the
+                # decoder has already refused this blob, so the handler must not
+                # be asked for storage for it. The list route reaches the same
+                # verdict inside _bytes(); this path bypasses that, so it asks
+                # here.
+                if self._wants_blob_begin and self._pk != _PEND_LIMIT:
                     dst = visitor.on_blob_begin(fid, self._pend_size)
                     if dst is not None:
                         self._take_blob_into(dst, <Py_ssize_t>self._pend_size)

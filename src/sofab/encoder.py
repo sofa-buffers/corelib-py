@@ -340,12 +340,24 @@ class Encoder:
         # the new cursor — resetting to 0 here would silently drop the header room it
         # just reserved and overwrite it with payload in every packet but the first.
         installs = self._installs
-        snapshot = bytes(self._fixed[0 : self._cursor])
+        # §5.1.6: the sink is handed the installed buffer itself, never a copy
+        # of it and never any other memory. A copy would be "memory other than
+        # the installed output buffer" -- and it would also make §5.1.5's other
+        # half unreachable, because a sink cannot *take* a buffer it was never
+        # given. The view is over the caller's bytearray, so a sink that keeps
+        # it has taken the buffer and must install a replacement before it
+        # returns; one that copies simply lets the view go.
+        view = memoryview(self._fixed)[0 : self._cursor]
         if self._writer is not None:
-            self._writer.write(snapshot)  # type: ignore[attr-defined]
+            self._writer.write(view)  # type: ignore[attr-defined]
         else:
-            self._flush_sink(snapshot)  # type: ignore[misc]
+            self._flush_sink(view)  # type: ignore[misc, arg-type]
         if self._installs == installs:
+            # The sink copied, so the buffer is ours again and the view must go
+            # with it -- a lingering export would block the next buffer_set from
+            # replacing the buffer. A sink that *took* it installed a
+            # replacement, and its view stays valid over memory it now owns.
+            view.release()
             self._cursor = 0
 
     def bytes_used(self) -> int:

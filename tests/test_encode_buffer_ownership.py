@@ -185,7 +185,54 @@ def test_convenience_and_caller_buffer_models_agree(enc_cls):
     assert b"".join(writer.chunks) == expected
 
     chunks: list[bytes] = []
-    over = enc_cls.over_buffer(bytearray(MIN_OUTPUT_BUFFER), 0, chunks.append)
+    over = enc_cls.over_buffer(bytearray(MIN_OUTPUT_BUFFER), 0, lambda c: chunks.append(bytes(c)))
     build_full_scale(over)
     over.flush()
     assert b"".join(chunks) == expected
+
+
+# --- §5.1.6: the sink sees the installed buffer, never a copy of it ----------
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_the_sink_is_handed_the_installed_buffer_itself(enc_cls):
+    """§5.1.6: "An encoder MUST NOT hand any memory other than the installed
+    output buffer to the sink."
+
+    A copy is memory other than the buffer, and it also makes §5.1.5's other
+    half unreachable: a sink cannot *take* a buffer it was never given. What
+    arrives is therefore a view over the caller's own bytearray.
+    """
+    buf = bytearray(16)
+    seen = []
+
+    def sink(chunk):
+        assert isinstance(chunk, memoryview), type(chunk)
+        seen.append(chunk.obj is buf)
+        return None
+
+    enc = enc_cls.over_buffer(buf, 0, sink)
+    enc.write_bytes(1, b"x" * 200)
+    enc.flush()
+    assert len(seen) > 1, "the payload must have been flushed in pieces"
+    assert all(seen), "every flush must be a view over the installed buffer"
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_a_taking_sink_keeps_what_it_was_handed(enc_cls):
+    """§5.1.5: a sink that installs a replacement has *taken* the buffer, so the
+    memory it holds stays its own -- and the bytes are still there afterwards."""
+    bufs = [bytearray(16) for _ in range(64)]
+    kept = []
+
+    def taking(chunk):
+        kept.append(chunk)
+        enc.buffer_set(bufs[len(kept)], 0)
+        return None
+
+    enc = enc_cls.over_buffer(bufs[0], 0, taking)
+    enc.write_bytes(1, bytes(range(200)))
+    enc.flush()
+    assert len(kept) > 1
+    joined = b"".join(bytes(k) for k in kept)
+    assert joined.endswith(bytes(range(200))[-8:])

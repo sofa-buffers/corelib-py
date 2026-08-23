@@ -200,7 +200,7 @@ Every `feed` returns the outcome for the bytes consumed **so far**:
 
 There is deliberately **no** `finish()`/`end()`: the status `feed` returned *is*
 the answer, and whether an `INCOMPLETE` at end-of-input is acceptable is your
-framing's call. A **receiver-side limit** (`max_array_count` and friends) is not
+framing's call. A **receiver-side limit** (`max_dyn_array_count` and friends) is not
 one of the three outcomes — the message is well-formed and you declined it — so
 it raises `SofaLimitError` rather than folding into `INVALID`.
 
@@ -450,23 +450,30 @@ whether more can still come.
 
 ### Decode limits
 
-Array counts and string/blob lengths are optional on the wire, so by default the
-decoder allocates whatever a message declares. `Decoder` takes optional
-**receiver-side** caps that reject an oversize field on its count/length word
-alone — *before* any allocation or payload buffering:
+A field the schema leaves unbounded lets the *sender* decide what the *receiver*
+allocates, so every decoder carries **receiver-side** limits that reject an
+oversize field on its count/length word alone — *before* any allocation or
+payload buffering:
 
 ```python
 dec = Decoder(binding=b, words=words,
-              max_array_count=65536, max_string_len=1 << 20, max_blob_len=1 << 20)
+              max_dyn_array_count=65536, max_dyn_string_len=1 << 20, max_dyn_blob_len=1 << 20)
 ```
 
-A field whose declared count/length exceeds its cap raises `SofaLimitError`: a
+A field whose declared count/length exceeds its limit raises `SofaLimitError`: a
 *policy* rejection, distinct from malformed input, and a sibling of
 `SofaDecodeError` under `SofaError` rather than a subclass, so `except
-SofaDecodeError` does not catch it. Each limit defaults to `None` (no cap); the
-values are supplied by generated code, which knows the schema. Independent of any
-limit, the decoder never pre-allocates from an untrusted array count — a
-truncated oversize claim fails promptly as `SofaIncompleteError`.
+SofaDecodeError` does not catch it.
+
+**There is no unset state and no unlimited mode.** `None` is refused rather than
+read as "no limit". Each defaults to the format-wide ceiling — `ARRAY_MAX` for
+the count, `FIXLEN_MAX` for the two lengths — above which the value is already
+`INVALID`, so the default configuration rejects nothing a looser one would
+accept. `0` is a real setting, not an unset one. The numbers are supplied by
+generated code, which knows the schema and the deployment.
+
+Independent of any limit, the decoder never pre-allocates from an untrusted array
+count — a truncated oversize claim fails promptly as an `INCOMPLETE`.
 
 The verdict is reached on the count/length word alone, before a single payload
 byte is read or buffered — the point CORELIB_PLAN §6.2.1 requires it to be
@@ -519,6 +526,19 @@ Encoding never allocates an output buffer at all (§5.1).
   zero-copy aliasing**: a handler receives a fresh `str`, independent `bytes`, a
   fresh `int`/`float` or a new `list`, and every one of them stays valid after
   the decoder advances.
+* **Decode: where a chunk-straddling construct is joined is yours to decide.**
+  By default the decoder joins it in a `bytearray` of its own, extended to
+  whatever the message declares. Pass `reassembly=bytearray(n)` and it joins in
+  **your** buffer instead, refusing a construct that does not fit rather than
+  growing one — which is what bounds a decode's memory by construction, and what
+  CORELIB_PLAN §6.6.2 asks of a codec. The default is the convenience; the
+  parameter is the conformant path, and generated code should take it.
+* **Decode: a decoded value can land in your storage too.** `Binding` writes the
+  numeric fields straight into slots you supply; `on_array_begin` takes a buffer
+  for an integer array's elements and `on_blob_begin` one for a blob's payload,
+  and neither builds a Python object on the way. What is left materialising is a
+  `str` (which must be validated, and this port validates by decoding), a float
+  array, and the scalars — those are values, not storage.
 * **Decode: a suspended construct keeps its bytes, and only its bytes.**
   Everything fed is retained until it is consumed, so a field split across chunks
   is never half-decoded; the consumed prefix is dropped on the next `feed`, down
@@ -576,8 +596,10 @@ Encoding never allocates an output buffer at all (§5.1).
   occur, so the buffer simply holds the message or reports `SofaBufferError`, and
   sizing it from a generated `MAX_SIZE` stays exact. There is no pass-through: a
   `string`/`blob` run is copied into the output buffer like any other output, and
-  every flush hands the sink a `bytes` snapshot of that buffer's prefix — a sink
-  may retain what it receives without pinning caller memory.
+  every flush hands the sink a `memoryview` **over that buffer** — the installed
+  buffer itself, never a copy of it and never any other memory. A sink that only
+  reads or copies during the call may let the view go; one that keeps it has
+  *taken* the buffer and must install a replacement before it returns (below).
 * **The start offset belongs to the installation, not to the buffer.** A flush
   sink that returns **without** installing anything has *copied* the bytes it was
   handed: the same buffer stays active and encoding resumes at offset 0. A sink

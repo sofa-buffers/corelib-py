@@ -1,6 +1,6 @@
 """Receiver-side caps vs. the fields the SCHEMA already bounds (§6.2.1).
 
-``max_array_count`` / ``max_string_len`` / ``max_blob_len`` are *deployment*
+``max_dyn_array_count`` / ``max_dyn_string_len`` / ``max_dyn_blob_len`` are *deployment*
 configuration: they protect the receiver from a size the SENDER picks freely.
 CORELIB_PLAN §6.2.1 therefore forbids applying them "to a field the schema
 already bounds. There the schema bound governs and its violation is INVALID",
@@ -46,12 +46,12 @@ def _uvarint(x: int) -> list[int]:
 @pytest.mark.parametrize("engine", ENGINES)
 def test_a_declared_string_is_exempt_from_max_string_len(engine):
     # The issue's repro: a field the schema bounds at maxlen 4194304, carrying
-    # 2000 bytes, decoded by a receiver configured max_string_len=1024. The
+    # 2000 bytes, decoded by a receiver configured max_dyn_string_len=1024. The
     # message is well within its schema bound, so the cap must not touch it.
     enc = Encoder()
     enc.write_string(1, BIG)
     b = Binding().string(1, at=0, maxlen=4194304)
-    status, _dec, slots = bound(engine, enc.getvalue(), b, max_string_len=1024)
+    status, _dec, slots = bound(engine, enc.getvalue(), b, max_dyn_string_len=1024)
     assert status is Status.COMPLETE
     assert slots.objects[0] == BIG
 
@@ -61,7 +61,7 @@ def test_a_declared_blob_is_exempt_from_max_blob_len(engine):
     enc = Encoder()
     enc.write_bytes(1, b"y" * 2000)
     b = Binding().bytes(1, at=0, maxlen=4194304)
-    status, _dec, slots = bound(engine, enc.getvalue(), b, max_blob_len=1024)
+    status, _dec, slots = bound(engine, enc.getvalue(), b, max_dyn_blob_len=1024)
     assert status is Status.COMPLETE
     assert slots.objects[0] == b"y" * 2000
 
@@ -85,7 +85,7 @@ def test_a_declared_array_is_exempt_from_max_array_count(engine, write, binder):
     enc = Encoder()
     write(enc)
     status, _dec, slots = bound(
-        engine, enc.getvalue(), binder(Binding()), max_array_count=8
+        engine, enc.getvalue(), binder(Binding()), max_dyn_array_count=8
     )
     assert status is Status.COMPLETE
     assert slots.u[200] == 64
@@ -99,7 +99,7 @@ def test_the_declaration_covers_that_field_only(engine):
     enc.write_string(2, BIG)  # not
     b = Binding().string(1, at=0, maxlen=4194304).string(2, at=1)
     with pytest.raises(SofaLimitError):
-        bound(engine, enc.getvalue(), b, max_string_len=1024)
+        bound(engine, enc.getvalue(), b, max_dyn_string_len=1024)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -110,7 +110,7 @@ def test_a_declaration_inside_a_sequence_is_honoured(engine):
     enc.write_sequence_end()
     child = Binding().string(1, at=0, maxlen=4194304)
     b = Binding().sequence(9, child)
-    status, _dec, slots = bound(engine, enc.getvalue(), b, max_string_len=1024)
+    status, _dec, slots = bound(engine, enc.getvalue(), b, max_dyn_string_len=1024)
     assert status is Status.COMPLETE
     assert slots.objects[0] == BIG
 
@@ -134,7 +134,7 @@ def test_an_undeclared_string_is_still_rejected(engine):
     enc.write_string(1, BIG)
     b = Binding().string(1, at=0)  # bound, but with no maxlen declared
     with pytest.raises(SofaLimitError):
-        bound(engine, enc.getvalue(), b, max_string_len=1024)
+        bound(engine, enc.getvalue(), b, max_dyn_string_len=1024)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -143,7 +143,7 @@ def test_an_undeclared_blob_is_still_rejected(engine):
     enc.write_bytes(1, b"y" * 2000)
     b = Binding().bytes(1, at=0)
     with pytest.raises(SofaLimitError):
-        bound(engine, enc.getvalue(), b, max_blob_len=1024)
+        bound(engine, enc.getvalue(), b, max_dyn_blob_len=1024)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -163,7 +163,7 @@ def test_an_unbound_array_is_still_rejected_on_every_array_kind(engine, write):
     enc = Encoder()
     write(enc)
     with pytest.raises(SofaLimitError):
-        walk(engine, enc.getvalue(), max_array_count=5)
+        walk(engine, enc.getvalue(), max_dyn_array_count=5)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -174,7 +174,7 @@ def test_an_undeclared_field_is_rejected_even_when_declined(engine):
     enc.write_string(1, BIG)
     with pytest.raises(SofaLimitError):
         walk(
-            engine, enc.getvalue(), max_string_len=1024,
+            engine, enc.getvalue(), max_dyn_string_len=1024,
             recorder=Recorder(decline=lambda f: True),
         )
 
@@ -190,7 +190,7 @@ def test_the_cap_is_decided_at_the_header_before_any_payload(engine):
     # id 1, FIXLEN, length_header = (10_000_000 << 3) | STRING, then nothing.
     data = bytes([0x0A] + _uvarint((10_000_000 << 3) | 0x2))
     with pytest.raises(SofaLimitError) as exc:
-        walk(engine, data, max_string_len=1024)
+        walk(engine, data, max_dyn_string_len=1024)
     assert not isinstance(exc.value, SofaIncompleteError)
 
 
@@ -199,7 +199,7 @@ def test_an_array_count_is_capped_before_its_elements(engine):
     # id 1, ARRAY_UNSIGNED, count 2^31-1, then one lone byte.
     data = bytes([0x0B] + _uvarint(0x7FFFFFFF) + [0x01])
     with pytest.raises(SofaLimitError):
-        walk(engine, data, max_array_count=5)
+        walk(engine, data, max_dyn_array_count=5)
 
 
 # --- past the DECLARED bound is INVALID, never LimitExceeded ----------------
@@ -213,7 +213,7 @@ def test_over_the_declared_string_bound_is_invalid(engine):
     enc = Encoder()
     enc.write_string(1, BIG)
     b = Binding().string(1, at=0, maxlen=1024)
-    status, dec, slots = bound(engine, enc.getvalue(), b, max_string_len=512)
+    status, dec, slots = bound(engine, enc.getvalue(), b, max_dyn_string_len=512)
     assert status is Status.INVALID
     assert isinstance(dec.error, SofaDecodeError)
     assert not isinstance(dec.error, SofaLimitError)
@@ -225,7 +225,7 @@ def test_over_the_declared_array_bound_is_invalid(engine):
     enc = Encoder()
     enc.write_unsigned_array(1, list(range(64)))
     b = Binding().unsigned_array(1, at=0, cap=8, count_at=200)
-    status, dec, slots = bound(engine, enc.getvalue(), b, max_array_count=4)
+    status, dec, slots = bound(engine, enc.getvalue(), b, max_dyn_array_count=4)
     assert status is Status.INVALID
     assert isinstance(dec.error, SofaDecodeError)
     assert not isinstance(dec.error, SofaLimitError)
@@ -237,7 +237,7 @@ def test_exactly_at_the_declared_bound_is_accepted(engine):
     enc = Encoder()
     enc.write_string(1, "z" * 64)
     b = Binding().string(1, at=0, maxlen=64)
-    status, _dec, slots = bound(engine, enc.getvalue(), b, max_string_len=8)
+    status, _dec, slots = bound(engine, enc.getvalue(), b, max_dyn_string_len=8)
     assert status is Status.COMPLETE
     assert slots.objects[0] == "z" * 64
 
@@ -252,7 +252,7 @@ def test_a_declared_field_can_still_be_incomplete(engine):
     enc.write_string(1, BIG)
     wire = enc.getvalue()
     b = Binding().string(1, at=0, maxlen=4194304)
-    status, dec, slots = bound(engine, wire[: len(wire) // 2], b, max_string_len=1024)
+    status, dec, slots = bound(engine, wire[: len(wire) // 2], b, max_dyn_string_len=1024)
     assert status is Status.INCOMPLETE
     assert dec.error is None
     assert slots.objects[0] is None
@@ -263,7 +263,7 @@ def test_a_declared_field_can_still_be_invalid_utf8(engine):
     # id 1, FIXLEN STRING of length 2, payload 0xFF 0xFE.
     data = bytes([0x0A, 0x12, 0xFF, 0xFE])
     b = Binding().string(1, at=0, maxlen=4194304)
-    status, dec, _slots = bound(engine, data, b, max_string_len=1)
+    status, dec, _slots = bound(engine, data, b, max_dyn_string_len=1)
     assert status is Status.INVALID
     assert isinstance(dec.error, SofaDecodeError)
     assert not isinstance(dec.error, SofaLimitError)
@@ -277,4 +277,4 @@ def test_a_capped_field_reports_the_cap_rather_than_the_mismatch(engine):
     enc.write_string(1, BIG)
     b = Binding().unsigned_array(1, at=0, cap=8, count_at=200)  # wrong type
     with pytest.raises(SofaLimitError):
-        bound(engine, enc.getvalue(), b, max_string_len=1024)
+        bound(engine, enc.getvalue(), b, max_dyn_string_len=1024)

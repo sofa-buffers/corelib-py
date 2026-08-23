@@ -268,12 +268,12 @@ def test_a_capped_field_reports_the_cap_rather_than_the_mismatch(Encoder, Decode
     # Bound as an array — the wrong type *and* over the configured cap.
     capped = Binding().unsigned_array(1, at=_AT, cap=8, count_at=_COUNT_AT)
     with pytest.raises(SofaLimitError):
-        bound(Decoder, wire, capped, max_string_len=8)
+        bound(Decoder, wire, capped, max_dyn_string_len=8)
 
     # Lifting the cap means declaring the field's own bound — which is only
     # possible by naming its actual kind, so the two can never be combined:
     # §6.2.1 is settled before §7.3 is ever asked.
     declared = Binding().string(1, at=_OBJ, maxlen=64, count_at=_COUNT_AT)
-    status, _dec, slots = bound(Decoder, wire, declared, max_string_len=8)
+    status, _dec, slots = bound(Decoder, wire, declared, max_dyn_string_len=8)
     assert status is Status.COMPLETE
     assert slots.objects[_OBJ] == "x" * 64

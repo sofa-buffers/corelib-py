@@ -419,7 +419,7 @@ def test_an_undeclared_string_is_still_subject_to_the_receiver_cap(enc_cls, dec_
     enc.flush()
     b = Binding().string(1, at=0)
     words, objects, *_ = storage(b)
-    dec = dec_cls(binding=b, words=words, objects=objects, max_string_len=4)
+    dec = dec_cls(binding=b, words=words, objects=objects, max_dyn_string_len=4)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
     assert objects[0] is None
@@ -434,7 +434,7 @@ def test_a_declared_maxlen_lifts_the_receiver_cap(enc_cls, dec_cls):
     enc.flush()
     b = Binding().string(1, at=0, maxlen=64)
     words, objects, *_ = storage(b)
-    dec = dec_cls(binding=b, words=words, objects=objects, max_string_len=4)
+    dec = dec_cls(binding=b, words=words, objects=objects, max_dyn_string_len=4)
     assert dec.feed(enc.getvalue()) is Status.COMPLETE
     assert objects[0] == "0123456789"
 
@@ -450,7 +450,7 @@ def test_a_limit_rejection_stays_rejected(enc_cls, dec_cls):
     enc.flush()
     b = Binding().unsigned(2, at=0, count_at=1)
     words, objects, u, _q, _f = storage(b)
-    dec = dec_cls(binding=b, words=words, max_array_count=2)
+    dec = dec_cls(binding=b, words=words, max_dyn_array_count=2)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
     with pytest.raises(SofaLimitError):
