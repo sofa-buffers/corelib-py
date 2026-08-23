@@ -542,14 +542,25 @@ class Decoder:
             # blocks inside its refill instead of returning to the caller here.
             self._keep = self._pos
 
-        if self._n - self._pos < 1:
+        buf = self._buf
+        pos = self._pos
+        if pos >= self._n:
             if self._depth != 0:
                 raise self._suspend("truncated: unbalanced sequence")
             # ``_cur`` deliberately keeps the last field past EOF: `field` is
             # documented as "the most recently returned Field".
             return -1
 
-        header = self._varint()
+        # The header varint, read inline. A call into _varint costs more than
+        # the byte it usually returns: ids below 16 with a wire type packed
+        # beside them fit in one byte, which is the overwhelmingly common
+        # header, and the EOF test above has already proved that byte is there.
+        # Anything longer falls back to the real reader.
+        header = buf[pos]
+        if header < 0x80:
+            self._pos = pos + 1
+        else:
+            header = self._varint()
         wtype = header & 0x07
         field_id = header >> 3
         if self._track_ids:
@@ -589,7 +600,18 @@ class Decoder:
             return wtype
 
         if wtype == WireType.FIXLEN:
-            length_header = self._varint()
+            # Same one-byte fast path as the header above, but this byte is not
+            # guaranteed to be buffered, so the bound is tested first. A length
+            # word is one byte for any payload under 16 bytes.
+            pos = self._pos
+            if pos < self._n:
+                length_header = buf[pos]
+                if length_header < 0x80:
+                    self._pos = pos + 1
+                else:
+                    length_header = self._varint()
+            else:
+                length_header = self._varint()
             length = length_header >> 3
             subtype = length_header & 0x07
             if subtype > FixlenSubtype.BLOB:
