@@ -623,40 +623,19 @@ BENCH_SPEC's optional `blob 1MB passthrough` row is absent rather than stubbed.
 
 Read those two encode rows as MB/s rather than `Ir/op`: the one-shot row is a
 *single* 1,000,000-byte `memcpy`, which glibc serves from its ERMS (`rep movsb`)
-path and Valgrind counts at ~1 instruction per byte (a bare 1 MB `memcpy` costs
-≈967k Ir under Callgrind on this host), while the streaming row's 4096-byte
-copies take the vectorised path at a fraction of that. `Ir/op` therefore reports
-one-shot as the *dearer* of the two (≈1.07M vs ≈0.41M) although it does strictly
+path and Valgrind counts at about one instruction per byte, while the streaming
+row's 4096-byte copies take the vectorised path at a fraction of that. `Ir/op`
+therefore reports one-shot as the *dearer* of the two although it does strictly
 less work. Every other row is `Ir/op`'s to tell.
 
-Representative result (throughput MB/s, higher is better; one x86-64 host,
-CPython 3.14 — the *ratios* are the point, not the absolute numbers):
+The native accelerator is worth roughly an order of magnitude over the pure
+engine on the message-shaped rows and two on the array-heavy ones, and it beats
+protobuf everywhere except the smallest decode, where the two are level. That
+last workload is where the streaming **pull** API costs the most: it crosses the
+Python↔C boundary twice per field (`next()` then a typed read), whereas protobuf
+parses the whole message in one C call. `bench/compare_protobuf.py` runs that
+comparison.
 
-| Workload | sofab **native** | sofab pure | native vs pure |
-|----------|-----------------:|-----------:|---------------:|
-| encode: u64 array (1000) | **1067** | 7.9 | ≈136× |
-| encode: typical message | **47.6** | 3.8 | ≈13× |
-| encode: blob 1MB one-shot | **37729** | 28370 | ≈1.3× |
-| encode: blob 1MB streaming | **13777** | 3066 | ≈4.5× |
-| encode: composite | **176** | 7.6 | ≈23× |
-| decode: u64 array (1000) | **452** | 5.4 | ≈84× |
-| decode: typical message | **15.7** | 1.3 | ≈12× |
-| decode: blob 1MB | **5926** | 414 | ≈14× |
-| decode: composite | **38.0** | 5.0 | ≈7.6× |
-| decode: composite skip-all | **187** | 6.5 | ≈29× |
-
-Against protobuf (a separate measurement — `bench/compare_protobuf.py`, best of
-5, one x86-64 host, CPython 3.12; read this table internally, not across into the
-one above):
-
-| Workload | sofab **native** | sofab pure | protobuf (upb) | native vs protobuf |
-|----------|-----------------:|-----------:|---------------:|:------------------:|
-| encode: u64 array (1000) | **≈840** | ≈11 | ≈160 | **≈5× faster** |
-| encode: typical message  | **≈18**  | ≈4.4 | ≈10 | **≈1.7× faster** |
-| decode: u64 array (1000) | **≈460** | ≈7.8 | ≈195 | **≈2.4× faster** |
-| decode: typical message  | ≈9.2     | ≈2.1 | ≈9.0 | ≈1.0× (see note) |
-
-The native accelerator beats protobuf everywhere except the smallest decode,
-where the two are level. That last workload is where the streaming **pull** API
-costs the most: it crosses the Python↔C boundary twice per field (`next()` then a
-typed read), whereas protobuf parses the whole message in one C call.
+Measured figures are not reproduced here — they belong to the cross-language
+benchmark arena, which runs every port on one host under one methodology. This
+section says how to obtain them, not what they came out as.
