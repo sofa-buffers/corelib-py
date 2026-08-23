@@ -210,6 +210,57 @@ reuse or overwrite that buffer the moment it comes back. `feed` accepts `bytes`,
 `bytearray` or a `memoryview` over either. `reset()` starts a new message on the
 same decoder, keeping the handler.
 
+#### Integer arrays: `on_array_begin`
+
+`on_unsigned_array` / `on_signed_array` receive an array **already decoded**, and
+two decisions have been made for you by then.
+
+The first is the **element width your schema declares**. Checking the list you
+are handed only rejects an array that *arrived*; one truncated behind a bad
+element never produces a list at all, so the bad value goes unreported. The
+second is **where the elements went** — into a list the decoder built, and a
+list handed over afterwards is a list already built.
+
+`on_array_begin` runs at the count header, before a single element is read:
+
+```python
+from array import array
+
+class Handler(Visitor):
+    def __init__(self):
+        self.ports = array("H", bytes(2 * 64))     # your storage, your size
+
+    def on_array_begin(self, field_id, wtype, count):
+        if field_id == 7:                          # `ports: { array, items: u16 }`
+            return (self.ports, None, 0xFFFF)      # dst, elem_min, elem_max
+        return None                                # anything else: the list
+```
+
+Return `None` and nothing changes. Return `(dst, elem_min, elem_max)` and:
+
+* **`elem_min` / `elem_max`** are applied **at each element**, so a value outside
+  them is `INVALID` whether the array completes or is truncated behind it, which
+  is also `INVALID`-over-`INCOMPLETE` for free. Either side may be `None`.
+* **`dst`** is a writable, contiguous buffer of at least `count` slots — an
+  `array` of the right typecode, or a `memoryview` over one. The decoder fills it
+  and does **not** call the typed hook; on the native engine no element is ever
+  boxed. A buffer too short is `SofaRangeError`: the decoder never grows one, and
+  the refusal comes at the header, before anything is written. `dst=None` states
+  the width and keeps the list.
+
+Slots may be 1, 2, 4 or 8 bytes. A narrower one needs a declared width that fits
+it, so a value can never be silently truncated into it.
+
+Handing over a destination is what makes an array cheap: on the native engine a
+1 000-element `u16` array costs **68% less** than the same array as a list, and a
+`u64` array **64% less** — the list route spends most of its time building and
+freeing Python integers. On the pure-Python engine there is nothing to save (it
+has to box either way) and the destination route costs 7–18% more, so use it
+there for the bound and the storage, not for speed.
+
+`on_array_begin` is not called for float arrays: they carry no declared width and
+are already moved in one piece.
+
 ### Decode into your own storage (`Binding`)
 
 A `Visitor` costs one Python call per field. A **`Binding`** costs none: declare

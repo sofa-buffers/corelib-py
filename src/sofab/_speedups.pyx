@@ -55,7 +55,8 @@ from cpython.buffer cimport (PyObject_GetBuffer, PyBuffer_Release,
                              PyBUF_WRITABLE, PyBUF_SIMPLE)
 from cpython.long cimport PyLong_FromUnsignedLongLong, PyLong_FromLongLong
 from cpython.ref cimport PyObject, Py_INCREF
-from libc.stdint cimport uint32_t, uint64_t, int64_t
+from libc.stdint cimport (uint8_t, uint16_t, uint32_t, uint64_t,
+                          int8_t, int16_t, int32_t, int64_t)
 from libc.stdlib cimport malloc, realloc, free
 from libc.string cimport memcpy
 
@@ -633,6 +634,8 @@ cdef tuple _STATUS = tuple(Status)
 from .visitor import Visitor as _Visitor
 cdef object _BASE_ON_FIELD = _Visitor.on_field
 cdef object _BASE_ON_SEQUENCE_BEGIN = _Visitor.on_sequence_begin
+cdef object _BASE_ON_ARRAY_BEGIN = _Visitor.on_array_begin
+cdef object _INT64_MAX_OBJ = INT64_MAX
 cdef tuple _ST = tuple(FixlenSubtype)
 
 # Pending-value kinds (mirror the pure decoder's _SCALAR/_FIXLEN/_VARRAY/_FARRAY).
@@ -1830,6 +1833,7 @@ cdef class Decoder:
     # Field object is built at all: it is the only thing that receives one.
     cdef bint _wants_field
     cdef bint _wants_seq_begin
+    cdef bint _wants_array_begin
     cdef object _objects             # list destination for string/blob fields
     cdef _Compiled _tables          # keeps the compiled table alive
     cdef _BEntry* _bent
@@ -1871,10 +1875,13 @@ cdef class Decoder:
         self._visitor = visitor
         self._wants_field = False
         self._wants_seq_begin = False
+        self._wants_array_begin = False
         if visitor is not None:
             self._wants_field = type(visitor).on_field is not _BASE_ON_FIELD
             self._wants_seq_begin = (
                 type(visitor).on_sequence_begin is not _BASE_ON_SEQUENCE_BEGIN)
+            self._wants_array_begin = (
+                type(visitor).on_array_begin is not _BASE_ON_ARRAY_BEGIN)
         self._objects = objects
         if binding is None and visitor is None:
             raise SofaRangeError("a decoder needs a field handler (binding / visitor)")
@@ -2983,15 +2990,23 @@ cdef class Decoder:
 
     cdef int _fill_varints(self, uint64_t* dst, Py_ssize_t count, bint zigzag,
                            _BEntry* e) except -1:
+        # The binding's destination. Both callers meet in _fill_varints_at; this
+        # one just unpacks the declared width off the compiled entry.
+        return self._fill_varints_at(<void*>dst, 8, count, zigzag, e.elem_bounded,
+                                     e.elem_lo, e.elem_hi)
+
+    cdef int _fill_varints_at(self, void* dst, int itemsize, Py_ssize_t count,
+                              bint zigzag, bint bounded, int64_t lo,
+                              uint64_t hi) except -1:
         # _read_varints without the list: the elements go straight from the fed
         # buffer into the caller's slots, so an array costs no allocation and no
-        # Python object per element.
+        # Python object per element. Reached from a binding (above) and from a
+        # visitor that handed back a destination in on_array_begin (§6.6.3).
         cdef Py_ssize_t pos, n, i = 0
         cdef const unsigned char* p
         cdef _Varint v
         cdef uint64_t result
         cdef int64_t sv
-        cdef bint bounded = e.elem_bounded
         self._arm()
         pos = self._pos
         p = self._p
@@ -3015,13 +3030,29 @@ cdef class Decoder:
                 sv = _zigzag_decode(result)
                 # Checked AT the element, before it is stored, so the INVALID is
                 # reached before a truncation behind the bad element (§7.1/§5.2).
-                if bounded and (sv < e.elem_lo or sv > <int64_t>e.elem_hi):
+                if bounded and (sv < lo or sv > <int64_t>hi):
                     raise SofaDecodeError("array element outside declared width")
-                (<int64_t*>dst)[i] = sv
+                # The declared width was matched against the destination's item
+                # size at the header, so the narrowing here cannot lose a bit.
+                if itemsize == 8:
+                    (<int64_t*>dst)[i] = sv
+                elif itemsize == 4:
+                    (<int32_t*>dst)[i] = <int32_t>sv
+                elif itemsize == 2:
+                    (<int16_t*>dst)[i] = <int16_t>sv
+                else:
+                    (<int8_t*>dst)[i] = <int8_t>sv
             else:
-                if bounded and result > e.elem_hi:
+                if bounded and result > hi:
                     raise SofaDecodeError("array element outside declared width")
-                dst[i] = result
+                if itemsize == 8:
+                    (<uint64_t*>dst)[i] = result
+                elif itemsize == 4:
+                    (<uint32_t*>dst)[i] = <uint32_t>result
+                elif itemsize == 2:
+                    (<uint16_t*>dst)[i] = <uint16_t>result
+                else:
+                    (<uint8_t*>dst)[i] = <uint8_t>result
             i += 1
         self._pos = pos
         self._pk = _PEND_NONE   # committed only once the payload is in hand
@@ -3043,6 +3074,84 @@ cdef class Decoder:
                 dst[i] = _unpack_f64(p + i * 8)
         self._pos += nbytes
         self._pk = _PEND_NONE
+        return 0
+
+    cdef bint _width_fits(self, int itemsize, bint zigzag, bint bounded,
+                          int64_t lo, uint64_t hi):
+        # Does the width the handler declared fit an itemsize-byte slot?
+        cdef int bits = itemsize * 8
+        if not bounded:
+            return False
+        if zigzag:
+            return lo >= -(<int64_t>1 << (bits - 1)) and <int64_t>hi < (<int64_t>1 << (bits - 1))
+        return hi < (<uint64_t>1 << bits) if bits < 64 else True
+
+    cdef int _visit_varints(self, object visitor, object fid, int wtype,
+                            bint zigzag) except -1:
+        # Deliver an integer array by whichever route on_array_begin asked for
+        # (§6.6.3). Two things can only be settled here, at the header: the
+        # element width the schema declares, and where the elements are to go.
+        # Both are gone by the time the typed hook holds the list.
+        cdef object spec, dst = None, lo = None, hi = None
+        cdef Py_ssize_t count = self._pend_count
+        cdef Py_buffer view
+        cdef int isz
+        cdef bint bounded
+        cdef int64_t clo = INT64_MIN
+        cdef uint64_t chi = <uint64_t>0xFFFFFFFFFFFFFFFF
+        if self._wants_array_begin:
+            spec = visitor.on_array_begin(fid, _WT[wtype], count)
+            if spec is not None:
+                dst, lo, hi = spec
+        # A declared width that admits every value of its domain is not a
+        # constraint, and the list route's entry points take a narrowed maximum
+        # (they were written for the binding, which never declares a wider one).
+        # Dropping it here keeps the two engines on the same verdict -- the pure
+        # one compares and never fires -- instead of overflowing the cast.
+        if hi is not None and hi > _INT64_MAX_OBJ:
+            hi = None
+        if dst is None:
+            if zigzag:
+                visitor.on_signed_array(fid, self._read_signed_array(lo, hi))
+            else:
+                visitor.on_unsigned_array(fid, self._read_unsigned_array(hi))
+            return 0
+        bounded = lo is not None or hi is not None
+        if lo is not None:
+            clo = lo
+        if hi is not None:
+            chi = hi
+        # The buffer is the caller's: a short one is refused, never grown
+        # (§6.6), and the verdict is reached here, at the count header, before
+        # an element is read.
+        try:
+            PyObject_GetBuffer(dst, &view, PyBUF_WRITABLE | PyBUF_SIMPLE)
+        except (BufferError, TypeError) as exc:
+            raise SofaRangeError(
+                "on_array_begin returned a destination that is not a writable, "
+                "contiguous buffer") from exc
+        try:
+            isz = view.itemsize
+            if isz != 1 and isz != 2 and isz != 4 and isz != 8:
+                raise SofaRangeError(
+                    "on_array_begin's destination holds %d-byte items; 1, 2, 4 "
+                    "or 8 are supported" % isz)
+            # A destination narrower than 8 bytes is only safe if the declared
+            # width says every element fits it. Checked once, here, so the fill
+            # loop can narrow without a second test per element -- and refused
+            # rather than silently truncated.
+            if isz != 8 and not self._width_fits(isz, zigzag, bounded, clo, chi):
+                raise SofaRangeError(
+                    "on_array_begin declared a width that does not fit its "
+                    "%d-byte destination" % isz)
+            if view.len < count * isz:
+                raise SofaRangeError(
+                    "on_array_begin returned %d slots for an array of %d"
+                    % (view.len // isz, count))
+            self._fill_varints_at(view.buf, isz, count, zigzag,
+                                  bounded, clo, chi)
+        finally:
+            PyBuffer_Release(&view)
         return 0
 
     cdef int _visit_value(self, object visitor) except -1:
@@ -3068,9 +3177,9 @@ cdef class Decoder:
             else:
                 visitor.on_bytes(fid, self._bytes())
         elif t == _WT_ARRAY_UNSIGNED:
-            visitor.on_unsigned_array(fid, self._read_unsigned_array())
+            self._visit_varints(visitor, fid, t, False)
         elif t == _WT_ARRAY_SIGNED:
-            visitor.on_signed_array(fid, self._read_signed_array())
+            self._visit_varints(visitor, fid, t, True)
         elif st == _ST_FP32:
             visitor.on_float32_array(fid, self._read_float32_array())
         else:

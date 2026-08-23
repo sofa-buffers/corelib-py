@@ -25,7 +25,9 @@ The driver itself is layered on the public pull API, so it inherits the same
 
 from __future__ import annotations
 
-from .types import Field
+from typing import Any
+
+from .types import Field, WireType
 
 
 class Visitor:
@@ -50,6 +52,43 @@ class Visitor:
 
     def on_sequence_end(self) -> None:
         """The current nested sequence closed."""
+
+    def on_array_begin(
+        self, field_id: int, wtype: WireType, count: int
+    ) -> tuple[Any, int | None, int | None] | None:
+        """An integer array's header has been read; no element has been decoded.
+
+        This is the only place a handler can say anything about the array's
+        elements, because the typed hook below receives them already decoded.
+        Return ``None`` to take the default — a list, handed to
+        :meth:`on_unsigned_array` / :meth:`on_signed_array` — or a
+        ``(dst, elem_min, elem_max)`` triple:
+
+        ``dst``
+            Somewhere to put the elements, or ``None`` to keep the list. A
+            writable buffer of at least ``count`` slots: an ``array`` of the
+            right typecode, a ``memoryview`` over one, or any object supporting
+            the buffer protocol. The decoder writes into it and does **not**
+            call the typed hook — the handler already has the values where it
+            wanted them, and none of them was ever a Python object. A buffer
+            too short is :class:`sofab.SofaRangeError`; the decoder never grows
+            one (CORELIB_PLAN §6.6).
+        ``elem_min`` / ``elem_max``
+            The element width the schema declares, or ``None`` for an open
+            side. The decoder applies it **at each element**, so a value outside
+            it is INVALID whether the array completes or is truncated behind it
+            (§7.1), which is also §5.2's INVALID-over-INCOMPLETE for free. A
+            handler cannot do this itself: by the time it holds the list, an
+            array that never arrived is indistinguishable from one that did.
+
+        Called again for the same array if a chunk boundary suspends the read,
+        so return the same answer each time; the decoder restarts the array from
+        its first element and fills ``dst`` from the beginning.
+
+        Not called for float arrays, which carry no declared width to state and
+        are already moved into a destination in one piece.
+        """
+        return None
 
     # --- typed value hooks --------------------------------------------------
 

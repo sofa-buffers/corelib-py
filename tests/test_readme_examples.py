@@ -147,3 +147,26 @@ def test_feed_example_matches_the_api(readme: str) -> None:
     assert "no** `finish()`/`end()`" in body
     for banned in ("finish", "finalize", "end", "close"):
         assert not hasattr(Decoder, banned), banned
+
+
+def test_array_begin_example_fills_the_destination(readme: str) -> None:
+    """The ``on_array_begin`` example must do what the section claims: fill the
+    handler's own storage, leave the typed hook alone, and apply the width."""
+    from sofab import Decoder, Status, Visitor
+
+    ns: dict = {"Visitor": Visitor}
+    _run_readme_block(readme, "#### Integer arrays: `on_array_begin`", ns)
+    handler_cls = ns["Handler"]
+
+    enc = Encoder()
+    enc.write_unsigned_array(7, [1, 2, 0xFFFF])
+    enc.write_unsigned_array(8, [1 << 20])  # a different id: the list route
+    enc.flush()
+
+    got: list = []
+    handler = handler_cls()
+    handler.on_unsigned_array = lambda fid, vals: got.append((fid, list(vals)))
+    assert Decoder(visitor=handler).feed(enc.getvalue()) is Status.COMPLETE
+
+    assert list(handler.ports[:3]) == [1, 2, 0xFFFF]
+    assert got == [(8, [1 << 20])], "id 7 went to the destination, not the hook"

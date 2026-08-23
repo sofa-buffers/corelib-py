@@ -118,6 +118,19 @@ _ST_BLOB = int(FixlenSubtype.BLOB)
 _I64_MIN = -(1 << 63)
 
 
+def _width_fits(itemsize: int, zigzag: bool, lo: int | None, hi: int | None) -> bool:
+    """Does the declared element width fit an ``itemsize``-byte slot?"""
+    bits = itemsize * 8
+    if zigzag:
+        return (
+            lo is not None
+            and hi is not None
+            and lo >= -(1 << (bits - 1))
+            and hi < (1 << (bits - 1))
+        )
+    return hi is not None and hi < (1 << bits)
+
+
 class Decoder:
     """Pull-decodes a SofaBuffers stream field by field.
 
@@ -138,6 +151,52 @@ class Decoder:
     on a sequence start/end — is a caller mistake and raises
     :class:`sofab.SofaRangeError`.
     """
+
+    # Every attribute this decoder holds, declared rather than left to an
+    # instance dict.
+    #
+    # Not a size micro-optimisation. CPython shares one key table between all
+    # instances of a class, but only while the class stays within
+    # SHARED_KEYS_MAX_SIZE == 30 attributes; the 31st drops every instance
+    # onto its own combined dict and slows down *every* ``self._x`` in the
+    # decoder. This class sat at exactly 30, so the next attribute anyone
+    # added -- ``_wants_array_begin`` below is one -- cost 12.8% on
+    # `decode: composite`, a message with no arrays in it at all. Slots remove
+    # the cliff rather than stepping around it: attribute access becomes a
+    # fixed offset and the count stops mattering.
+    __slots__ = (
+        "_binding",
+        "_bmap",
+        "_bstack",
+        "_buf",
+        "_capped",
+        "_cur",
+        "_cur_id",
+        "_cur_subtype",
+        "_cur_wtype_resume",
+        "_depth",
+        "_error",
+        "_keep",
+        "_max_array_count",
+        "_max_blob_len",
+        "_max_string_len",
+        "_n",
+        "_objects",
+        "_pending",
+        "_pos",
+        "_resume_entry",
+        "_resume_kind",
+        "_running",
+        "_status",
+        "_visitor",
+        "_wants_array_begin",
+        "_wants_field",
+        "_wants_seq_begin",
+        "_wd",
+        "_wq",
+        "_wu",
+    )
+
 
     def __init__(
         self,
@@ -230,6 +289,10 @@ class Decoder:
         self._wants_seq_begin = (
             visitor is not None
             and type(visitor).on_sequence_begin is not Visitor.on_sequence_begin
+        )
+        self._wants_array_begin = (
+            visitor is not None
+            and type(visitor).on_array_begin is not Visitor.on_array_begin
         )
         # The active table and the stack of enclosing ones. A sequence opens a
         # fresh id scope (§4.9), so descending *replaces* the table rather than
@@ -1276,24 +1339,84 @@ class Decoder:
             else:
                 visitor.on_float64(fid, _core.unpack_f64(data))
         elif t == _WT_ARRAY_UNSIGNED:
-            visitor.on_unsigned_array(fid, self._take_varints(pending[2], False))
+            self._visit_varints(visitor, fid, t, pending[2], False)
         elif t == _WT_ARRAY_SIGNED:
-            visitor.on_signed_array(fid, self._take_varints(pending[2], True))
+            self._visit_varints(visitor, fid, t, pending[2], True)
         elif pending[1] == _ST_FP32:
             visitor.on_float32_array(fid, self._take_farray_values(pending, 4))
         else:
             visitor.on_float64_array(fid, self._take_farray_values(pending, 8))
 
-    def _take_varints(self, count: int, zigzag: bool) -> list[int]:
-        """The whole pending integer array, as a list (the visitor's shape)."""
+    def _visit_varints(
+        self, visitor: Visitor, fid: int, wtype: int, count: int, zigzag: bool
+    ) -> None:
+        """Deliver an integer array to ``visitor``, by whichever route it asked
+        for in :meth:`sofab.Visitor.on_array_begin` (§6.6.3).
+
+        Two things can only be settled here, at the header: the element width
+        the schema declares, and where the elements are to go. Both are gone by
+        the time the typed hook holds the list — a width checked there cannot
+        reject an array that never arrived (§7.1), and a destination offered
+        there is a destination the values have already been built without.
+        """
+        dst: Any = None
+        lo: int | None = None
+        hi: int | None = None
+        if self._wants_array_begin:
+            spec = visitor.on_array_begin(fid, _WT[wtype], count)
+            if spec is not None:
+                dst, lo, hi = spec
         if self._pending is not None and self._pending[0] == _LIMIT:
             raise SofaLimitError(self._pending[1])
         self._keep = self._pos
-        out = self._read_varints(count, None, None, zigzag)
-        if zigzag:
-            out = [(v >> 1) ^ -(v & 1) for v in out]
-        self._pending = None  # committed only once the payload is in hand (§5.2)
-        return out
+        if dst is None:
+            out = self._read_varints(count, lo, hi, zigzag)
+            if zigzag:
+                out = [(v >> 1) ^ -(v & 1) for v in out]
+            self._pending = None  # committed once the payload is in hand (§5.2)
+            if zigzag:
+                visitor.on_signed_array(fid, out)
+            else:
+                visitor.on_unsigned_array(fid, out)
+            return
+        # Straight into the caller's storage: no list, and on the native engine
+        # not one element ever boxed. The buffer is the caller's, so a short one
+        # is refused rather than grown (§6.6) -- and every verdict below is
+        # reached here, at the count header, before an element is read.
+        try:
+            view = memoryview(dst)
+        except TypeError as exc:
+            raise SofaRangeError(
+                "on_array_begin returned a destination that is not a writable, "
+                "contiguous buffer"
+            ) from exc
+        if view.readonly or not view.c_contiguous:
+            raise SofaRangeError(
+                "on_array_begin returned a destination that is not a writable, "
+                "contiguous buffer"
+            )
+        isz = view.itemsize
+        if isz not in (1, 2, 4, 8):
+            raise SofaRangeError(
+                f"on_array_begin's destination holds {isz}-byte items; "
+                "1, 2, 4 or 8 are supported"
+            )
+        # A destination narrower than 8 bytes is only safe if the declared width
+        # says every element fits it. Asked once, here, so the fill can narrow
+        # without a second test per element -- and refused rather than silently
+        # truncated.
+        if isz != 8 and not _width_fits(isz, zigzag, lo, hi):
+            raise SofaRangeError(
+                "on_array_begin declared a width that does not fit its "
+                f"{isz}-byte destination"
+            )
+        if view.nbytes < count * isz:
+            raise SofaRangeError(
+                f"on_array_begin returned {view.nbytes // isz} slots "
+                f"for an array of {count}"
+            )
+        self._read_varints(count, lo, hi, zigzag, view, 0)
+        self._pending = None
 
     def _take_farray_values(self, pending: tuple[Any, ...], width: int) -> list[float]:
         if pending[0] == _LIMIT:
