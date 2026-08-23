@@ -17,7 +17,7 @@ from typing import Callable
 
 import pytest
 
-from sofab import Encoder, Field, Status, Visitor
+from sofab import Binding, Encoder, Field, SofaIncompleteError, Status, Visitor
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
 
@@ -155,6 +155,65 @@ def walk(dec_cls, data: bytes, chunk: int | None = None, **kw):
         if not data:
             status = dec.feed(b"")
     return status, rec, dec
+
+
+def raise_for(status, dec) -> None:
+    """Turn a :meth:`feed` outcome back into the exception the removed pull API
+    used to raise.
+
+    Callers do not do this — a returned status *is* the contract (§5.2), and
+    nothing in ``sofab`` raises for a truncation any more. It exists so the
+    suite can keep asserting the **verdict on a message** with
+    ``pytest.raises``, which is what most of these tests are actually about;
+    rewriting several hundred of them into status comparisons would change what
+    they read like without changing what they check.
+    """
+    if status is Status.INVALID:
+        raise dec.error
+    if status is Status.INCOMPLETE:
+        raise SofaIncompleteError("truncated")
+
+
+class Slots:
+    """Typed views over a binding's ``words`` buffer, plus its ``objects``.
+
+    Reading a bound decode back means casting the one byte buffer to whatever
+    the field's kind is; this keeps that out of every test.
+    """
+
+    def __init__(self, words: bytearray, objects: list) -> None:
+        mv = memoryview(words)
+        self.u = mv.cast("Q")
+        self.q = mv.cast("q")
+        self.d = mv.cast("d")
+        self.objects = objects
+
+    def arr_u(self, at: int, n: int) -> list[int]:
+        return list(self.u[at : at + n])
+
+    def arr_q(self, at: int, n: int) -> list[int]:
+        return list(self.q[at : at + n])
+
+    def arr_d(self, at: int, n: int) -> list[float]:
+        return list(self.d[at : at + n])
+
+
+def bound(dec_cls, data: bytes, binding, chunk: int | None = None, **kw):
+    """Feed ``data`` into ``binding``'s destinations; return ``(status, dec, slots)``.
+
+    The destinations are sized from the table, which is the contract: the caller
+    owns and sizes them, never the wire (§6.6).
+    """
+    words = bytearray(binding.tree_words_required * 8)
+    objects: list = [None] * binding.tree_objects_required
+    dec = dec_cls(binding=binding, words=words, objects=objects, **kw)
+    status = Status.COMPLETE
+    if chunk is None:
+        status = dec.feed(data)
+    else:
+        for off in range(0, len(data), chunk):
+            status = dec.feed(data[off : off + chunk])
+    return status, dec, Slots(words, objects)
 
 
 def values(dec_cls, data: bytes, **kw) -> list[tuple]:

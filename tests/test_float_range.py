@@ -24,7 +24,7 @@ to ``FLT_MAX``.
 from __future__ import annotations
 
 import pytest
-from vectors import FLT_MAX, reader
+from vectors import FLT_MAX, values
 
 from sofab import Decoder
 from sofab.encoder import Encoder as PyEncoder
@@ -101,11 +101,10 @@ def test_saturated_value_round_trips():
     enc = PyEncoder()
     enc.write_float32(1, 1e300)
     enc.write_float32_array(2, [-1e300])
-    dec = Decoder(reader(enc.getvalue()))
-    dec.next()
-    assert dec.float32() == float("inf")
-    dec.next()
-    assert dec.read_float32_array() == [float("-inf")]
+    assert values(Decoder, enc.getvalue()) == [
+        ("f32", 1, float("inf")),
+        ("f32a", 2, (float("-inf"),)),
+    ]
 
 
 def test_pure_array_saturates_only_the_out_of_range_elements():
