@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
-from vectors import Binding, bound, raise_for
+from vectors import Binding, Recorder, bound, raise_for, walk
 from vectors import uvarint as _varint
 from vectors import zzvarint as _zz
 
@@ -234,3 +234,104 @@ def test_unsigned_verdict_is_the_plain_range_check(engine):
             else:
                 with pytest.raises(SofaDecodeError):
                     _read(engine, data, False, hi)
+
+
+# --- the same bound, stated by a visitor ------------------------------------
+
+
+class _BoundingRecorder(Recorder):
+    """A recorder that declares an element width in ``on_field``.
+
+    This is the shape generated code takes: the schema is known to the handler,
+    not to the decoder, so the handler states the bound at the header and the
+    decoder applies it while it decodes the elements. Stating it is the only way
+    a visitor can reach the bound at all -- ``on_unsigned_array`` receives a list
+    that has already fully arrived, so a check there could only ever decide an
+    array that *arrives*, which is exactly the case S5.2 is about.
+    """
+
+    def __init__(self, elem_min=None, elem_max=None):
+        super().__init__()
+        self._lo = elem_min
+        self._hi = elem_max
+
+    def on_field(self, field):
+        field.elem_min = self._lo
+        field.elem_max = self._hi
+        return super().on_field(field)
+
+
+def _visit(engine, data: bytes, *, lo=None, hi=None, chunk=None):
+    rec = _BoundingRecorder(elem_min=lo, elem_max=hi)
+    status, rec, dec = walk(engine, data, chunk=chunk, recorder=rec)
+    raise_for(status, dec)
+    return rec
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+class TestVisitorStatedBound:
+    def test_unsigned_over_width_then_truncated_is_invalid(self, engine):
+        # The array announces 4 elements and delivers one 2**32 before EOF. The
+        # element is out of width by its own bytes, so S5.2 keeps the verdict
+        # INVALID however little of the array followed it.
+        data = U_HDR + _varint(4) + _varint(2**32)
+        with pytest.raises(SofaDecodeError):
+            _visit(engine, data, hi=0xFFFFFFFF)
+
+    def test_unsigned_in_range_then_truncated_stays_incomplete(self, engine):
+        # The control: nothing is out of width, so the truncation IS the verdict.
+        data = U_HDR + _varint(4) + _varint(1) + _varint(2)
+        with pytest.raises(SofaIncompleteError):
+            _visit(engine, data, hi=0xFFFFFFFF)
+
+    def test_unsigned_over_width_complete_is_invalid(self, engine):
+        # S7.1 forbids the verdict from depending on the memory model, so a
+        # COMPLETE array carrying the same element is rejected alike.
+        with pytest.raises(SofaDecodeError):
+            _visit(engine, _uarray([1, 2**32, 3]), hi=0xFFFFFFFF)
+
+    def test_signed_over_width_then_truncated_is_invalid(self, engine):
+        data = S_HDR + _varint(4) + _zz(-129)
+        with pytest.raises(SofaDecodeError):
+            _visit(engine, data, lo=-128, hi=127)
+
+    def test_signed_at_both_bounds_is_accepted(self, engine):
+        rec = _visit(engine, _sarray([-128, 127]), lo=-128, hi=127)
+        assert rec.events == [("sa", 1, (-128, 127))]
+
+    def test_stating_no_bound_leaves_the_truncation_alone(self, engine):
+        # Both sides left None is the default: the element is wide but nothing
+        # declared it out of width, so the truncation is the only verdict.
+        data = U_HDR + _varint(4) + _varint(2**32)
+        with pytest.raises(SofaIncompleteError):
+            _visit(engine, data)
+
+    def test_a_bound_does_not_leak_to_the_next_field(self, engine):
+        # The decoder builds a fresh Field per header, so a width stated for one
+        # array cannot be read back for another. Here the recorder declares u8
+        # for every field it sees, and the SECOND array is the one that breaches
+        # it -- if the bound were sticky rather than per-field the first array's
+        # in-range elements would already have failed.
+        data = _uarray([1, 2, 3]) + U_HDR + _varint(1) + _varint(300)
+        with pytest.raises(SofaDecodeError):
+            _visit(engine, data, hi=0xFF)
+
+    def test_the_verdict_survives_byte_at_a_time_feeding(self, engine):
+        # The bound is applied inside the element loop, which a chunk boundary
+        # can suspend and resume; S7.2 item 4 wants the same outcome either way.
+        data = U_HDR + _varint(4) + _varint(2**32)
+        with pytest.raises(SofaDecodeError):
+            _visit(engine, data, hi=0xFFFFFFFF, chunk=1)
+
+    def test_the_field_carries_the_bound_slots(self, engine):
+        # The attributes exist and default to None, so a handler that never sets
+        # them behaves exactly as before.
+        seen = []
+
+        class Probe(Recorder):
+            def on_field(self, field):
+                seen.append((field.elem_min, field.elem_max))
+                return True
+
+        walk(engine, _uarray([1, 2, 3]), recorder=Probe())
+        assert seen == [(None, None)]

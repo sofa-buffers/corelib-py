@@ -403,10 +403,30 @@ bytes are decoded, so the verdict never depends on how much of the array
 followed it or on which engine read it (MESSAGE_SPEC §7.1). Omit them for
 `u64`/`i64`, whose range is the value domain, or for an unbounded consumer.
 
+A **visitor** states the same bound on the `Field` it is handed:
+
+```python
+class Handler(Visitor):
+    def on_field(self, field):
+        if field.id == 1:
+            field.elem_max = 255          # `data: { array, items: { type: u8 } }`
+        return True
+```
+
+`on_field` runs at the header, before an element is decoded, so the width
+reaches the reader in time to be applied *at* each element — the same place
+`unsigned_array(..., elem_max=…)` reaches through the binding. It has to be
+stated rather than checked: `on_unsigned_array` receives a list that has already
+fully arrived, so a check there can only decide an array that *arrives*, and a
+message truncated behind an out-of-width element would report `INCOMPLETE` where
+§5.2 owes `INVALID`. `elem_min` / `elem_max` default to `None` (no bound), and a
+fresh `Field` is built per header, so a width stated for one array is never read
+back for the next.
+
 ## Memory handling
 
 The key point for Python: **decoding allocates results for you unless you ask it
-not to.** The pull and visitor paths hand back fresh `int`/`str`/`bytes`/`list`
+not to.** The visitor path hands back fresh `int`/`str`/`bytes`/`list`
 objects; a `Binding` writes into storage you supplied and sized instead, and
 allocates only for `string` and `blob`, which have no fixed-width machine form.
 Encoding never allocates an output buffer at all (§5.1).

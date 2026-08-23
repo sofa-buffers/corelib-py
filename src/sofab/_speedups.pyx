@@ -406,9 +406,14 @@ cdef extern from *:
       #define Py_READONLY READONLY
     #endif
 
-    static PyMemberDef __sofab_field_members[5];
-    static const char *const __sofab_field_names[5] = {
-        "id", "type", "size", "count", "subtype"
+    #define __SOFAB_FIELD_NATTRS 7
+    /* The first five are ``cdef readonly``; elem_min/elem_max are ``cdef public``
+       because a handler assigns them, so they must not carry Py_READONLY. */
+    #define __SOFAB_FIELD_NRO 5
+
+    static PyMemberDef __sofab_field_members[__SOFAB_FIELD_NATTRS];
+    static const char *const __sofab_field_names[__SOFAB_FIELD_NATTRS] = {
+        "id", "type", "size", "count", "subtype", "elem_min", "elem_max"
     };
 
     static int __sofab_field_slot_attrs(PyObject *type_obj, PyObject *probe) {
@@ -418,9 +423,9 @@ cdef extern from *:
         char *mem = (char *) probe;
         Py_ssize_t i;
 
-        if (tp->tp_basicsize != base + 5 * step) return 0;
+        if (tp->tp_basicsize != base + __SOFAB_FIELD_NATTRS * step) return 0;
         if (!Py_IS_TYPE(probe, tp)) return 0;
-        for (i = 0; i < 5; i++) {
+        for (i = 0; i < __SOFAB_FIELD_NATTRS; i++) {
             PyObject *slot = *(PyObject **) (mem + base + i * step);
             PyObject *want = PyObject_GetAttrString(probe, __sofab_field_names[i]);
             int same;
@@ -429,12 +434,12 @@ cdef extern from *:
             Py_DECREF(want);
             if (!same) return 0;
         }
-        for (i = 0; i < 5; i++) {
+        for (i = 0; i < __SOFAB_FIELD_NATTRS; i++) {
             PyObject *descr;
             __sofab_field_members[i].name = (char *) __sofab_field_names[i];
             __sofab_field_members[i].type = Py_T_OBJECT_EX;
             __sofab_field_members[i].offset = base + i * step;
-            __sofab_field_members[i].flags = Py_READONLY;
+            __sofab_field_members[i].flags = (i < __SOFAB_FIELD_NRO) ? Py_READONLY : 0;
             __sofab_field_members[i].doc = NULL;
             descr = PyDescr_NewMember(tp, &__sofab_field_members[i]);
             if (descr == NULL) { PyErr_Clear(); return 0; }
@@ -536,23 +541,34 @@ cdef class Field:
     cdef readonly object size
     cdef readonly object count
     cdef readonly object subtype
+    # Writable, unlike the five above: a handler STATES these in on_field, and
+    # the decoder reads them back before it decodes the array's elements.
+    cdef public object elem_min
+    cdef public object elem_max
 
-    def __init__(self, id, type, size=0, count=0, subtype=None):
+    def __init__(self, id, type, size=0, count=0, subtype=None,
+                 elem_min=None, elem_max=None):
         self.id = id
         self.type = type
         self.size = size
         self.count = count
         self.subtype = subtype
+        self.elem_min = elem_min
+        self.elem_max = elem_max
 
     def __repr__(self):
-        return "Field(id=%r, type=%r, size=%r, count=%r, subtype=%r)" % (
-            self.id, self.type, self.size, self.count, self.subtype)
+        return ("Field(id=%r, type=%r, size=%r, count=%r, subtype=%r, "
+                "elem_min=%r, elem_max=%r)" % (
+                    self.id, self.type, self.size, self.count, self.subtype,
+                    self.elem_min, self.elem_max))
 
     def __eq__(self, other):
         return (isinstance(other, Field)
                 and self.id == other.id and self.type == other.type
                 and self.size == other.size and self.count == other.count
-                and self.subtype == other.subtype)
+                and self.subtype == other.subtype
+                and self.elem_min == other.elem_min
+                and self.elem_max == other.elem_max)
 
 
 # Whether the digit-level int conversion passed its import-time self-test (see
@@ -566,7 +582,8 @@ INT_DIGITS_FAST = __sofab_digits_selftest()
 # in *order* is caught as surely as one that differs in size. Exposed for the
 # test suite; ``False`` simply means the getset descriptors are still in use.
 FIELD_SLOT_ATTRS = __sofab_field_slot_attrs(
-    Field, Field(object(), object(), object(), object(), object()))
+    Field, Field(object(), object(), object(), object(), object(),
+                 object(), object()))
 
 
 cdef object _ZERO = 0
@@ -578,6 +595,10 @@ cdef inline Field _mkfield(object fid, object ftype, object size, object count, 
     f.type = ftype
     f.size = size
     f.count = count
+    # A fresh Field per header, so a bound stated for one field can never be
+    # read back for the next.
+    f.elem_min = _NONE
+    f.elem_max = _NONE
     f.subtype = subtype
     return f
 
@@ -3043,6 +3064,7 @@ cdef class Decoder:
         cdef int t = self._cur_wtype
         cdef int st = self._pend_subtype
         cdef object fid = PyLong_FromUnsignedLongLong(self._cur_id)
+        cdef object cur
         if t == _WT_UNSIGNED:
             visitor.on_unsigned(fid, self._unsigned())
         elif t == _WT_SIGNED:
@@ -3057,9 +3079,20 @@ cdef class Decoder:
             else:
                 visitor.on_bytes(fid, self._bytes())
         elif t == _WT_ARRAY_UNSIGNED:
-            visitor.on_unsigned_array(fid, self._read_unsigned_array())
+            # The declared element width, if on_field stated one. It has to reach
+            # the reader: the values are gone by the time on_*_array receives the
+            # list, so a bound applied there could only ever scan an array that
+            # arrived (S7.1/S5.2, generator#267). ``_cur`` is only rebuilt for a
+            # visitor that overrides on_field, hence the guard -- otherwise a
+            # bound from an earlier field would be read back here.
+            cur = self._cur if self._wants_field else None
+            visitor.on_unsigned_array(fid, self._read_unsigned_array(
+                None if cur is None else (<Field>cur).elem_max))
         elif t == _WT_ARRAY_SIGNED:
-            visitor.on_signed_array(fid, self._read_signed_array())
+            cur = self._cur if self._wants_field else None
+            visitor.on_signed_array(fid, self._read_signed_array(
+                None if cur is None else (<Field>cur).elem_min,
+                None if cur is None else (<Field>cur).elem_max))
         elif st == _ST_FP32:
             visitor.on_float32_array(fid, self._read_float32_array())
         else:

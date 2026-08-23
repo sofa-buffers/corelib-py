@@ -1178,11 +1178,25 @@ class Decoder:
             visitor.on_bytes(fid, self._take_fixlen_matched(pending[2]))
 
     def _take_varints(self, count: int, zigzag: bool) -> list[int]:
-        """The whole pending integer array, as a list (the visitor's shape)."""
+        """The whole pending integer array, as a list (the visitor's shape).
+
+        The element width comes off the Field ``on_field`` was handed, when the
+        handler set one: the values are gone by the time the hook receives the
+        list, so a bound stated afterwards could only ever scan an array that
+        arrived. Passing it into the reader instead puts the verdict at the
+        element -- the same place the binding path's ``elem_min``/``elem_max``
+        reach, through the same argument.
+        """
         if self._pending is not None and self._pending[0] == _LIMIT:
             raise SofaLimitError(self._pending[1])
         self._keep = self._pos
-        out = self._read_varints(count, None, None, zigzag)
+        # _cur is only rebuilt for a visitor that overrides on_field, so reading
+        # it unconditionally would carry a bound from an earlier field into one
+        # nobody stated a bound for.
+        f = self._cur if self._wants_field else None
+        lo = f.elem_min if f is not None else None
+        hi = f.elem_max if f is not None else None
+        out = self._read_varints(count, lo, hi, zigzag)
         if zigzag:
             out = [(v >> 1) ^ -(v & 1) for v in out]
         self._pending = None  # committed only once the payload is in hand (§5.2)

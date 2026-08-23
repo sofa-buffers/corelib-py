@@ -112,6 +112,16 @@ class Field:
     size: int = 0
     count: int = 0
     subtype: FixlenSubtype | None = None
+    #: The declared element width of an integer array, for a handler that knows
+    #: the schema to state in ``on_field`` -- before a single element is read.
+    #: Either side may be left ``None`` to leave that half open. The decoder
+    #: applies it AT each element, so an out-of-width value is INVALID by §7.1
+    #: whether the array completes or is truncated behind it, which is also
+    #: §5.2's precedence (INVALID over INCOMPLETE) for free. Setting them is the
+    #: only way a visitor can reach the bound the binding path declares with
+    #: ``unsigned_array(..., elem_max=...)``; both end up in the same reader.
+    elem_min: int | None = None
+    elem_max: int | None = None
 
 
 # --- errors -----------------------------------------------------------------
