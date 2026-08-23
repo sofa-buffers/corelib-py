@@ -397,12 +397,28 @@ class Encoder:
         cursor = self._cursor
         if cursor + _VARINT_MAX <= self._cap:
             buf = self._fixed_ba
-            while value >= 0x80:
+            # By width -- see write_unsigned_array. A field header is one byte
+            # while the id is below 16 and two up to 4096, so those two are the
+            # ones this site sees.
+            if value < 0x80:
+                buf[cursor] = value
+                self._cursor = cursor + 1
+            elif value < 0x4000:
                 buf[cursor] = (value & 0x7F) | 0x80
-                cursor += 1
-                value >>= 7
-            buf[cursor] = value
-            self._cursor = cursor + 1
+                buf[cursor + 1] = value >> 7
+                self._cursor = cursor + 2
+            else:
+                while value >= 0x4000:
+                    buf[cursor] = (value & 0x7F) | 0x80
+                    buf[cursor + 1] = ((value >> 7) & 0x7F) | 0x80
+                    cursor += 2
+                    value >>= 14
+                if value >= 0x80:
+                    buf[cursor] = (value & 0x7F) | 0x80
+                    cursor += 1
+                    value >>= 7
+                buf[cursor] = value
+                self._cursor = cursor + 1
         else:
             self._put(encode_varint(value))
 
@@ -612,12 +628,34 @@ class Encoder:
                         buf = self._fixed_ba
                         limit = self._cap - _VARINT_MAX
                         continue
-                    while v >= 0x80:
-                        buf[cursor] = (v & 0x7F) | 0x80
+                    # Varints are emitted by width, not one group at a time.
+                    # One and two bytes get a straight line each -- between them
+                    # that is nearly every id, length and count on the wire --
+                    # and anything longer runs a loop that does TWO 7-bit groups
+                    # a turn: five steps where two single-group turns cost eight.
+                    # ``>= 0x4000`` means at least three groups remain, so both
+                    # bytes that loop writes are certain to need a continuation
+                    # bit. The array elements this loop encodes are the case that
+                    # gets there -- 8.4 groups per element on the u64 workload.
+                    if v < 0x80:
+                        buf[cursor] = v
                         cursor += 1
-                        v >>= 7
-                    buf[cursor] = v
-                    cursor += 1
+                    elif v < 0x4000:
+                        buf[cursor] = (v & 0x7F) | 0x80
+                        buf[cursor + 1] = v >> 7
+                        cursor += 2
+                    else:
+                        while v >= 0x4000:
+                            buf[cursor] = (v & 0x7F) | 0x80
+                            buf[cursor + 1] = ((v >> 7) & 0x7F) | 0x80
+                            cursor += 2
+                            v >>= 14
+                        if v >= 0x80:
+                            buf[cursor] = (v & 0x7F) | 0x80
+                            cursor += 1
+                            v >>= 7
+                        buf[cursor] = v
+                        cursor += 1
             finally:
                 # Also on the way out of a rejected element: what was written
                 # stays written, exactly as it did when the buffer was growable.
@@ -658,12 +696,25 @@ class Encoder:
                         buf = self._fixed_ba
                         limit = self._cap - _VARINT_MAX
                         continue
-                    while u >= 0x80:
-                        buf[cursor] = (u & 0x7F) | 0x80
+                    if u < 0x80:
+                        buf[cursor] = u
                         cursor += 1
-                        u >>= 7
-                    buf[cursor] = u
-                    cursor += 1
+                    elif u < 0x4000:
+                        buf[cursor] = (u & 0x7F) | 0x80
+                        buf[cursor + 1] = u >> 7
+                        cursor += 2
+                    else:
+                        while u >= 0x4000:
+                            buf[cursor] = (u & 0x7F) | 0x80
+                            buf[cursor + 1] = ((u >> 7) & 0x7F) | 0x80
+                            cursor += 2
+                            u >>= 14
+                        if u >= 0x80:
+                            buf[cursor] = (u & 0x7F) | 0x80
+                            cursor += 1
+                            u >>= 7
+                        buf[cursor] = u
+                        cursor += 1
             finally:
                 self._cursor = cursor
         except SofaError as exc:
