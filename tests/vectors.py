@@ -17,11 +17,21 @@ from typing import Callable
 
 import pytest
 
-from sofab import Encoder, Field, SofaIncompleteError, Status, Visitor
+from sofab import Binding, Encoder, Field, SofaIncompleteError, Status, Visitor
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
 
 # --- the shared conformance vectors -----------------------------------------
+
+# Re-exported so a suite building a binding imports one name from one place.
+# ``ruff`` would otherwise read Binding as unused here and drop it.
+__all__ = [
+    "DBL_MAX", "DECODER_ENGINES", "ENCODER_ENGINES", "ENGINE_PAIRS", "FLT_MAX",
+    "FP64_FROM_FLOAT", "FULL_SCALE_EXPECTED", "VECTORS", "VECTOR_DOC",
+    "Binding", "Recorder", "Slots", "Status",
+    "bound", "build_full_scale", "encode", "pairs", "raise_for", "uvarint",
+    "values", "verdict", "walk", "zzvarint",
+]
 
 #: ``assets/test_vectors.json`` — the shared set, copied verbatim from
 #: ``corelib-c-cpp``. Loaded once here rather than re-read and re-parsed by every
