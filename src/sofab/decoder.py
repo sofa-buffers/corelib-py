@@ -165,6 +165,11 @@ class Decoder:
         self._max_string_len = max_string_len
         self._max_blob_len = max_blob_len
         self._buf: bytes | bytearray = b""
+        # len(self._buf), kept in step with it. The buffer only ever changes in
+        # feed() and reset(), while the walk asks for its length constantly —
+        # 5.2 len() calls per field on the composite workload, each a builtin
+        # call. Holding the number is what the native engine already does.
+        self._n = 0
         self._pos = 0
         self._depth = 0
         self._cur: Field | None = None
@@ -300,7 +305,7 @@ class Decoder:
         refilling only if it runs off the end mid-value."""
         buf = self._buf
         pos = self._pos
-        if pos >= len(buf):
+        if pos >= self._n:
             raise self._suspend("truncated varint")
         b = buf[pos]
         pos += 1
@@ -309,7 +314,7 @@ class Decoder:
             return b
         result = b & 0x7F
         shift = 7
-        n = len(buf)
+        n = self._n
         while True:
             if pos >= n:
                 self._pos = pos
@@ -341,13 +346,16 @@ class Decoder:
         buf = self._buf
         pos = self._pos
         end = pos + n
-        if end > len(buf):
+        if end > self._n:
             raise self._suspend("truncated payload")
         self._pos = end
-        # One copy out of the buffer, and always a real ``bytes``: while a
-        # construct is being accumulated the buffer *is* a bytearray, and a
-        # slice of one would both be the wrong type and alias storage the next
-        # feed can move.
+        # Always a real ``bytes``: while a construct is being accumulated the
+        # buffer *is* a bytearray, and a slice of one would both be the wrong
+        # type and alias storage the next feed can move. Slicing bytes already
+        # gives bytes, so the memoryview detour — three objects to make one — is
+        # only worth it for the bytearray case, where it saves the second copy.
+        if type(buf) is bytes:
+            return buf[pos:end]
         return bytes(memoryview(buf)[pos:end])
 
     def _skip_exact(self, n: int) -> None:
@@ -361,7 +369,7 @@ class Decoder:
         byte, and a declined sequence replays a whole nested walk. Retention is
         the resume contract's; the copy was pure waste."""
         end = self._pos + n
-        if end > len(self._buf):
+        if end > self._n:
             raise self._suspend("truncated payload")
         self._pos = end
 
@@ -433,7 +441,7 @@ class Decoder:
         )
         buf = self._buf
         pos = self._pos
-        n = len(buf)
+        n = self._n
         i = 0
         while i < count:
             if pos >= n:
@@ -493,7 +501,7 @@ class Decoder:
         """Advance the cursor past ``count`` varints without materialising them."""
         buf = self._buf
         pos = self._pos
-        n = len(buf)
+        n = self._n
         i = 0
         while i < count:
             if pos < n:
@@ -505,7 +513,7 @@ class Decoder:
             self._varint()
             buf = self._buf
             pos = self._pos
-            n = len(buf)
+            n = self._n
             i += 1
         self._pos = pos
 
@@ -534,7 +542,7 @@ class Decoder:
             # blocks inside its refill instead of returning to the caller here.
             self._keep = self._pos
 
-        if len(self._buf) - self._pos < 1:
+        if self._n - self._pos < 1:
             if self._depth != 0:
                 raise self._suspend("truncated: unbalanced sequence")
             # ``_cur`` deliberately keeps the last field past EOF: `field` is
@@ -827,8 +835,9 @@ class Decoder:
         # chunk — a 1 MB blob fed in 4 KiB pieces costs ~122 MB of copying that
         # way.
         buf = self._buf
-        if self._pos >= len(buf):
-            self._buf = data if isinstance(data, bytes) else bytes(data)
+        if self._pos >= self._n:
+            buf = data if isinstance(data, bytes) else bytes(data)
+            self._buf = buf
         else:
             if not isinstance(buf, bytearray):
                 buf = bytearray(buf)
@@ -836,6 +845,7 @@ class Decoder:
             if self._pos:
                 del buf[: self._pos]
             buf += data
+        self._n = len(buf)
         self._pos = 0
         self._keep = 0
         self._running = True
@@ -862,6 +872,7 @@ class Decoder:
         the next message does not write keeps whatever is in it, which is how
         absence is reported)."""
         self._buf = b""
+        self._n = 0
         self._pos = 0
         self._depth = 0
         self._cur = None
@@ -889,7 +900,7 @@ class Decoder:
         pending = self._pending
         assert pending is not None  # only asked while a value is pending
         kind = pending[0]
-        have = len(self._buf) - self._pos
+        have = self._n - self._pos
         if kind == _FIXLEN:
             return bool(have >= pending[2])
         if kind == _FARRAY:
