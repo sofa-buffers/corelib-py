@@ -162,7 +162,7 @@ def test_a_run_committed_across_flushes_is_byte_identical(Encoder):
     bytes of an already-committed run survive being chopped up by the sink.
     """
     chunks: list[bytes] = []
-    enc = Encoder.over_buffer(bytearray(3), 0, chunks.append)
+    enc = Encoder.over_buffer(bytearray(3), 0, lambda c: chunks.append(bytes(c)))
     enc.write_sequence_begin_lazy(1)
     enc.write_sequence_begin_lazy(2)
     enc.write_sequence_end()

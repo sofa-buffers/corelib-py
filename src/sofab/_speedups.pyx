@@ -1132,12 +1132,28 @@ cdef class Encoder:
         if self._writer is None and self._flush_sink is None:
             raise SofaBufferError("encoder buffer full")
         installs = self._installs
-        snapshot = PyBytes_FromStringAndSize(<char*>self._fixed_ptr, <Py_ssize_t>self._cursor)
-        if self._writer is not None:
-            self._writer.write(snapshot)
+        # §5.1.6: the sink is handed the installed buffer itself, never a copy of
+        # it and never any other memory -- see the pure engine for why a copy is
+        # both "other memory" and the thing that makes §5.1.5's take-the-buffer
+        # half unreachable.
+        cdef Py_ssize_t used = <Py_ssize_t>self._cursor
+        cdef bint owned = self._fixed_obj is not None
+        if owned:
+            view = memoryview(self._fixed_obj)[0:used]
         else:
-            self._flush_sink(snapshot)
+            # The scratch shape has no Python object behind it, so the view is
+            # made over the pointer. Same memory either way: the sink still sees
+            # only the installed buffer.
+            view = <unsigned char[:used]>self._fixed_ptr
+        if self._writer is not None:
+            self._writer.write(view)
+        else:
+            self._flush_sink(view)
         if self._installs == installs:
+            if owned:
+                # The sink copied, so the buffer is ours again and the export has
+                # to go -- it would otherwise block the next buffer_set.
+                view.release()
             self._cursor = 0
         return 0
 

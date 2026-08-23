@@ -596,8 +596,10 @@ Encoding never allocates an output buffer at all (§5.1).
   occur, so the buffer simply holds the message or reports `SofaBufferError`, and
   sizing it from a generated `MAX_SIZE` stays exact. There is no pass-through: a
   `string`/`blob` run is copied into the output buffer like any other output, and
-  every flush hands the sink a `bytes` snapshot of that buffer's prefix — a sink
-  may retain what it receives without pinning caller memory.
+  every flush hands the sink a `memoryview` **over that buffer** — the installed
+  buffer itself, never a copy of it and never any other memory. A sink that only
+  reads or copies during the call may let the view go; one that keeps it has
+  *taken* the buffer and must install a replacement before it returns (below).
 * **The start offset belongs to the installation, not to the buffer.** A flush
   sink that returns **without** installing anything has *copied* the bytes it was
   handed: the same buffer stays active and encoding resumes at offset 0. A sink

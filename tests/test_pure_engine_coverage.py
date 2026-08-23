@@ -197,7 +197,7 @@ def test_writer_flush_drains_and_clears():
 
 def test_over_buffer_streams_through_flush_sink():
     chunks: list[bytes] = []
-    enc = Encoder.over_buffer(bytearray(8), offset=0, flush=chunks.append)
+    enc = Encoder.over_buffer(bytearray(8), offset=0, flush=lambda c: chunks.append(bytes(c)))
     for i in range(50):
         enc.write_unsigned(i % 100, i)
     enc.flush()

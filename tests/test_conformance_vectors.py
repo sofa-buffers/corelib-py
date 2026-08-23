@@ -155,7 +155,7 @@ def _encode_chunked(fields, buf_size: int) -> bytes:
     sink each time it fills — the streaming-encoder worst case."""
     chunks: list[bytes] = []
     buf = bytearray(buf_size)
-    enc = Encoder.over_buffer(buf, offset=0, flush=chunks.append)
+    enc = Encoder.over_buffer(buf, offset=0, flush=lambda c: chunks.append(bytes(c)))
     _replay(enc, fields)
     enc.flush()
     return b"".join(chunks)

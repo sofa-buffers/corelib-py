@@ -297,7 +297,7 @@ def test_array_bytes_match_over_both_output_models(enc_cls):
     grow.flush()
 
     chunks: list[bytes] = []
-    fixed = enc_cls.over_buffer(bytearray(8), 0, chunks.append)
+    fixed = enc_cls.over_buffer(bytearray(8), 0, lambda c: chunks.append(bytes(c)))
     fixed.write_unsigned_array(1, values)
     fixed.write_signed_array(2, [-v // 2 for v in values])
     fixed.flush()
