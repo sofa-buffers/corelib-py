@@ -1181,7 +1181,41 @@ class Decoder:
             raw = self._take_scalar_matched()
             visitor.on_signed(fid, (raw >> 1) ^ -(raw & 1))
         elif t == WireType.FIXLEN:
-            self._visit_fixlen(visitor, fid, pending)
+            # Folded in rather than delegated. A string field is the commonest
+            # thing on the wire and used to cost four nested calls to deliver —
+            # _visit_value, _visit_fixlen, _take_fixlen_matched, _read_exact —
+            # three of which only chose the next one. Everything they did is
+            # here: the parked-cap check, the resume transaction, the bounds
+            # test, and the one copy out of the buffer.
+            if pending[0] == _LIMIT:
+                # A parked receiver cap (§6.2.1): the field is being refused, and
+                # the walk over its payload is what the cap exists to prevent.
+                raise SofaLimitError(pending[1])
+            self._keep = pos = self._pos
+            end = pos + pending[2]
+            if end > self._n:
+                raise self._suspend("truncated payload")
+            buf = self._buf
+            # Always a real ``bytes`` — see _read_exact for why the bytearray
+            # case takes the memoryview.
+            data = buf[pos:end] if type(buf) is bytes else bytes(memoryview(buf)[pos:end])
+            self._pos = end
+            self._pending = None  # committed once the payload is in hand (§5.2)
+            subtype = pending[1]
+            if subtype == FixlenSubtype.STRING:
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise SofaDecodeError("invalid UTF-8 in string field") from exc
+                visitor.on_string(fid, text)
+            elif subtype == FixlenSubtype.BLOB:
+                visitor.on_bytes(fid, data)
+            elif subtype == FixlenSubtype.FP32:
+                # _next_wire already refused any other width for these two, so
+                # the payload is exactly 4 or 8 bytes.
+                visitor.on_float32(fid, _core.unpack_f32(data))
+            else:
+                visitor.on_float64(fid, _core.unpack_f64(data))
         elif t == WireType.ARRAY_UNSIGNED:
             visitor.on_unsigned_array(fid, self._take_varints(pending[2], False))
         elif t == WireType.ARRAY_SIGNED:
@@ -1190,25 +1224,6 @@ class Decoder:
             visitor.on_float32_array(fid, self._take_farray_values(pending, 4))
         else:
             visitor.on_float64_array(fid, self._take_farray_values(pending, 8))
-
-    def _visit_fixlen(self, visitor: Visitor, fid: int, pending: tuple[Any, ...]) -> None:
-        if pending[0] == _LIMIT:
-            # A parked receiver cap (§6.2.1): the field is being refused, and the
-            # walk over its payload is exactly what the cap exists to prevent.
-            raise SofaLimitError(pending[1])
-        subtype = pending[1]
-        if subtype == FixlenSubtype.FP32:
-            visitor.on_float32(fid, _core.unpack_f32(self._take_fixlen_matched(4)))
-        elif subtype == FixlenSubtype.FP64:
-            visitor.on_float64(fid, _core.unpack_f64(self._take_fixlen_matched(8)))
-        elif subtype == FixlenSubtype.STRING:
-            data = self._take_fixlen_matched(pending[2])
-            try:
-                visitor.on_string(fid, data.decode("utf-8"))
-            except UnicodeDecodeError as exc:
-                raise SofaDecodeError("invalid UTF-8 in string field") from exc
-        else:
-            visitor.on_bytes(fid, self._take_fixlen_matched(pending[2]))
 
     def _take_varints(self, count: int, zigzag: bool) -> list[int]:
         """The whole pending integer array, as a list (the visitor's shape)."""
