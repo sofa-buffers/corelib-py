@@ -17,7 +17,7 @@ from typing import Callable
 
 import pytest
 
-from sofab import Binding, Encoder, Field, SofaIncompleteError, Status, Visitor
+from sofab import Encoder, Field, SofaIncompleteError, Status, Visitor
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
 
@@ -214,6 +214,20 @@ def bound(dec_cls, data: bytes, binding, chunk: int | None = None, **kw):
         for off in range(0, len(data), chunk):
             status = dec.feed(data[off : off + chunk])
     return status, dec, Slots(words, objects)
+
+
+def pairs(dec_cls, data: bytes, **kw) -> list[tuple]:
+    """``[(Field, event), ...]`` for every value field, in wire order.
+
+    ``on_field`` fires only for the fields that carry a value, so the recorder's
+    Fields line up one-for-one with its non-sequence events. Tests that assert
+    on wire metadata *and* the decoded value want both halves together.
+    """
+    status, rec, _dec = walk(dec_cls, data, **kw)
+    assert status is Status.COMPLETE, status
+    vals = [e for e in rec.events if e[0] not in ("seq{", "seq}")]
+    assert len(vals) == len(rec.fields), (len(vals), len(rec.fields))
+    return list(zip(rec.fields, vals))
 
 
 def values(dec_cls, data: bytes, **kw) -> list[tuple]:

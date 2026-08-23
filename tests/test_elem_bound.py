@@ -16,8 +16,6 @@ behind the offending element (issue #67).
 
 from __future__ import annotations
 
-import io
-
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
 from vectors import Binding, bound, raise_for

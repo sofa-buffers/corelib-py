@@ -13,7 +13,6 @@ from sofab import (
     Encoder,
     SofaBufferError,
     SofaRangeError,
-    WireType,
 )
 from sofab.encoder import Encoder as PyEncoder
 

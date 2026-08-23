@@ -18,9 +18,9 @@ from __future__ import annotations
 import struct
 
 import pytest
-from vectors import reader
+from vectors import Status, values
 
-from sofab import Decoder, Encoder, FixlenSubtype, WireType
+from sofab import Decoder, Encoder, Visitor
 from sofab._core import _unpack_f32_bits, unpack_f32
 
 # We must feed the corelib the *literal* payload bytes: struct.unpack("<f", ...)
@@ -47,19 +47,15 @@ def _f32_encode_hex(hexbits: str) -> str:
 
     This is the exact decode -> re-encode round-trip the §4.6 oracle checks.
     """
-    dec = Decoder(reader(_f32_frame(hexbits)))
-    dec.next()
     out = Encoder()
-    out.write_float32(7, dec.float32())
+    out.write_float32(7, values(Decoder, _f32_frame(hexbits))[0][2])
     return out.getvalue()[-4:].hex()
 
 
 def _f64_encode_hex(hexbits: str) -> str:
     """decode ``hexbits`` (8 LE bytes) -> float -> re-encode; return payload hex."""
-    dec = Decoder(reader(_f64_frame(hexbits)))
-    dec.next()
     out = Encoder()
-    out.write_float64(3, dec.float64())
+    out.write_float64(3, values(Decoder, _f64_frame(hexbits))[0][2])
     return out.getvalue()[-8:].hex()
 
 
@@ -104,9 +100,7 @@ def test_fp32_signaling_nan_in_fixlen_array():
     enc.write_float32_array(2, [0.0] * len(payloads))
     frame = enc.getvalue()[: -4 * len(payloads)] + bytes.fromhex("".join(payloads))
 
-    dec = Decoder(reader(frame))
-    dec.next()
-    got = dec.read_float32_array()
+    got = values(Decoder, frame)[0][2]
 
     out = Encoder()
     out.write_float32_array(2, got)
@@ -131,46 +125,52 @@ def _reencode_message(wire: bytes) -> bytes:
     preserve a frame it was handed, never decide it away. Dropping one is the
     message layer's call (MESSAGE_SPEC §2), made from the values, not the bytes.
     """
-    dec = Decoder(reader(wire))
-    enc = Encoder()
+    class Transcoder(Visitor):
+        """Writes back every field it is handed, in order."""
 
-    def copy() -> None:
-        while True:
-            f = dec.next()
-            if f is None:
-                return
-            t = f.type
-            if t == WireType.SEQUENCE_START:
-                enc.write_sequence_begin_lazy(f.id)
-                copy()
-            elif t == WireType.SEQUENCE_END:
-                enc.write_sequence_end_keep()
-                return
-            elif t == WireType.UNSIGNED:
-                enc.write_unsigned(f.id, dec.unsigned())
-            elif t == WireType.SIGNED:
-                enc.write_signed(f.id, dec.signed())
-            elif t == WireType.FIXLEN:
-                st = f.subtype
-                if st == FixlenSubtype.FP32:
-                    enc.write_float32(f.id, dec.float32())
-                elif st == FixlenSubtype.FP64:
-                    enc.write_float64(f.id, dec.float64())
-                elif st == FixlenSubtype.STRING:
-                    enc.write_string(f.id, dec.string())
-                else:
-                    enc.write_bytes(f.id, dec.bytes())
-            elif t == WireType.ARRAY_UNSIGNED:
-                enc.write_unsigned_array(f.id, dec.read_unsigned_array())
-            elif t == WireType.ARRAY_SIGNED:
-                enc.write_signed_array(f.id, dec.read_signed_array())
-            else:  # ARRAY_FIXLEN
-                if f.subtype == FixlenSubtype.FP32:
-                    enc.write_float32_array(f.id, dec.read_float32_array())
-                else:
-                    enc.write_float64_array(f.id, dec.read_float64_array())
+        def __init__(self) -> None:
+            self.enc = Encoder()
 
-    copy()
+        def on_sequence_begin(self, field_id):
+            self.enc.write_sequence_begin_lazy(field_id)
+            return None
+
+        def on_sequence_end(self):
+            self.enc.write_sequence_end_keep()
+
+        def on_unsigned(self, field_id, value):
+            self.enc.write_unsigned(field_id, value)
+
+        def on_signed(self, field_id, value):
+            self.enc.write_signed(field_id, value)
+
+        def on_float32(self, field_id, value):
+            self.enc.write_float32(field_id, value)
+
+        def on_float64(self, field_id, value):
+            self.enc.write_float64(field_id, value)
+
+        def on_string(self, field_id, value):
+            self.enc.write_string(field_id, value)
+
+        def on_bytes(self, field_id, value):
+            self.enc.write_bytes(field_id, value)
+
+        def on_unsigned_array(self, field_id, values_):
+            self.enc.write_unsigned_array(field_id, values_)
+
+        def on_signed_array(self, field_id, values_):
+            self.enc.write_signed_array(field_id, values_)
+
+        def on_float32_array(self, field_id, values_):
+            self.enc.write_float32_array(field_id, values_)
+
+        def on_float64_array(self, field_id, values_):
+            self.enc.write_float64_array(field_id, values_)
+
+    t = Transcoder()
+    assert Decoder(visitor=t).feed(wire) is Status.COMPLETE
+    enc = t.enc
     return enc.getvalue()
 
 
@@ -189,9 +189,7 @@ def test_fp32_array_mixes_nan_and_ordinary_elements():
     enc.write_float32_array(4, [0.0] * len(payloads))
     frame = enc.getvalue()[: -4 * len(payloads)] + bytes.fromhex("".join(payloads))
 
-    dec = Decoder(reader(frame))
-    dec.next()
-    got = dec.read_float32_array()
+    got = values(Decoder, frame)[0][2]
     assert got[0] == 1.0 and got[2] == -2.0 and got[4] == 0.0
 
     out = Encoder()
@@ -229,9 +227,7 @@ NARROWED_NAN = {
 @pytest.mark.parametrize("name,case", list(NARROWED_NAN.items()), ids=list(NARROWED_NAN))
 def test_nan_narrowed_to_fp32_stays_a_nan(name, case):
     bits, expected = case
-    dec = Decoder(reader(_f64_frame(_f64_hex(bits))))
-    dec.next()
-    value = dec.float64()
+    value = values(Decoder, _f64_frame(_f64_hex(bits)))[0][2]
     assert value != value, "the fp64 NaN did not survive the trip through a float"
 
     out = Encoder()

@@ -20,7 +20,6 @@ and dataset test, never a performance assertion: no timing figure is checked.
 from __future__ import annotations
 
 import importlib.util
-import io
 import re
 import sys
 from pathlib import Path

@@ -17,6 +17,7 @@ import io
 import struct
 
 import pytest
+from vectors import values
 
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
@@ -25,7 +26,7 @@ _speedups = pytest.importorskip("sofab._speedups", reason="native extension not 
 NativeEncoder = _speedups.Encoder
 NativeDecoder = _speedups.Decoder
 
-from sofab import FixlenSubtype, WireType  # noqa: E402
+from sofab import WireType  # noqa: E402
 
 FLT_MAX = struct.unpack("<f", b"\xff\xff\x7f\x7f")[0]
 
@@ -159,38 +160,10 @@ def test_over_buffer_sink_reinstalled_offset_survives_the_drain(cap, offset):
     )
 
 
-def _walk(dec):
-    out = []
-    while (f := dec.next()) is not None:
-        t = f.type
-        if t == WireType.SEQUENCE_END:
-            out.append(("end",))
-        elif t == WireType.SEQUENCE_START:
-            out.append(("seq", f.id))
-        elif t == WireType.UNSIGNED:
-            out.append(("u", f.id, dec.unsigned()))
-        elif t == WireType.SIGNED:
-            out.append(("s", f.id, dec.signed()))
-        elif t == WireType.FIXLEN:
-            st = f.subtype
-            if st == FixlenSubtype.FP32:
-                out.append(("f32", f.id, dec.float32()))
-            elif st == FixlenSubtype.FP64:
-                out.append(("f64", f.id, dec.float64()))
-            elif st == FixlenSubtype.STRING:
-                out.append(("str", f.id, dec.string()))
-            else:
-                out.append(("blob", f.id, dec.bytes()))
-        elif t == WireType.ARRAY_UNSIGNED:
-            out.append(("ua", f.id, dec.read_unsigned_array()))
-        elif t == WireType.ARRAY_SIGNED:
-            out.append(("sa", f.id, dec.read_signed_array()))
-        elif t == WireType.ARRAY_FIXLEN:
-            if f.subtype == FixlenSubtype.FP32:
-                out.append(("f32a", f.id, dec.read_float32_array()))
-            else:
-                out.append(("f64a", f.id, dec.read_float64_array()))
-    return out
+def _walk(dec_cls, data: bytes):
+    """Every field of ``data`` as the engine hands it over."""
+    return values(dec_cls, data)
+
 
 
 def test_decode_values_identical():
@@ -198,7 +171,7 @@ def test_decode_values_identical():
     _program(enc)
     enc.flush()
     data = enc.getvalue()
-    assert _walk(NativeDecoder(io.BytesIO(data))) == _walk(PyDecoder(io.BytesIO(data)))
+    assert _walk(NativeDecoder, data) == _walk(PyDecoder, data)
 
 
 def test_cross_decode():
@@ -210,7 +183,7 @@ def test_cross_decode():
     ne.flush()
     pd = pe.getvalue()
     nd = ne.getvalue()
-    assert _walk(PyDecoder(io.BytesIO(nd))) == _walk(NativeDecoder(io.BytesIO(pd)))
+    assert _walk(PyDecoder, nd) == _walk(NativeDecoder, pd)
 
 
 # --- parity on *malformed* input, not just on valid programs (issue #64) -----
