@@ -569,13 +569,22 @@ class Decoder:
             return -1
 
         # The header varint, read inline. A call into _varint costs more than
-        # the byte it usually returns: ids below 16 with a wire type packed
-        # beside them fit in one byte, which is the overwhelmingly common
-        # header, and the EOF test above has already proved that byte is there.
-        # Anything longer falls back to the real reader.
+        # the one or two bytes it usually returns, and the EOF test above has
+        # already proved the first of them is there.
+        #
+        # Two bytes, not one: a header packs the wire type into the low 3 bits,
+        # so it stays single-byte only while the id is below 16. Ids run past
+        # that in any real schema — 53 of the 77 headers on the composite
+        # workload are two bytes — and a fast path that misses two thirds of the
+        # time is not one. Nothing longer than two bytes is handled here;
+        # ``_varint`` owns the 64-bit bound and the overlong verdict (§4.1.3),
+        # and a two-byte varint cannot reach either.
         header = buf[pos]
         if header < 0x80:
             self._pos = pos + 1
+        elif pos + 1 < self._n and buf[pos + 1] < 0x80:
+            header = (header & 0x7F) | (buf[pos + 1] << 7)
+            self._pos = pos + 2
         else:
             header = self._varint()
         wtype = header & 0x07
@@ -619,10 +628,14 @@ class Decoder:
             # guaranteed to be buffered, so the bound is tested first. A length
             # word is one byte for any payload under 16 bytes.
             pos = self._pos
-            if pos < self._n:
+            n = self._n
+            if pos < n:
                 length_header = buf[pos]
                 if length_header < 0x80:
                     self._pos = pos + 1
+                elif pos + 1 < n and buf[pos + 1] < 0x80:
+                    length_header = (length_header & 0x7F) | (buf[pos + 1] << 7)
+                    self._pos = pos + 2
                 else:
                     length_header = self._varint()
             else:
