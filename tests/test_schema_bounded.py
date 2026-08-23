@@ -7,22 +7,26 @@ already bounds. There the schema bound governs and its violation is INVALID",
 and §6.3 says the same from the other end — ``LimitExceeded`` is "never raised
 for a field the schema bounds".
 
-Only the caller knows which fields those are, so it says so per field with
-:meth:`Decoder.schema_bounded`, and the cap's verdict is parked on the pending
-value at the count/length header until the field is actually consumed — before
-any payload is read or any list allocated, which is where §6.2.1 requires it to
-be decided. Both engines are exercised on every case.
+Only the caller knows which fields those are, and a :class:`sofab.Binding` is
+where it says so: ``cap`` on an array and ``maxlen`` on a string or blob *are*
+the schema's bound. Declaring one takes the receiver cap off that field and puts
+the verdict on the declared bound instead, as INVALID (§7.1). A field with no
+declared bound — one the binding does not name, or names without a ``maxlen`` —
+stays under the cap.
+
+The verdict is reached at the count/length header, before any payload is read or
+any storage written, which is where §6.2.1 requires it to be. Both engines are
+exercised on every case.
 """
 
 from __future__ import annotations
 
-import io
-
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
-from vectors import uvarint
+from vectors import Recorder, Status, bound, uvarint, walk
 
 from sofab import (
+    Binding,
     Encoder,
     SofaDecodeError,
     SofaIncompleteError,
@@ -30,10 +34,6 @@ from sofab import (
 )
 
 BIG = "x" * 2000
-
-
-def _dec(engine, data, **kw):
-    return engine(io.BytesIO(bytes(data)), **kw)
 
 
 def _uvarint(x: int) -> list[int]:
@@ -44,259 +44,237 @@ def _uvarint(x: int) -> list[int]:
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_schema_bounded_string_is_exempt_from_max_string_len(engine):
+def test_a_declared_string_is_exempt_from_max_string_len(engine):
     # The issue's repro: a field the schema bounds at maxlen 4194304, carrying
     # 2000 bytes, decoded by a receiver configured max_string_len=1024. The
     # message is well within its schema bound, so the cap must not touch it.
     enc = Encoder()
     enc.write_string(1, BIG)
-    dec = _dec(engine, enc.getvalue(), max_string_len=1024)
-    f = dec.next()
-    assert f is not None and f.id == 1
-    dec.schema_bounded()
-    assert dec.string() == BIG
+    b = Binding().string(1, at=0, maxlen=4194304)
+    status, _dec, slots = bound(engine, enc.getvalue(), b, max_string_len=1024)
+    assert status is Status.COMPLETE
+    assert slots.objects[0] == BIG
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_schema_bounded_blob_is_exempt_from_max_blob_len(engine):
-    payload = bytes(range(256)) * 8
+def test_a_declared_blob_is_exempt_from_max_blob_len(engine):
     enc = Encoder()
-    enc.write_bytes(2, payload)
-    dec = _dec(engine, enc.getvalue(), max_blob_len=16)
-    assert dec.next() is not None
-    dec.schema_bounded()
-    assert dec.bytes() == payload
+    enc.write_bytes(1, b"y" * 2000)
+    b = Binding().bytes(1, at=0, maxlen=4194304)
+    status, _dec, slots = bound(engine, enc.getvalue(), b, max_blob_len=1024)
+    assert status is Status.COMPLETE
+    assert slots.objects[0] == b"y" * 2000
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_schema_bounded_arrays_are_exempt_from_max_array_count(engine):
-    values = list(range(64))
-    cases = [
-        (lambda e: e.write_unsigned_array(3, values), lambda d: d.read_unsigned_array(), values),
-        (lambda e: e.write_signed_array(4, values), lambda d: d.read_signed_array(), values),
-        (
-            lambda e: e.write_float32_array(5, [1.0] * 64),
-            lambda d: d.read_float32_array(),
-            [1.0] * 64,
-        ),
-        (
-            lambda e: e.write_float64_array(6, [2.0] * 64),
-            lambda d: d.read_float64_array(),
-            [2.0] * 64,
-        ),
-    ]
-    for write, read, want in cases:
-        enc = Encoder()
-        write(enc)
-        dec = _dec(engine, enc.getvalue(), max_array_count=8)
-        assert dec.next() is not None
-        dec.schema_bounded()
-        assert read(dec) == want
-
-
-@pytest.mark.parametrize("engine", ENGINES)
-def test_declaration_covers_the_current_field_only(engine):
-    # §6.2.1 is a per-field statement, so the declaration is too: the next
-    # next() starts an undeclared — and therefore capped — field again.
+@pytest.mark.parametrize(
+    "write,binder",
+    [
+        (lambda e: e.write_unsigned_array(1, list(range(64))),
+         lambda b: b.unsigned_array(1, at=0, cap=128, count_at=200)),
+        (lambda e: e.write_signed_array(1, [-1] * 64),
+         lambda b: b.signed_array(1, at=0, cap=128, count_at=200)),
+        (lambda e: e.write_float32_array(1, [1.5] * 64),
+         lambda b: b.float32_array(1, at=0, cap=128, count_at=200)),
+        (lambda e: e.write_float64_array(1, [1.5] * 64),
+         lambda b: b.float64_array(1, at=0, cap=128, count_at=200)),
+    ],
+    ids=["unsigned", "signed", "fp32", "fp64"],
+)
+def test_a_declared_array_is_exempt_from_max_array_count(engine, write, binder):
     enc = Encoder()
-    enc.write_string(1, BIG)
-    enc.write_string(2, BIG)
-    dec = _dec(engine, enc.getvalue(), max_string_len=1024)
-    assert dec.next() is not None
-    dec.schema_bounded()
-    assert dec.string() == BIG
-    assert dec.next() is not None
+    write(enc)
+    status, _dec, slots = bound(
+        engine, enc.getvalue(), binder(Binding()), max_array_count=8
+    )
+    assert status is Status.COMPLETE
+    assert slots.u[200] == 64
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_the_declaration_covers_that_field_only(engine):
+    """Declaring one field's bound says nothing about the next one."""
+    enc = Encoder()
+    enc.write_string(1, BIG)  # declared
+    enc.write_string(2, BIG)  # not
+    b = Binding().string(1, at=0, maxlen=4194304).string(2, at=1)
     with pytest.raises(SofaLimitError):
-        dec.string()
+        bound(engine, enc.getvalue(), b, max_string_len=1024)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_declaration_inside_a_sequence_is_honoured(engine):
+def test_a_declaration_inside_a_sequence_is_honoured(engine):
     enc = Encoder()
     enc.write_sequence_begin_lazy(9)
     enc.write_string(1, BIG)
     enc.write_sequence_end()
-    dec = _dec(engine, enc.getvalue(), max_string_len=1024)
-    assert dec.next() is not None  # sequence start
-    assert dec.next() is not None  # the bounded string inside it
-    dec.schema_bounded()
-    assert dec.string() == BIG
+    child = Binding().string(1, at=0, maxlen=4194304)
+    b = Binding().sequence(9, child)
+    status, _dec, slots = bound(engine, enc.getvalue(), b, max_string_len=1024)
+    assert status is Status.COMPLETE
+    assert slots.objects[0] == BIG
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_schema_bounded_on_an_uncapped_field_is_a_no_op(engine):
-    enc = Encoder()
-    enc.write_string(1, "small")
-    dec = _dec(engine, enc.getvalue(), max_string_len=1024)
-    assert dec.next() is not None
-    dec.schema_bounded()
-    dec.schema_bounded()  # idempotent
-    assert dec.string() == "small"
-
-
-@pytest.mark.parametrize("engine", ENGINES)
-def test_schema_bounded_before_any_field_is_harmless(engine):
-    enc = Encoder()
-    enc.write_unsigned(1, 7)
-    dec = _dec(engine, enc.getvalue())
-    dec.schema_bounded()
-    assert dec.next() is not None
-    assert dec.unsigned() == 7
-
-
-# --- an UNDECLARED field is still capped -------------------------------------
-
-
-@pytest.mark.parametrize("engine", ENGINES)
-def test_undeclared_string_is_still_rejected(engine):
+def test_declaring_a_bound_with_no_cap_configured_changes_nothing(engine):
     enc = Encoder()
     enc.write_string(1, BIG)
-    dec = _dec(engine, enc.getvalue(), max_string_len=1024)
-    assert dec.next() is not None
-    with pytest.raises(SofaLimitError):
-        dec.string()
+    b = Binding().string(1, at=0, maxlen=4194304)
+    status, _dec, slots = bound(engine, enc.getvalue(), b)
+    assert status is Status.COMPLETE
+    assert slots.objects[0] == BIG
+
+
+# --- an undeclared field is still capped ------------------------------------
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_undeclared_blob_is_still_rejected(engine):
-    enc = Encoder()
-    enc.write_bytes(1, b"y" * 100)
-    dec = _dec(engine, enc.getvalue(), max_blob_len=10)
-    assert dec.next() is not None
-    with pytest.raises(SofaLimitError):
-        dec.bytes()
-
-
-@pytest.mark.parametrize("engine", ENGINES)
-def test_undeclared_array_is_still_rejected_on_every_array_kind(engine):
-    cases = [
-        (lambda e: e.write_unsigned_array(1, list(range(6))), lambda d: d.read_unsigned_array()),
-        (lambda e: e.write_signed_array(1, list(range(6))), lambda d: d.read_signed_array()),
-        (lambda e: e.write_float32_array(1, [1.0] * 6), lambda d: d.read_float32_array()),
-        (lambda e: e.write_float64_array(1, [1.0] * 6), lambda d: d.read_float64_array()),
-    ]
-    for write, read in cases:
-        enc = Encoder()
-        write(enc)
-        dec = _dec(engine, enc.getvalue(), max_array_count=5)
-        assert dec.next() is not None
-        with pytest.raises(SofaLimitError):
-            read(dec)
-
-
-@pytest.mark.parametrize("engine", ENGINES)
-def test_undeclared_field_is_rejected_when_skipped(engine):
-    # A skip still buffers the payload, so the cap protects it too: skip() and
-    # the auto-skip the following next() performs both reject the field.
-    enc = Encoder()
-    enc.write_bytes(1, b"z" * 100)
-    data = enc.getvalue()
-
-    dec = _dec(engine, data, max_blob_len=10)
-    assert dec.next() is not None
-    with pytest.raises(SofaLimitError):
-        dec.skip()
-
-    dec2 = _dec(engine, data, max_blob_len=10)
-    assert dec2.next() is not None
-    with pytest.raises(SofaLimitError):
-        dec2.next()
-
-
-@pytest.mark.parametrize("engine", ENGINES)
-def test_cap_is_decided_at_the_length_header_before_any_payload(engine):
-    # §6.2.1: enforced at the count/length header, before the allocation it is
-    # meant to prevent. A header claiming 100 elements with NO payload behind it
-    # is a limit rejection, not the truncation reading those elements would give.
-    dec = _dec(engine, [0x03] + _uvarint(100), max_array_count=10)
-    assert dec.next() is not None
-    with pytest.raises(SofaLimitError):
-        dec.read_unsigned_array()
-
-    # 0x02 = (0<<3)|FIXLEN; length header = (100 << 3) | 0x2 (STRING).
-    dec2 = _dec(engine, [0x02] + _uvarint((100 << 3) | 0x2), max_string_len=10)
-    assert dec2.next() is not None
-    with pytest.raises(SofaLimitError):
-        dec2.string()
-
-
-@pytest.mark.parametrize("engine", ENGINES)
-def test_declared_field_still_gets_its_ordinary_outcomes(engine):
-    # Declaring a field schema-bounded waives the CAP, nothing else: a truncated
-    # payload is still INCOMPLETE and malformed bytes are still INVALID.
-    dec = _dec(engine, [0x02] + _uvarint((100 << 3) | 0x2), max_string_len=10)
-    assert dec.next() is not None
-    dec.schema_bounded()
-    with pytest.raises(SofaIncompleteError):
-        dec.string()
-
-    bad = [0x02] + _uvarint((2 << 3) | 0x2) + [0xC3, 0x28]  # invalid UTF-8
-    dec2 = _dec(engine, bad, max_string_len=1)
-    assert dec2.next() is not None
-    dec2.schema_bounded()
-    with pytest.raises(SofaDecodeError):
-        dec2.string()
-
-
-@pytest.mark.parametrize("engine", ENGINES)
-def test_a_capped_field_read_as_the_wrong_type_reports_the_cap(engine):
-    # The field is being rejected either way, so the read that would consume it
-    # reports why it is rejected rather than which type it isn't.
+def test_an_undeclared_string_is_still_rejected(engine):
     enc = Encoder()
     enc.write_string(1, BIG)
-    dec = _dec(engine, enc.getvalue(), max_string_len=1024)
-    assert dec.next() is not None
+    b = Binding().string(1, at=0)  # bound, but with no maxlen declared
     with pytest.raises(SofaLimitError):
-        dec.read_unsigned_array()
+        bound(engine, enc.getvalue(), b, max_string_len=1024)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_fixlen_len_still_refuses_a_capped_array(engine):
-    # The peek answers for a fixlen field only: a capped ARRAY states a count,
-    # not a payload byte length, so it is the wrong shape for it either way — and
-    # it answers that the same way it does for an uncapped array, with the §7.3
-    # ``None``. The cap is not re-raised here: the peek reads and allocates
-    # nothing, which is why it answers through a parked rejection at all.
+def test_an_undeclared_blob_is_still_rejected(engine):
     enc = Encoder()
-    enc.write_unsigned_array(1, list(range(6)))
-    dec = _dec(engine, enc.getvalue(), max_array_count=5)
-    assert dec.next() is not None
-    assert dec.fixlen_len() is None
-
-
-# --- the schema bound is the caller's to enforce, as INVALID -----------------
+    enc.write_bytes(1, b"y" * 2000)
+    b = Binding().bytes(1, at=0)
+    with pytest.raises(SofaLimitError):
+        bound(engine, enc.getvalue(), b, max_blob_len=1024)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_fixlen_len_peeks_through_a_capped_field(engine):
-    # fixlen_len() is a pure peek — it allocates nothing — and it is how
-    # generated code enforces the SCHEMA maxlen (as INVALID, §7.1). It therefore
-    # answers whether or not the receiver cap has spoken on the field, so the
-    # schema bound can be decided first, in either order.
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda e: e.write_unsigned_array(1, list(range(6))),
+        lambda e: e.write_signed_array(1, [-1] * 6),
+        lambda e: e.write_float32_array(1, [1.5] * 6),
+        lambda e: e.write_float64_array(1, [1.5] * 6),
+    ],
+    ids=["unsigned", "signed", "fp32", "fp64"],
+)
+def test_an_unbound_array_is_still_rejected_on_every_array_kind(engine, write):
+    """A field the table does not name at all declares nothing, so the cap
+    governs it — even though nobody is going to read it."""
     enc = Encoder()
-    enc.write_string(1, BIG)
-    data = enc.getvalue()
-
-    dec = _dec(engine, data, max_string_len=1024)
-    assert dec.next() is not None
-    assert dec.fixlen_len() == 2000
-    dec.schema_bounded()
-    assert dec.fixlen_len() == 2000
-    assert dec.string() == BIG
+    write(enc)
+    with pytest.raises(SofaLimitError):
+        walk(engine, enc.getvalue(), max_array_count=5)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_over_schema_bound_is_invalid_not_limit_exceeded(engine):
-    # What generated code does for a `maxlen: 1024` field: declare it, then
-    # reject an over-bound length itself. The verdict is INVALID
-    # (SofaDecodeError), never the receiver cap's SofaLimitError (§6.3).
+def test_an_undeclared_field_is_rejected_even_when_declined(engine):
+    """Declining a field is a consume too: the walk still passes over the
+    payload the cap exists to refuse."""
     enc = Encoder()
     enc.write_string(1, BIG)
-    dec = _dec(engine, enc.getvalue(), max_string_len=512)
-    assert dec.next() is not None
-    dec.schema_bounded()
-    with pytest.raises(SofaDecodeError) as exc:
-        if dec.fixlen_len() > 1024:
-            raise SofaDecodeError("s: string byte length above schema maxlen 1024")
-        dec.string()
-    assert not isinstance(exc.value, SofaLimitError)
+    with pytest.raises(SofaLimitError):
+        walk(
+            engine, enc.getvalue(), max_string_len=1024,
+            recorder=Recorder(decline=lambda f: True),
+        )
+
+
+# --- the verdict is reached before any payload ------------------------------
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_the_cap_is_decided_at_the_header_before_any_payload(engine):
+    """A hostile message claiming a huge length with nothing behind it is
+    rejected by the cap, not reported as truncated: §6.2.1 wants the verdict on
+    the length word alone, before a byte of payload is buffered."""
+    # id 1, FIXLEN, length_header = (10_000_000 << 3) | STRING, then nothing.
+    data = bytes([0x0A] + _uvarint((10_000_000 << 3) | 0x2))
+    with pytest.raises(SofaLimitError) as exc:
+        walk(engine, data, max_string_len=1024)
+    assert not isinstance(exc.value, SofaIncompleteError)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_an_array_count_is_capped_before_its_elements(engine):
+    # id 1, ARRAY_UNSIGNED, count 2^31-1, then one lone byte.
+    data = bytes([0x0B] + _uvarint(0x7FFFFFFF) + [0x01])
+    with pytest.raises(SofaLimitError):
+        walk(engine, data, max_array_count=5)
+
+
+# --- past the DECLARED bound is INVALID, never LimitExceeded ----------------
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_over_the_declared_string_bound_is_invalid(engine):
+    """What generated code gets for a ``maxlen: 1024`` field: the binding
+    declares it, and an over-bound length is INVALID (§7.1) — never the receiver
+    cap's SofaLimitError (§6.3)."""
+    enc = Encoder()
+    enc.write_string(1, BIG)
+    b = Binding().string(1, at=0, maxlen=1024)
+    status, dec, slots = bound(engine, enc.getvalue(), b, max_string_len=512)
+    assert status is Status.INVALID
+    assert isinstance(dec.error, SofaDecodeError)
+    assert not isinstance(dec.error, SofaLimitError)
+    assert slots.objects[0] is None  # nothing was materialised
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_over_the_declared_array_bound_is_invalid(engine):
+    enc = Encoder()
+    enc.write_unsigned_array(1, list(range(64)))
+    b = Binding().unsigned_array(1, at=0, cap=8, count_at=200)
+    status, dec, slots = bound(engine, enc.getvalue(), b, max_array_count=4)
+    assert status is Status.INVALID
+    assert isinstance(dec.error, SofaDecodeError)
+    assert not isinstance(dec.error, SofaLimitError)
+    assert slots.u[0] == 0  # rejected at the count header, before an element
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_exactly_at_the_declared_bound_is_accepted(engine):
+    enc = Encoder()
+    enc.write_string(1, "z" * 64)
+    b = Binding().string(1, at=0, maxlen=64)
+    status, _dec, slots = bound(engine, enc.getvalue(), b, max_string_len=8)
+    assert status is Status.COMPLETE
+    assert slots.objects[0] == "z" * 64
+
+
+# --- a declared field still gets its ordinary outcomes ----------------------
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_declared_field_can_still_be_incomplete(engine):
+    """Lifting the cap does not make the field immune to truncation."""
+    enc = Encoder()
+    enc.write_string(1, BIG)
+    wire = enc.getvalue()
+    b = Binding().string(1, at=0, maxlen=4194304)
+    status, dec, slots = bound(engine, wire[: len(wire) // 2], b, max_string_len=1024)
+    assert status is Status.INCOMPLETE
+    assert dec.error is None
+    assert slots.objects[0] is None
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_declared_field_can_still_be_invalid_utf8(engine):
+    # id 1, FIXLEN STRING of length 2, payload 0xFF 0xFE.
+    data = bytes([0x0A, 0x12, 0xFF, 0xFE])
+    b = Binding().string(1, at=0, maxlen=4194304)
+    status, dec, _slots = bound(engine, data, b, max_string_len=1)
+    assert status is Status.INVALID
+    assert isinstance(dec.error, SofaDecodeError)
+    assert not isinstance(dec.error, SofaLimitError)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_capped_field_reports_the_cap_rather_than_the_mismatch(engine):
+    """§6.2.1 outranks §7.3: the skip §7.3 asks for still walks the payload the
+    cap exists to refuse, so the cap is what the message is rejected with."""
+    enc = Encoder()
+    enc.write_string(1, BIG)
+    b = Binding().unsigned_array(1, at=0, cap=8, count_at=200)  # wrong type
+    with pytest.raises(SofaLimitError):
+        bound(engine, enc.getvalue(), b, max_string_len=1024)
