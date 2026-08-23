@@ -163,7 +163,7 @@ class Decoder:
         self._max_array_count = max_array_count
         self._max_string_len = max_string_len
         self._max_blob_len = max_blob_len
-        self._buf = b""
+        self._buf: bytes | bytearray = b""
         self._pos = 0
         self._depth = 0
         self._cur: Field | None = None
@@ -328,7 +328,11 @@ class Decoder:
         if end > len(buf):
             raise self._suspend("truncated payload")
         self._pos = end
-        return buf[pos:end]
+        # One copy out of the buffer, and always a real ``bytes``: while a
+        # construct is being accumulated the buffer *is* a bytearray, and a
+        # slice of one would both be the wrong type and alias storage the next
+        # feed can move.
+        return bytes(memoryview(buf)[pos:end])
 
     def _skip_exact(self, n: int) -> None:
         """Consume the next ``n`` bytes without materialising them (§5.2: a skip
@@ -791,15 +795,29 @@ class Decoder:
             raise SofaRangeError("feed() is not re-entrant")
         if self._status is Status.INVALID:
             return Status.INVALID
-        chunk = data if isinstance(data, bytes) else bytes(data)
+        # Two shapes, because they want opposite things.
+        #
+        # Nothing carried — the whole previous feed was consumed, which is the
+        # one-shot case and the steady state of a chunked one — and the chunk is
+        # *adopted*: ``bytes`` is immutable, so there is nothing to copy.
+        #
+        # Something carried, i.e. a construct that could not complete: the
+        # buffer becomes a bytearray and the chunk is *appended*. A construct
+        # that cannot complete leaves ``_pos`` at 0 (the suspension rewinds it),
+        # so every following feed only extends, at amortised O(len(chunk)).
+        # Rebuilding ``carry + chunk`` instead would copy the whole carry per
+        # chunk — a 1 MB blob fed in 4 KiB pieces costs ~122 MB of copying that
+        # way.
         buf = self._buf
-        pos = self._pos
-        if pos:
-            buf = buf[pos:]
-        # ``bytes`` is immutable, so an empty carry lets the chunk be adopted
-        # whole rather than copied — the common case for a caller that reads
-        # into a fresh buffer each time.
-        self._buf = buf + chunk if buf else chunk
+        if self._pos >= len(buf):
+            self._buf = data if isinstance(data, bytes) else bytes(data)
+        else:
+            if not isinstance(buf, bytearray):
+                buf = bytearray(buf)
+                self._buf = buf
+            if self._pos:
+                del buf[: self._pos]
+            buf += data
         self._pos = 0
         self._keep = 0
         self._running = True

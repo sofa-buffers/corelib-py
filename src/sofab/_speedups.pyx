@@ -1776,7 +1776,11 @@ cdef class Decoder:
     cdef object _max_array_count
     cdef object _max_string_len
     cdef object _max_blob_len
-    cdef bytes _buf                 # owns the bytes the pointer indexes into
+    # Owns the storage the pointer indexes into. ``bytes`` while a chunk is
+    # being consumed whole (adopted, never copied); a ``bytearray`` while a
+    # construct is being accumulated across chunks (appended to, never
+    # rebuilt). See feed().
+    cdef object _buf
     # Owns a fixlen payload that had to be assembled across refills, for as long
     # as a pointer into it can still be in use (see _take_fixlen_ptr).
     cdef bytes _spill
@@ -1885,10 +1889,14 @@ cdef class Decoder:
             free(self._wview)
             self._wview = NULL
 
-    cdef inline void _rebind(self, bytes newbuf):
+    cdef inline void _rebind(self, object newbuf):
         self._buf = newbuf
-        self._p = <const unsigned char*>PyBytes_AS_STRING(newbuf)
-        self._n = PyBytes_GET_SIZE(newbuf)
+        if type(newbuf) is bytes:
+            self._p = <const unsigned char*>PyBytes_AS_STRING(newbuf)
+            self._n = PyBytes_GET_SIZE(newbuf)
+        else:
+            self._p = <const unsigned char*>PyByteArray_AS_STRING(newbuf)
+            self._n = PyByteArray_GET_SIZE(newbuf)
 
     # --- resume transactions (CORELIB_PLAN §5.2) ----------------------------
     #
@@ -1977,7 +1985,9 @@ cdef class Decoder:
         cdef bytes out
         if pos + n > self._n:
             raise self._suspend("truncated payload")
-        out = self._buf[pos:pos + n]
+        # Built from the pointer rather than sliced out of ``_buf``: one copy,
+        # and always a real ``bytes`` even while the buffer is a bytearray.
+        out = PyBytes_FromStringAndSize(<const char*>self._p + pos, n)
         self._pos = pos + n
         return out
 
@@ -2677,20 +2687,34 @@ cdef class Decoder:
         See :meth:`sofab.decoder.Decoder.feed` for the contract; this is the
         same call with the loop in C.
         """
-        cdef bytes chunk
-        cdef bytes buf
+        cdef object buf
         if self._running:
             raise SofaRangeError("feed() is not re-entrant")
         if self._status == <int>Status.INVALID:
             return Status.INVALID
-        chunk = data if type(data) is bytes else bytes(data)
+        # Two shapes, because they want opposite things.
+        #
+        # Nothing carried — the whole previous feed was consumed, which is the
+        # one-shot case and the steady state of a chunked one — and the chunk is
+        # ADOPTED: ``bytes`` is immutable, so there is nothing to copy. (§6's
+        # chunk-lifetime rule is what bytes(data) answers for every other input.)
+        #
+        # Something carried, i.e. a construct that could not complete: the buffer
+        # becomes a bytearray and the chunk is APPENDED. Such a construct leaves
+        # _pos at 0 (the suspension rewinds it), so every following feed only
+        # extends, at amortised O(len(chunk)). Rebuilding ``carry + chunk``
+        # instead would copy the whole carry per chunk — a 1 MB blob fed in
+        # 4 KiB pieces costs ~122 MB of copying that way.
         buf = self._buf
-        if self._pos:
-            buf = buf[self._pos:]
-        # ``bytes`` is immutable, so with no carry the chunk can be adopted
-        # rather than copied — and copying is exactly what §6's chunk-lifetime
-        # rule demands for every other input, which bytes(data) above does.
-        self._rebind(buf + chunk if PyBytes_GET_SIZE(buf) else chunk)
+        if self._pos >= self._n:
+            self._rebind(data if type(data) is bytes else bytes(data))
+        else:
+            if type(buf) is not bytearray:
+                buf = bytearray(buf)
+            if self._pos:
+                del buf[:self._pos]
+            buf += data
+            self._rebind(buf)      # += may have moved the storage
         self._pos = 0
         self._keep = 0
         self._running = True

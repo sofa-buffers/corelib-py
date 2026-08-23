@@ -101,9 +101,12 @@ def test_a_declined_payload_is_not_copied(Encoder: Any, Decoder: Any, build: Any
     wire = build(Encoder)
     control = _control(Decoder, wire)
     skipped = _measure(Decoder, wire, decline=True)
-    assert skipped < PAYLOAD // 8, (
-        f"declining allocated {skipped} bytes for a {PAYLOAD}-byte payload "
-        f"(materialising it allocates {control}) — the payload is being copied"
+    # Both runs buffer the message, so the buffer itself is in both numbers.
+    # What separates them is one payload: materialising costs it, declining
+    # does not.
+    assert control - skipped > PAYLOAD // 2, (
+        f"declining allocated {skipped} bytes and materialising {control} for a "
+        f"{PAYLOAD}-byte payload — the declined payload is being copied too"
     )
 
 
@@ -114,12 +117,14 @@ def test_an_unbound_payload_is_not_copied(Encoder: Any, Decoder: Any, build: Any
     nothing is built for bytes nobody asked for."""
     wire = build(Encoder)
     _control(Decoder, wire)
+    control = _control(Decoder, wire)
     b = Binding().unsigned(2, at=0, count_at=1)  # field 1, the payload, is unbound
     words = bytearray(b.tree_words_required * 8)
     dec = Decoder(binding=b, words=words)
     peak = _peak_bytes(lambda: dec.feed(wire))
-    assert peak < PAYLOAD // 8, (
-        f"an unbound payload allocated {peak} bytes for a {PAYLOAD}-byte payload"
+    assert control - peak > PAYLOAD // 2, (
+        f"an unbound payload allocated {peak} bytes against {control} for "
+        f"materialising a {PAYLOAD}-byte payload"
     )
 
 
