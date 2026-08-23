@@ -18,12 +18,11 @@ here is a conformance divergence the differential fuzzer would report.
 
 from __future__ import annotations
 
-import io
-
 import pytest
-from vectors import ChunkReader
+from vectors import Status, bound
 
 import sofab
+from sofab import Binding
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
 from sofab.types import SofaError, SofaLimitError, SofaRangeError
@@ -41,10 +40,11 @@ engine = pytest.mark.parametrize(
 )
 
 
-def _decoder(Decoder, build):
+def _feed(Decoder, build, binding, **kw):
+    """Encode ``build``, decode it against ``binding``; return ``(status, slots)``."""
     enc = PyEncoder()
     build(enc)
-    return Decoder(io.BytesIO(enc.getvalue()))
+    return bound(Decoder, enc.getvalue(), binding, **kw)[::2]
 
 
 # --- the taxonomy -----------------------------------------------------------
@@ -59,168 +59,136 @@ def test_no_invalid_usage_class_exists():
     assert not hasattr(sofab, "SofaStateError")
 
 
-# --- §7.3: every wrong-type read, on every wire kind ------------------------
+# --- §7.3: every contradicting binding, on every wire kind ------------------
+#
+# A binding declares each field's type. When the wire disagrees, §7.3 makes that
+# a *skip*, not an error: the field is dropped like an unknown id, its
+# destination is left exactly as the caller prepared it, and the decode stays
+# COMPLETE. Each row writes a field, binds it wrongly, and binds it rightly.
 
-# (write the field, read it with a contradicting type, read it correctly)
+_AT, _COUNT_AT, _OBJ = 0, 40, 0
+
+
+def _u(b):     return b.unsigned(1, at=_AT, count_at=_COUNT_AT)
+def _s(b):     return b.signed(1, at=_AT, count_at=_COUNT_AT)
+def _f32(b):   return b.float32(1, at=_AT, count_at=_COUNT_AT)
+def _f64(b):   return b.float64(1, at=_AT, count_at=_COUNT_AT)
+def _str(b):   return b.string(1, at=_OBJ, count_at=_COUNT_AT)
+def _blob(b):  return b.bytes(1, at=_OBJ, count_at=_COUNT_AT)
+def _ua(b):    return b.unsigned_array(1, at=_AT, cap=8, count_at=_COUNT_AT)
+def _sa(b):    return b.signed_array(1, at=_AT, cap=8, count_at=_COUNT_AT)
+def _f32a(b):  return b.float32_array(1, at=_AT, cap=8, count_at=_COUNT_AT)
+def _f64a(b):  return b.float64_array(1, at=_AT, cap=8, count_at=_COUNT_AT)
+
+
+def _read(slots, kind, n):
+    if kind in ("str", "blob"):
+        return slots.objects[_OBJ]
+    if kind == "u":
+        return slots.u[_AT]
+    if kind == "s":
+        return slots.q[_AT]
+    if kind in ("f32", "f64"):
+        return slots.d[_AT]
+    if kind in ("ua",):
+        return slots.arr_u(_AT, n)
+    if kind == "sa":
+        return slots.arr_q(_AT, n)
+    return slots.arr_d(_AT, n)
+
+
+# (label, write, wrong binder, right binder, right kind, expected value)
 _MISMATCHES = [
-    ("unsigned", lambda e: e.write_unsigned(1, 5), lambda d: d.signed(), lambda d: d.unsigned(), 5),
-    ("signed", lambda e: e.write_signed(1, -5), lambda d: d.unsigned(), lambda d: d.signed(), -5),
-    ("bool", lambda e: e.write_signed(1, -5), lambda d: d.bool(), lambda d: d.signed(), -5),
-    ("fp32", lambda e: e.write_float32(1, 1.5), lambda d: d.float64(), lambda d: d.float32(), 1.5),
-    ("fp64", lambda e: e.write_float64(1, 1.5), lambda d: d.float32(), lambda d: d.float64(), 1.5),
-    ("string", lambda e: e.write_string(1, "hi"), lambda d: d.bytes(), lambda d: d.string(), "hi"),
-    ("blob", lambda e: e.write_bytes(1, b"hi"), lambda d: d.string(), lambda d: d.bytes(), b"hi"),
-    ("string/scalar", lambda e: e.write_string(1, "hi"), lambda d: d.unsigned(), lambda d: d.string(), "hi"),
-    ("uarray", lambda e: e.write_unsigned_array(1, [1, 2]), lambda d: d.read_signed_array(), lambda d: d.read_unsigned_array(), [1, 2]),
-    ("iarray", lambda e: e.write_signed_array(1, [-1]), lambda d: d.read_unsigned_array(), lambda d: d.read_signed_array(), [-1]),
-    ("uarray/scalar", lambda e: e.write_unsigned_array(1, [1, 2]), lambda d: d.unsigned(), lambda d: d.read_unsigned_array(), [1, 2]),
-    ("fp32array", lambda e: e.write_float32_array(1, [1.5]), lambda d: d.read_float64_array(), lambda d: d.read_float32_array(), [1.5]),
-    ("fp64array", lambda e: e.write_float64_array(1, [1.5]), lambda d: d.read_float32_array(), lambda d: d.read_float64_array(), [1.5]),
-    ("fp32array/varray", lambda e: e.write_float32_array(1, [1.5]), lambda d: d.read_unsigned_array(), lambda d: d.read_float32_array(), [1.5]),
+    ("unsigned", lambda e: e.write_unsigned(1, 5), _s, _u, "u", 5),
+    ("signed", lambda e: e.write_signed(1, -5), _u, _s, "s", -5),
+    ("fp32", lambda e: e.write_float32(1, 1.5), _f64, _f32, "f32", 1.5),
+    ("fp64", lambda e: e.write_float64(1, 1.5), _f32, _f64, "f64", 1.5),
+    ("string", lambda e: e.write_string(1, "hi"), _blob, _str, "str", "hi"),
+    ("blob", lambda e: e.write_bytes(1, b"hi"), _str, _blob, "blob", b"hi"),
+    ("string/scalar", lambda e: e.write_string(1, "hi"), _u, _str, "str", "hi"),
+    ("uarray", lambda e: e.write_unsigned_array(1, [1, 2]), _sa, _ua, "ua", [1, 2]),
+    ("iarray", lambda e: e.write_signed_array(1, [-1]), _ua, _sa, "sa", [-1]),
+    ("uarray/scalar", lambda e: e.write_unsigned_array(1, [1, 2]), _u, _ua, "ua", [1, 2]),
+    ("fp32array", lambda e: e.write_float32_array(1, [1.5]), _f64a, _f32a, "f32a", [1.5]),
+    ("fp64array", lambda e: e.write_float64_array(1, [1.5]), _f32a, _f64a, "f64a", [1.5]),
+    ("fp32array/varray", lambda e: e.write_float32_array(1, [1.5]), _ua, _f32a, "f32a", [1.5]),
     # An *empty* fixlen array still carries its fixlen_word (§4.8), so its
-    # subtype is known and can contradict the read like any other field.
-    ("fp32array/empty", lambda e: e.write_float32_array(1, []), lambda d: d.read_float64_array(), lambda d: d.read_float32_array(), []),
+    # subtype is known and can contradict the binding like any other field.
+    ("fp32array/empty", lambda e: e.write_float32_array(1, []), _f64a, _f32a, "f32a", []),
 ]
 mismatch = pytest.mark.parametrize(
-    "write,wrong,right,value", [m[1:] for m in _MISMATCHES], ids=[m[0] for m in _MISMATCHES]
+    "write,wrong,right,kind,value",
+    [m[1:] for m in _MISMATCHES],
+    ids=[m[0] for m in _MISMATCHES],
 )
 
 
 @engine
 @mismatch
-def test_wrong_type_read_returns_none(Encoder, Decoder, write, wrong, right, value):
-    dec = _decoder(Decoder, write)
-    dec.next()
-    assert wrong(dec) is None
+def test_a_contradicting_binding_writes_nothing(Encoder, Decoder, write, wrong, right, kind, value):
+    status, slots = _feed(Decoder, write, wrong(Binding()))
+    assert status is Status.COMPLETE  # §7.3 is not an error
+    assert slots.u[_COUNT_AT] == 0    # the field never arrived, as far as it knows
 
 
 @engine
 @mismatch
-def test_wrong_type_read_consumes_nothing(Encoder, Decoder, write, wrong, right, value):
-    """The refusal leaves the value pending, so the field is still there — a
-    caller that knows better can read it with the type the wire carries."""
-    dec = _decoder(Decoder, write)
-    dec.next()
-    assert wrong(dec) is None
-    assert right(dec) == value
-    assert dec.next() is None
+def test_the_matching_binding_gets_the_value(Encoder, Decoder, write, wrong, right, kind, value):
+    status, slots = _feed(Decoder, write, right(Binding()))
+    assert status is Status.COMPLETE
+    n = slots.u[_COUNT_AT]
+    got = _read(slots, kind, n)
+    assert got == value if kind not in ("ua", "sa", "f32a", "f64a") else list(got) == list(value)
 
 
 @engine
 @mismatch
-def test_wrong_type_read_leaves_the_decode_complete(Encoder, Decoder, write, wrong, right, value):
-    """Ignoring the ``None`` is the §7.3 case proper: the field is skipped like
-    an unknown id by the next ``next()``, the fields around it decode normally,
-    and the stream ends at clean EOF rather than INVALID or INCOMPLETE."""
+def test_a_contradicting_binding_leaves_the_rest_intact(
+    Encoder, Decoder, write, wrong, right, kind, value
+):
+    """The field is skipped like an unknown id; the fields around it decode
+    normally and the stream ends at clean EOF, not INVALID or INCOMPLETE."""
 
     def build(e):
         write(e)
         e.write_unsigned(2, 7)
 
-    dec = _decoder(Decoder, build)
-    dec.next()
-    assert wrong(dec) is None
-    f = dec.next()  # skips the refused field
-    assert f is not None and f.id == 2
-    assert dec.unsigned() == 7
-    assert dec.next() is None
+    b = wrong(Binding()).unsigned(2, at=41, count_at=42)
+    status, slots = _feed(Decoder, build, b)
+    assert status is Status.COMPLETE
+    assert slots.u[_COUNT_AT] == 0
+    assert slots.u[41] == 7 and slots.u[42] == 1
 
 
 @engine
-@mismatch
-def test_wrong_type_read_can_be_skipped_explicitly(Encoder, Decoder, write, wrong, right, value):
-    dec = _decoder(Decoder, write)
-    dec.next()
-    assert wrong(dec) is None
-    dec.skip()  # the value is still pending, so skip() takes it
-    assert dec.next() is None
-
-
-@engine
-def test_wrong_type_read_inside_a_sequence(Encoder, Decoder):
-    """§7.3 applies at every nesting level, and the skipped field must not
-    disturb the sequence framing."""
+def test_a_contradicting_binding_inside_a_sequence(Encoder, Decoder):
+    """Same rule at depth: the id scope is the sequence's, and a mismatch there
+    is skipped without disturbing the walk out of it."""
 
     def build(e):
-        e.write_sequence_begin_lazy(1)
-        e.write_string(2, "hi")
-        e.write_unsigned(3, 9)
+        e.write_sequence_begin_lazy(9)
+        e.write_string(1, "hi")
+        e.write_unsigned(2, 4)
         e.write_sequence_end()
+        e.write_unsigned(3, 5)
 
-    dec = _decoder(Decoder, build)
-    dec.next()  # sequence start
-    f = dec.next()
-    assert f.id == 2
-    assert dec.float64() is None
-    f = dec.next()
-    assert f.id == 3
-    assert dec.unsigned() == 9
-    assert dec.next() is not None  # sequence end
-    assert dec.next() is None
+    child = Binding().unsigned(1, at=_AT, count_at=_COUNT_AT).unsigned(2, at=41, count_at=42)
+    b = Binding().sequence(9, child).unsigned(3, at=43, count_at=44)
+    status, slots = _feed(Decoder, build, b)
+    assert status is Status.COMPLETE
+    assert slots.u[_COUNT_AT] == 0     # field 1 is a string, the binding says unsigned
+    assert slots.u[41] == 4 and slots.u[42] == 1
+    assert slots.u[43] == 5 and slots.u[44] == 1
 
 
-@engine
-def test_fixlen_len_is_a_peek_that_answers_none(Encoder, Decoder):
-    dec = _decoder(Decoder, lambda e: e.write_string(1, "hello"))
-    dec.next()
-    assert dec.fixlen_len() == 5
-    assert dec.float32() is None  # a refused read does not disturb the peek
-    assert dec.fixlen_len() == 5
-    assert dec.string() == "hello"
-
-
-# --- §6.3: no pending value at all is the caller's mistake ------------------
-
-
-@engine
-def test_read_before_next_raises(Encoder, Decoder):
-    dec = _decoder(Decoder, lambda e: e.write_unsigned(1, 5))
-    with pytest.raises(SofaRangeError):
-        dec.unsigned()
-
-
-@engine
-def test_second_read_of_one_field_raises(Encoder, Decoder):
-    dec = _decoder(Decoder, lambda e: e.write_string(1, "hi"))
-    dec.next()
-    assert dec.string() == "hi"
-    with pytest.raises(SofaRangeError):
-        dec.string()
-    with pytest.raises(SofaRangeError):
-        dec.fixlen_len()
-
-
-@engine
-def test_read_on_a_sequence_frame_raises(Encoder, Decoder):
-    """A sequence start/end carries no value, so there is nothing pending for a
-    typed read to contradict — this is the caller-mistake half, not §7.3."""
-
-    def build(e):
-        e.write_sequence_begin_lazy(1)
-        e.write_unsigned(2, 5)
-        e.write_sequence_end_keep()
-
-    dec = _decoder(Decoder, build)
-    dec.next()  # sequence start
-    with pytest.raises(SofaRangeError):
-        dec.unsigned()
-    dec.next()
-    assert dec.unsigned() == 5
-    dec.next()  # sequence end
-    with pytest.raises(SofaRangeError):
-        dec.read_unsigned_array()
-
-
-@engine
-def test_read_at_eof_raises(Encoder, Decoder):
-    dec = _decoder(Decoder, lambda e: e.write_unsigned(1, 5))
-    dec.next()
-    assert dec.unsigned() == 5
-    assert dec.next() is None
-    with pytest.raises(SofaRangeError):
-        dec.bytes()
-    with pytest.raises(SofaRangeError):
-        dec.read_float32_array()
+# --- §6.3: the caller-mistake half ------------------------------------------
+#
+# "No value pending for this field" used to be reachable: a caller could issue a
+# typed read before the first next(), twice for one field, or on a sequence
+# frame. The decoder owns the reads now — a handler is *handed* values and never
+# asks for them — so that whole class of mistake is gone from the surface. What
+# is left of §6.3 InvalidArgument on the decode side is binding construction
+# (see test_binding) and the encode side below.
 
 
 # --- §6.3 on the encode side ------------------------------------------------
@@ -272,39 +240,40 @@ def test_array_shrank_mid_encode_is_invalid_argument():
 
 @engine
 def test_a_refused_read_does_not_disturb_a_chunk_fed_decode(Encoder, Decoder):
-    """§5.2: a read that answers `None` consumes nothing and suspends nothing —
-    the field stays whole for the retry, even when the payload is still arriving
-    one byte at a time."""
+    """§5.2: the §7.3 skip consumes the field cleanly and suspends nothing — the
+    walk carries on even while the payload is still arriving one byte at a
+    time."""
 
     def build(e):
         e.write_string(1, "hello world")
         e.write_unsigned(2, 7)
 
-    enc = PyEncoder()
-    build(enc)
-    dec = Decoder(ChunkReader(enc.getvalue(), chunk=1))
-    dec.next()
-    assert dec.float64() is None  # not an fp64 → §7.3, nothing consumed
-    assert dec.fixlen_len() == 11  # the peek still measures the same field
-    assert dec.string() == "hello world"
-    dec.next()
-    assert dec.unsigned() == 7
-    assert dec.next() is None
+    b = Binding().float64(1, at=_AT, count_at=_COUNT_AT).unsigned(2, at=41, count_at=42)
+    status, slots = _feed(Decoder, build, b, chunk=1)
+    assert status is Status.COMPLETE
+    assert slots.u[_COUNT_AT] == 0        # field 1 is a string, not an fp64
+    assert slots.u[41] == 7 and slots.u[42] == 1
 
 
 @engine
 def test_a_capped_field_reports_the_cap_rather_than_the_mismatch(Encoder, Decoder):
-    """§6.2.1 wins over §7.3 on a *consuming* read: the skip §7.3 asks for would
-    have to buffer the payload the cap exists to refuse, and the cap is a
-    terminal rejection of the message rather than an answer about one read.
-    (`fixlen_len` is the documented exception — it reads and allocates nothing,
-    so it answers `None`; see test_schema_bounded.py.)"""
+    """§6.2.1 wins over §7.3: the skip §7.3 asks for still has to walk the
+    payload the cap exists to refuse, and a cap rejection is terminal for the
+    message rather than an answer about one field. Declaring the bound in the
+    binding is what takes the cap off — and then §7.3 applies again."""
     enc = PyEncoder()
     enc.write_string(1, "x" * 64)
-    dec = Decoder(io.BytesIO(enc.getvalue()), max_string_len=8)
-    assert dec.next() is not None
+    wire = enc.getvalue()
+
+    # Bound as an array — the wrong type *and* over the configured cap.
+    capped = Binding().unsigned_array(1, at=_AT, cap=8, count_at=_COUNT_AT)
     with pytest.raises(SofaLimitError):
-        dec.read_unsigned_array()  # the wrong type *and* over the cap
-    dec.schema_bounded()  # the caller takes the cap off the field...
-    assert dec.read_unsigned_array() is None  # ... and now §7.3 answers
-    assert dec.string() == "x" * 64
+        bound(Decoder, wire, capped, max_string_len=8)
+
+    # Lifting the cap means declaring the field's own bound — which is only
+    # possible by naming its actual kind, so the two can never be combined:
+    # §6.2.1 is settled before §7.3 is ever asked.
+    declared = Binding().string(1, at=_OBJ, maxlen=64, count_at=_COUNT_AT)
+    status, _dec, slots = bound(Decoder, wire, declared, max_string_len=8)
+    assert status is Status.COMPLETE
+    assert slots.objects[_OBJ] == "x" * 64
