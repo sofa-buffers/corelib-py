@@ -340,30 +340,35 @@ class Decoder:
         if b < 0x80:  # one-byte fast path (ids, small counts, small values)
             self._pos = pos
             return b
+        # An overlong (>64-bit) varint is INVALID, not something to mask away on
+        # return (§4.1.3/§6.3, issue #43) -- but only the tenth byte can be the
+        # one to overflow. The first nine carry bits 0..62, so the check belongs
+        # on the tenth, where exactly one payload bit still fits, and not on
+        # every byte. An eleventh cannot follow: a byte that small is already a
+        # terminator. Same shape as the array reader's inner loop.
         result = b & 0x7F
         shift = 7
         n = self._n
-        while True:
+        while shift < 63:
             if pos >= n:
                 self._pos = pos
                 raise self._suspend("truncated varint")
             b = buf[pos]
             pos += 1
-            # Reject an overlong (>64-bit) varint before OR-ing: if this byte's
-            # 7 payload bits would spill past bit 63 they are unrepresentable in
-            # u64 and must be INVALID, not silently masked away on return
-            # (§4.1/§6.3, issue #43). ``room`` is the bits left below 64; only
-            # when fewer than 7 remain can a payload bit overflow.
-            room = 64 - shift
-            if room < 7 and (b & 0x7F) >> room:
-                raise SofaDecodeError("overlong varint")
             result |= (b & 0x7F) << shift
             if b < 0x80:
                 self._pos = pos
-                return result & MASK64
+                return result
             shift += 7
-            if shift >= 64:
-                raise SofaDecodeError("overlong varint")
+        if pos >= n:
+            self._pos = pos
+            raise self._suspend("truncated varint")
+        b = buf[pos]
+        pos += 1
+        if b > 0x01:
+            raise SofaDecodeError("overlong varint")
+        self._pos = pos
+        return result | (b << 63)
 
     def _read_exact(self, n: int) -> bytes:
         """Return the next ``n`` bytes. Fast path is a single buffer slice; the
