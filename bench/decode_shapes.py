@@ -47,8 +47,8 @@ alone is 87 937 of ``pull``'s 160 941 Ir, so at equal dispatch ``pull``
 (``pull_cheap``, 73 004) is 1.6x *faster* than ``feed_visitor`` (114 800) —
 while compared as written ``feed_visitor`` looks 1.4x better. Only
 ``feed_bound`` is structurally ahead, because there the field-to-destination
-resolution happens in C and no dispatch reaches Python at all. This was got wrong once already (PR #110's table), which is why these two
-extra rows exist.
+resolution happens in C and no dispatch reaches Python at all. This was got
+wrong once already (PR #110's table), which is why these two extra rows exist.
 
 Usage:
     python bench/decode_shapes.py <driver> [reps]     # for run_shapes_callgrind.sh
