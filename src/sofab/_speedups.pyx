@@ -2231,8 +2231,10 @@ cdef class Decoder:
             if self._depth != 0:
                 raise self._suspend("truncated: unbalanced sequence")
             self._cur_wtype = -1
-            if want_field:
-                self._cur = None
+            # ``_cur`` deliberately keeps the last field: `field` is documented
+            # as "the most recently returned Field", and the pure engine holds it
+            # past EOF too. §5.3 wants the accelerator invisible, and that
+            # includes this.
             return -1
 
         header = self._varint()
@@ -2498,6 +2500,12 @@ cdef class Decoder:
                 raise
             finally:
                 self._floor = -1
+            # The walk asked for no Field objects, so ``_cur`` still names the
+            # sequence that was just consumed. Publish the end marker the walk
+            # stopped on, exactly as a Field-building walk would have left it —
+            # `field` is part of the public surface and the pure engine leaves
+            # the same thing behind (§5.3). One object per skip, not per field.
+            self._cur = _mkfield(_ZERO, _WT[_WT_SEQUENCE_END], _ZERO, _ZERO, _NONE)
             return 0
         if self._pk != _PEND_NONE:
             self._skip_pending()
