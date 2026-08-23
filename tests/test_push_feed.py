@@ -298,7 +298,7 @@ def test_a_receiver_cap_is_raised_not_folded_into_invalid(enc_cls, dec_cls):
     enc = enc_cls()
     enc.write_unsigned_array(1, [1, 2, 3, 4, 5])
     enc.flush()
-    dec = dec_cls(visitor=Collect(), max_array_count=2)
+    dec = dec_cls(visitor=Collect(), max_dyn_array_count=2)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
 
@@ -315,7 +315,7 @@ def test_a_declared_bound_takes_the_receiver_cap_off_the_field(enc_cls, dec_cls)
     msg = enc.getvalue()
     b = Binding().unsigned_array(1, at=0, cap=8, count_at=8)
     words = bytearray(b.tree_words_required * 8)
-    assert dec_cls(binding=b, words=words, max_array_count=2).feed(msg) is Status.COMPLETE
+    assert dec_cls(binding=b, words=words, max_dyn_array_count=2).feed(msg) is Status.COMPLETE
 
     tight = Binding().unsigned_array(1, at=0, cap=3, count_at=8)
     dec = dec_cls(binding=tight, words=bytearray(tight.tree_words_required * 8))

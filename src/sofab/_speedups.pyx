@@ -636,6 +636,8 @@ cdef object _BASE_ON_FIELD = _Visitor.on_field
 cdef object _BASE_ON_SEQUENCE_BEGIN = _Visitor.on_sequence_begin
 cdef object _BASE_ON_ARRAY_BEGIN = _Visitor.on_array_begin
 cdef object _BASE_ON_BLOB_BEGIN = _Visitor.on_blob_begin
+cdef object _ARRAY_MAX_OBJ = _ARRAY_MAX
+cdef object _FIXLEN_MAX_OBJ = _FIXLEN_MAX
 cdef object _INT64_MAX_OBJ = INT64_MAX
 cdef tuple _ST = tuple(FixlenSubtype)
 
@@ -1787,9 +1789,9 @@ cdef class Decoder:
     # and without this the header walk touches a Python attribute per string,
     # blob and array field only to find None there.
     cdef bint _capped
-    cdef object _max_array_count
-    cdef object _max_string_len
-    cdef object _max_blob_len
+    cdef object _max_dyn_array_count
+    cdef object _max_dyn_string_len
+    cdef object _max_dyn_blob_len
     # Owns the storage the pointer indexes into. ``bytes`` while a chunk is
     # being consumed whole (adopted, never copied); a ``bytearray`` while a
     # construct is being accumulated across chunks (appended to, never
@@ -1863,7 +1865,9 @@ cdef class Decoder:
     cdef bint _running
 
     def __cinit__(self, *, binding=None, visitor=None, words=None, objects=None,
-                  max_array_count=None, max_string_len=None, max_blob_len=None,
+                  max_dyn_array_count=_ARRAY_MAX_OBJ,
+                  max_dyn_string_len=_FIXLEN_MAX_OBJ,
+                  max_dyn_blob_len=_FIXLEN_MAX_OBJ,
                   reassembly=None):
         self._tables = None
         self._bent = NULL
@@ -1909,11 +1913,24 @@ cdef class Decoder:
             self._btab = self._tables.btab
             self._bind_words(words, objects)
             self._tab = 0
-        self._capped = (max_array_count is not None or max_string_len is not None
-                        or max_blob_len is not None)
-        self._max_array_count = max_array_count
-        self._max_string_len = max_string_len
-        self._max_blob_len = max_blob_len
+        # §6.2.1: no unset state and no unlimited mode. None is refused rather
+        # than read as "no limit"; the defaults are the format ceilings above
+        # which the value is already INVALID, which is the widest a limit can be
+        # while still being one. See the pure engine for the full note.
+        for _lname, _lval, _lceil in (
+                ("max_dyn_array_count", max_dyn_array_count, _ARRAY_MAX_OBJ),
+                ("max_dyn_string_len", max_dyn_string_len, _FIXLEN_MAX_OBJ),
+                ("max_dyn_blob_len", max_dyn_blob_len, _FIXLEN_MAX_OBJ)):
+            if _lval is None:
+                raise SofaRangeError("%s has no unset state (§6.2.1)" % _lname)
+            if _lval < 0 or _lval > _lceil:
+                raise SofaRangeError("%s=%s is outside 0..%s" % (_lname, _lval, _lceil))
+        self._capped = (max_dyn_array_count < _ARRAY_MAX_OBJ
+                        or max_dyn_string_len < _FIXLEN_MAX_OBJ
+                        or max_dyn_blob_len < _FIXLEN_MAX_OBJ)
+        self._max_dyn_array_count = max_dyn_array_count
+        self._max_dyn_string_len = max_dyn_string_len
+        self._max_dyn_blob_len = max_dyn_blob_len
         self._buf = b""
         self._p = <const unsigned char*>PyBytes_AS_STRING(self._buf)
         self._n = 0
@@ -2239,9 +2256,9 @@ cdef class Decoder:
             cap = _NONE
             if self._capped:
                 if subtype == _ST_STRING:
-                    cap = self._max_string_len
+                    cap = self._max_dyn_string_len
                 elif subtype == _ST_BLOB:
-                    cap = self._max_blob_len
+                    cap = self._max_dyn_blob_len
             if want_field or cap is not None:
                 # One boxed length, reused: it is the Field's ``size`` and the
                 # value a configured cap is compared against and named in its
@@ -2253,10 +2270,10 @@ cdef class Decoder:
                                          _WT[_WT_FIXLEN], boxed, _ZERO, _ST[subtype])
                 if cap is not None and boxed > cap:
                     if subtype == _ST_STRING:
-                        self._park_limit("string length %d exceeds max_string_len %s"
+                        self._park_limit("string length %d exceeds max_dyn_string_len %s"
                                          % (boxed, cap))
                     else:
-                        self._park_limit("blob length %d exceeds max_blob_len %s"
+                        self._park_limit("blob length %d exceeds max_dyn_blob_len %s"
                                          % (boxed, cap))
             return wtype
 
@@ -2292,15 +2309,15 @@ cdef class Decoder:
             self._pk = _PEND_VARRAY
             self._pend_wtype = wtype
             self._pend_count = count
-            cap = self._max_array_count if self._capped else _NONE
-            if want_field or cap is not None:
+            cap = self._max_dyn_array_count if self._capped else _NONE
+            if want_field or cap is not _NONE:
                 boxed = PyLong_FromUnsignedLongLong(count)   # see the fixlen branch
                 if want_field:
                     self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
                                          _WT[wtype], _ZERO, boxed, _NONE)
                 # Parked, not raised — see the fixlen branch above (§6.2.1).
                 if cap is not None and boxed > cap:
-                    self._park_limit("array count %d exceeds max_array_count %s" % (boxed, cap))
+                    self._park_limit("array count %d exceeds max_dyn_array_count %s" % (boxed, cap))
             return wtype
 
         # wtype == _WT_ARRAY_FIXLEN
@@ -2329,8 +2346,8 @@ cdef class Decoder:
         self._pend_subtype = subtype
         self._pend_count = count
         self._pend_size = elem_size
-        cap = self._max_array_count if self._capped else _NONE
-        if want_field or cap is not None:
+        cap = self._max_dyn_array_count if self._capped else _NONE
+        if want_field or cap is not _NONE:
             boxed = PyLong_FromUnsignedLongLong(count)      # see the fixlen branch
             if want_field:
                 self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
@@ -2339,7 +2356,7 @@ cdef class Decoder:
                                      _ST[subtype])
             # Parked, not raised — see the fixlen branch above (§6.2.1).
             if cap is not None and boxed > cap:
-                self._park_limit("array count %d exceeds max_array_count %s" % (boxed, cap))
+                self._park_limit("array count %d exceeds max_dyn_array_count %s" % (boxed, cap))
         return wtype
 
     # --- receiver caps vs. schema bounds (§6.2.1) ---------------------------

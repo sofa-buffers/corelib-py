@@ -475,7 +475,7 @@ def test_fixlen_array_payload_beyond_the_address_space_is_truncated(monkeypatch)
 
 
 def test_max_array_count_rejects_oversize_before_alloc():
-    # Part B acceptance: with max_array_count=65536 an otherwise-valid message
+    # Part B acceptance: with max_dyn_array_count=65536 an otherwise-valid message
     # carrying a 65537-element dynamic array is rejected with SofaLimitError on
     # the strength of its count header alone — no element is decoded and no list
     # is allocated. The verdict is reached inside next(); it is RAISED by the
@@ -487,7 +487,7 @@ def test_max_array_count_rejects_oversize_before_alloc():
     data = enc.getvalue()
 
     with pytest.raises(SofaLimitError):
-        verdict(Decoder, bytes(data), max_array_count=65536)
+        verdict(Decoder, bytes(data), max_dyn_array_count=65536)
 
     f, ev = pairs(Decoder, data)[0]
     assert f.count == 65537
@@ -501,21 +501,21 @@ def test_max_array_count_fires_before_any_payload():
     # runs before allocation/buffering.
     data = [0x03] + _uvarint(100)  # ARRAY_UNSIGNED, count 100, no elements
     with pytest.raises(SofaLimitError):
-        verdict(Decoder, bytes(data), max_array_count=10)
+        verdict(Decoder, bytes(data), max_dyn_array_count=10)
 
 
 def test_max_array_count_boundary_is_inclusive():
-    # count == max_array_count is allowed; count == max + 1 is rejected.
+    # count == max_dyn_array_count is allowed; count == max + 1 is rejected.
     ok = Encoder()
     ok.write_unsigned_array(0, list(range(8)))
-    f, ev = pairs(Decoder, ok.getvalue(), max_array_count=8)[0]
+    f, ev = pairs(Decoder, ok.getvalue(), max_dyn_array_count=8)[0]
     assert f.count == 8
     assert ev[2] == tuple(range(8))
 
     over = Encoder()
     over.write_unsigned_array(0, list(range(9)))
     with pytest.raises(SofaLimitError):
-        verdict(Decoder, bytes(over.getvalue()), max_array_count=8)
+        verdict(Decoder, bytes(over.getvalue()), max_dyn_array_count=8)
 
 
 def test_max_array_count_applies_to_all_array_kinds():
@@ -532,19 +532,19 @@ def test_max_array_count_applies_to_all_array_kinds():
         # is exactly what the cap protects, so it is rejected all the same.
         with pytest.raises(SofaLimitError):
             verdict(
-                Decoder, enc.getvalue(), max_array_count=5,
+                Decoder, enc.getvalue(), max_dyn_array_count=5,
                 recorder=Recorder(decline=lambda f: True),
             )
 
 
 def test_max_string_len_fires_before_payload():
     # A fixlen STRING header claiming length 100 with NO payload bytes is
-    # rejected by max_string_len on its length word, before the payload is
+    # rejected by max_dyn_string_len on its length word, before the payload is
     # read/buffered — the read never gets as far as reporting the truncation.
     # 0x02 = (0<<3)|FIXLEN; length_header = (100 << 3) | 0x2 (STRING).
     data = [0x02] + _uvarint((100 << 3) | 0x2)
     with pytest.raises(SofaLimitError):
-        verdict(Decoder, bytes(data), max_string_len=10)
+        verdict(Decoder, bytes(data), max_dyn_string_len=10)
 
 
 def test_max_string_len_valid_message_roundtrips_without_limit():
@@ -553,13 +553,13 @@ def test_max_string_len_valid_message_roundtrips_without_limit():
     data = enc.getvalue()
 
     with pytest.raises(SofaLimitError):
-        verdict(Decoder, bytes(data), max_string_len=64)
+        verdict(Decoder, bytes(data), max_dyn_string_len=64)
 
     assert values(Decoder, data) == [("str", 3, "x" * 100)]
 
     within = Encoder()
     within.write_string(3, "y" * 64)  # exactly at the limit: allowed
-    assert values(Decoder, within.getvalue(), max_string_len=64) == [
+    assert values(Decoder, within.getvalue(), max_dyn_string_len=64) == [
         ("str", 3, "y" * 64)
     ]
 
@@ -570,21 +570,21 @@ def test_max_blob_len_rejects_oversize():
     data = enc.getvalue()
 
     with pytest.raises(SofaLimitError):
-        verdict(Decoder, bytes(data), max_blob_len=16)
+        verdict(Decoder, bytes(data), max_dyn_blob_len=16)
 
     assert values(Decoder, data)[0][2] == b"\x00" * 100
 
 
 def test_limits_are_independent_per_kind():
     # Each limit governs only its own field kind: a blob is not bound by
-    # max_string_len, nor a string by max_blob_len.
+    # max_dyn_string_len, nor a string by max_dyn_blob_len.
     blob = Encoder()
     blob.write_bytes(1, b"z" * 100)
-    assert values(Decoder, blob.getvalue(), max_string_len=1)[0][2] == b"z" * 100
+    assert values(Decoder, blob.getvalue(), max_dyn_string_len=1)[0][2] == b"z" * 100
 
     text = Encoder()
     text.write_string(1, "z" * 100)
-    assert values(Decoder, text.getvalue(), max_blob_len=1)[0][2] == "z" * 100
+    assert values(Decoder, text.getvalue(), max_dyn_blob_len=1)[0][2] == "z" * 100
 
 
 def test_limit_error_is_not_a_decode_or_incomplete_error():
@@ -595,7 +595,7 @@ def test_limit_error_is_not_a_decode_or_incomplete_error():
     data = enc.getvalue()
 
     with pytest.raises(SofaLimitError) as exc:
-        verdict(Decoder, bytes(data), max_array_count=2)
+        verdict(Decoder, bytes(data), max_dyn_array_count=2)
     assert isinstance(exc.value, SofaError)
     assert not isinstance(exc.value, SofaDecodeError)
     assert not isinstance(exc.value, SofaIncompleteError)
@@ -603,7 +603,7 @@ def test_limit_error_is_not_a_decode_or_incomplete_error():
     # `except SofaDecodeError` genuinely does not intercept it.
     with pytest.raises(SofaLimitError):
         try:
-            verdict(Decoder, data, max_array_count=2)
+            verdict(Decoder, data, max_dyn_array_count=2)
         except SofaDecodeError:  # pragma: no cover - must not be taken
             pytest.fail("SofaLimitError must not be caught as SofaDecodeError")
 

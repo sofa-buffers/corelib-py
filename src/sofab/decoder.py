@@ -194,9 +194,9 @@ class Decoder:
         "_depth",
         "_error",
         "_keep",
-        "_max_array_count",
-        "_max_blob_len",
-        "_max_string_len",
+        "_max_dyn_array_count",
+        "_max_dyn_blob_len",
+        "_max_dyn_string_len",
         "_n",
         "_objects",
         "_pending",
@@ -226,9 +226,9 @@ class Decoder:
         visitor: Visitor | None = None,
         words: Any = None,
         objects: list[Any] | None = None,
-        max_array_count: int | None = None,
-        max_string_len: int | None = None,
-        max_blob_len: int | None = None,
+        max_dyn_array_count: int = ARRAY_MAX,
+        max_dyn_string_len: int = FIXLEN_MAX,
+        max_dyn_blob_len: int = FIXLEN_MAX,
         reassembly: Any = None,
     ) -> None:
         """Build a push decoder around a field handler (CORELIB_PLAN §5.2).
@@ -247,31 +247,50 @@ class Decoder:
         entries. The decoder allocates neither and never sizes either from the
         wire.
 
-        ``max_array_count`` / ``max_string_len`` / ``max_blob_len`` are optional
-        **receiver-side** decode limits on fields the schema leaves unbounded: a
-        field whose wire-declared count or length exceeds the cap is rejected
-        with :class:`SofaLimitError`. The verdict is reached at the count/length
-        header — before any allocation or payload buffering, so a hostile claim
-        fails even if the payload never arrives. ``None`` (the default) means "no
-        limit". They never apply to a field a binding declares a bound for: that
+        ``max_dyn_array_count`` / ``max_dyn_string_len`` / ``max_dyn_blob_len`` are the
+        **receiver-side** limits of §6.2.1, on the fields the schema leaves
+        unbounded: a field whose wire-declared count or length exceeds one is
+        rejected with :class:`SofaLimitError`. The verdict is reached at the
+        count/length header — before any allocation or payload buffering, so a
+        hostile claim fails even if the payload never arrives.
+
+        **There is no unset state and no unlimited mode** (§6.2.1): "unbounded by
+        the schema" is still bounded by the receiver. ``None`` is refused rather
+        than read as "no limit", and each defaults to the format-wide ceiling
+        above which the value is already INVALID (§6.2) — the widest a limit can
+        be while still being one. The numbers themselves belong to generated
+        code, which knows the schema and the deployment; the codec neither
+        invents a policy of its own nor clamps to one.
+
+        They never apply to a field a binding declares a bound for: that
         declaration *is* the schema bound, and exceeding it is INVALID rather
         than a policy rejection (§6.2.1).
         """
         if binding is None and visitor is None:
             raise SofaRangeError("a decoder needs a field handler (binding / visitor)")
-        self._max_array_count = max_array_count
-        self._max_string_len = max_string_len
-        self._max_blob_len = max_blob_len
-        # Whether any receiver cap is configured at all. All three default to
-        # off, and the header walk otherwise pays two or three steps per field
-        # to rediscover that — a subtype test, an attribute load and a None
-        # test — for every string, blob and array it passes. One test here skips
-        # all of it; a decoder that does configure a cap falls through to the
-        # full check unchanged.
+        for name, value, ceiling in (
+            ("max_dyn_array_count", max_dyn_array_count, ARRAY_MAX),
+            ("max_dyn_string_len", max_dyn_string_len, FIXLEN_MAX),
+            ("max_dyn_blob_len", max_dyn_blob_len, FIXLEN_MAX),
+        ):
+            if value is None:
+                raise SofaRangeError(f"{name} has no unset state (§6.2.1)")
+            if value < 0 or value > ceiling:
+                raise SofaRangeError(
+                    f"{name}={value} is outside 0..{ceiling}"
+                )
+        self._max_dyn_array_count = max_dyn_array_count
+        self._max_dyn_string_len = max_dyn_string_len
+        self._max_dyn_blob_len = max_dyn_blob_len
+        # Whether any limit is tighter than the ceiling the format already
+        # enforces. At the ceiling a limit cannot fire — a longer value is
+        # INVALID before the check is reached — so the header walk can skip the
+        # whole block, which otherwise costs a subtype test, an attribute load
+        # and a comparison for every string, blob and array it passes.
         self._capped = (
-            max_array_count is not None
-            or max_string_len is not None
-            or max_blob_len is not None
+            max_dyn_array_count < ARRAY_MAX
+            or max_dyn_string_len < FIXLEN_MAX
+            or max_dyn_blob_len < FIXLEN_MAX
         )
         # The caller's reassembly buffer, and the span of it currently holding a
         # construct that spans a chunk boundary. Optional: without one the
@@ -789,19 +808,19 @@ class Decoder:
             # schema-bounded and take the cap off it (:meth:`schema_bounded`).
             if self._capped:
                 if subtype == _ST_STRING:
-                    cap = self._max_string_len
-                    if cap is not None and length > cap:
+                    cap = self._max_dyn_string_len
+                    if length > cap:
                         pending = (
                             _LIMIT,
-                            f"string length {length} exceeds max_string_len {cap}",
+                            f"string length {length} exceeds max_dyn_string_len {cap}",
                             pending,
                         )
                 elif subtype == _ST_BLOB:
-                    cap = self._max_blob_len
-                    if cap is not None and length > cap:
+                    cap = self._max_dyn_blob_len
+                    if length > cap:
                         pending = (
                             _LIMIT,
-                            f"blob length {length} exceeds max_blob_len {cap}",
+                            f"blob length {length} exceeds max_dyn_blob_len {cap}",
                             pending,
                         )
             self._pending = pending
@@ -837,9 +856,13 @@ class Decoder:
                 self._cur = Field(field_id, _WT[wtype], count=count)
             pending = (_VARRAY, wtype, count)
             # Parked, not raised — see the fixlen branch above (§6.2.1).
-            cap = self._max_array_count if self._capped else None
-            if cap is not None and count > cap:
-                pending = (_LIMIT, f"array count {count} exceeds max_array_count {cap}", pending)
+            if self._capped and count > self._max_dyn_array_count:
+                cap = self._max_dyn_array_count
+                pending = (
+                    _LIMIT,
+                    f"array count {count} exceeds max_dyn_array_count {cap}",
+                    pending,
+                )
             self._pending = pending
             return wtype
 
@@ -877,9 +900,9 @@ class Decoder:
         self._cur_subtype = subtype
         pending = (_FARRAY, subtype, count, elem_size)
         # Parked, not raised — see the fixlen branch above (§6.2.1).
-        cap = self._max_array_count if self._capped else None
-        if cap is not None and count > cap:
-            pending = (_LIMIT, f"array count {count} exceeds max_array_count {cap}", pending)
+        if self._capped and count > self._max_dyn_array_count:
+            cap = self._max_dyn_array_count
+            pending = (_LIMIT, f"array count {count} exceeds max_dyn_array_count {cap}", pending)
         self._pending = pending
         return wtype
 

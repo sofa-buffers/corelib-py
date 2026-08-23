@@ -149,8 +149,8 @@ class SofaIncompleteError(SofaError):
 
 class SofaLimitError(SofaError):
     """A wire-declared array count or fixlen (string/blob) length exceeded a
-    **receiver-configured** decode limit (``Decoder(max_array_count=…,
-    max_string_len=…, max_blob_len=…)``).
+    **receiver-configured** decode limit (``Decoder(max_dyn_array_count=…,
+    max_dyn_string_len=…, max_dyn_blob_len=…)``).
 
     This is a *policy* rejection, not wire malformation: the bytes are perfectly
     well-formed and would decode fine with the limit unset — the receiver simply
