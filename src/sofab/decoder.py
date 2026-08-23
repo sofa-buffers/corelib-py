@@ -470,8 +470,10 @@ class Decoder:
         buf = self._buf
         pos = self._pos
         n = self._n
-        i = 0
-        while i < count:
+        # ``for``, not a hand-rolled counter: range() advances the index in the
+        # interpreter's own loop instead of costing a compare and an add per
+        # element.
+        for i in range(count):
             if pos >= n:
                 self._pos = pos
                 raise self._suspend("truncated varint")
@@ -486,33 +488,44 @@ class Decoder:
                     into[base + i] = (b >> 1) ^ -(b & 1) if zigzag else b
                 else:
                     append(b)
-                i += 1
                 continue
-            result = b & 0x7F
-            shift = 7
-            while True:
-                if pos >= n:
-                    self._pos = pos
-                    raise self._suspend("truncated varint")
-                b = buf[pos]
-                pos += 1
-                # An element value is a varint like any other, so the 64-bit
-                # bound of §4.1 applies to it: if this byte's payload bits would
-                # land at bit >= 64 they are unrepresentable and the encoding is
-                # INVALID — masking them off on return would silently corrupt
-                # the value instead (issue #64). Same guard, same wording as
-                # ``_varint`` above; this loop inlines the codec for speed and
-                # so has to carry it itself. ``room`` is the bits left below 64.
-                room = 64 - shift
-                if room < 7 and (b & 0x7F) >> room:
-                    raise SofaDecodeError("overlong varint")
-                result |= (b & 0x7F) << shift
-                if b < 0x80:
-                    break
-                shift += 7
-                if shift >= 64:
-                    raise SofaDecodeError("overlong varint")
-            result &= MASK64
+            # A multi-byte element. The 64-bit bound of §4.1 applies to it like
+            # to any other varint: payload bits landing at bit >= 64 are
+            # unrepresentable and the encoding is INVALID, and masking them off
+            # on return would silently corrupt the value instead (issue #64).
+            #
+            # Both of the tests that enforce it are out of the loop. A u64 fills
+            # its first nine bytes with bits 0..62, so no byte before the tenth
+            # can overflow, and the tenth carries only bit 63 — one payload bit,
+            # which is what the `> 0x01` below tests. An eleventh byte cannot
+            # follow, because a value that small is already a terminator.
+            #
+            # The per-byte bounds test is out of the loop too, on the outer test
+            # that ten bytes are buffered — a varint is at most ten bytes, so
+            # inside that window no read can run off the end. When fewer remain,
+            # _varint takes the element and suspends properly if it is truncated.
+            if n - pos >= 9:
+                result = b & 0x7F
+                shift = 7
+                while shift < 63:
+                    b = buf[pos]
+                    pos += 1
+                    result |= (b & 0x7F) << shift
+                    if b < 0x80:
+                        break
+                    shift += 7
+                else:
+                    b = buf[pos]
+                    pos += 1
+                    if b > 0x01:
+                        raise SofaDecodeError("overlong varint")
+                    result |= b << 63
+            else:
+                self._pos = pos - 1  # replay this element from its first byte
+                result = self._varint()
+                buf = self._buf
+                pos = self._pos
+                n = self._n
             if bounded:
                 x = (result >> 1) ^ -(result & 1) if zigzag else result
                 if x < blo or x > bhi:
@@ -521,7 +534,6 @@ class Decoder:
                 into[base + i] = (result >> 1) ^ -(result & 1) if zigzag else result
             else:
                 append(result)
-            i += 1
         self._pos = pos
         return out
 
