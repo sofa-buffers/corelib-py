@@ -2143,6 +2143,11 @@ cdef class Decoder:
 
         if self._pk != _PEND_NONE:
             self._skip_pending()
+            # The auto-skip committed, so it must not be replayed: re-open the
+            # transaction *after* it. Without this, a suspension later in this
+            # same call rewinds to before the skipped value and the retry reads
+            # those bytes as a new field. See the pure engine for the long note.
+            self._arm()
 
         if self._pos >= self._n and not self._need(1):
             if self._depth != 0:

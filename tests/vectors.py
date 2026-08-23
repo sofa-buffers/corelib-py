@@ -17,7 +17,15 @@ from typing import Callable
 
 import pytest
 
-from sofab import Binding, Encoder, Field, SofaIncompleteError, Status, Visitor
+from sofab import (
+    Binding,
+    Encoder,
+    Field,
+    SofaIncompleteError,
+    Status,
+    Visitor,
+    WireType,
+)
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
 
@@ -29,6 +37,7 @@ __all__ = [
     "DBL_MAX", "DECODER_ENGINES", "ENCODER_ENGINES", "ENGINE_PAIRS", "FLT_MAX",
     "FP64_FROM_FLOAT", "FULL_SCALE_EXPECTED", "VECTORS", "VECTOR_DOC",
     "Binding", "Recorder", "Slots", "Status",
+    "WireType",
     "bound", "build_full_scale", "encode", "pairs", "raise_for", "uvarint",
     "values", "verdict", "walk", "zzvarint",
 ]
@@ -108,6 +117,13 @@ class Recorder(Visitor):
         return False if self._decline is not None and self._decline(field) else None
 
     def on_sequence_begin(self, field_id):
+        # A sequence never reaches ``on_field``, so the same predicate is applied
+        # here — declining one drops its whole sub-tree, and nothing inside it is
+        # recorded (its matching end is consumed too, §5.2).
+        if self._decline is not None and self._decline(
+            Field(field_id, WireType.SEQUENCE_START)
+        ):
+            return False
         self.events.append(("seq{", field_id))
         return None
 

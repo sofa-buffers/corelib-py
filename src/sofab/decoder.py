@@ -546,6 +546,13 @@ class Decoder:
         self._keep = self._pos  # opens this field's resume transaction (§5.2)
         if self._pending is not None:
             self._skip_pending()
+            # The auto-skip committed, so it must not be replayed: re-open the
+            # transaction *after* it. Without this, a suspension later in this
+            # same call (the EOF check below, or the header parse) rewinds to
+            # before the skipped value, and the retry re-reads those bytes as a
+            # new field. Only a push decoder can reach it — a reader-backed one
+            # blocks in _need instead of returning to the caller here.
+            self._keep = self._pos
 
         if not self._need(1):
             if self._depth != 0:

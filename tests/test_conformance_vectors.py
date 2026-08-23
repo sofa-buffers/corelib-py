@@ -25,7 +25,7 @@ import struct
 
 import pytest
 from vectors import VECTOR_DOC as _DATA
-from vectors import VECTORS, ChunkReader
+from vectors import VECTORS, Recorder, raise_for, walk
 
 from sofab import (
     MIN_OUTPUT_BUFFER,
@@ -168,46 +168,26 @@ def _encode_chunked(fields, buf_size: int) -> bytes:
 def _decode_stream(data: bytes, *, chunk: int | None = None, skip_ids=()):
     """Decode ``data`` into a list of ``(tag, ...)`` tuples.
 
-    ``chunk`` (if set) feeds the decoder that many bytes per ``read`` — use 1 to
-    force byte-at-a-time streaming. ``skip_ids`` are auto-skipped wherever they
-    appear (a skipped sequence-start drops its whole sub-tree)."""
+    ``chunk`` (if set) feeds the decoder that many bytes at a time — use 1 to
+    force byte-at-a-time streaming. ``skip_ids`` are declined wherever they
+    appear (a declined sequence-start drops its whole sub-tree)."""
     skip = frozenset(skip_ids)
-    src = ChunkReader(data, chunk) if chunk is not None else io.BytesIO(data)
-    dec = Decoder(src)
+    status, rec, dec = walk(
+        Decoder, data, chunk=chunk, recorder=Recorder(decline=lambda f: f.id in skip)
+    )
+    raise_for(status, dec)
+    # This suite's tuple grammar predates the recorder's: sequence framing is
+    # ("seq", id) / ("end",), and array values are lists rather than tuples.
     out = []
-    while (fld := dec.next()) is not None:
-        t = fld.type
-        if t == WireType.SEQUENCE_END:
+    for e in rec.events:
+        if e[0] == "seq{":
+            out.append(("seq", e[1]))
+        elif e[0] == "seq}":
             out.append(("end",))
-            continue
-        if fld.id in skip:
-            dec.skip()  # for a sequence-start this skips the entire sub-tree
-            continue
-        if t == WireType.UNSIGNED:
-            out.append(("u", fld.id, dec.unsigned()))
-        elif t == WireType.SIGNED:
-            out.append(("s", fld.id, dec.signed()))
-        elif t == WireType.FIXLEN:
-            st = fld.subtype
-            if st == FixlenSubtype.FP32:
-                out.append(("f32", fld.id, dec.float32()))
-            elif st == FixlenSubtype.FP64:
-                out.append(("f64", fld.id, dec.float64()))
-            elif st == FixlenSubtype.STRING:
-                out.append(("str", fld.id, dec.string()))
-            else:
-                out.append(("blob", fld.id, dec.bytes()))
-        elif t == WireType.ARRAY_UNSIGNED:
-            out.append(("ua", fld.id, dec.read_unsigned_array()))
-        elif t == WireType.ARRAY_SIGNED:
-            out.append(("sa", fld.id, dec.read_signed_array()))
-        elif t == WireType.ARRAY_FIXLEN:
-            if fld.subtype == FixlenSubtype.FP32:
-                out.append(("f32a", fld.id, dec.read_float32_array()))
-            else:
-                out.append(("f64a", fld.id, dec.read_float64_array()))
-        elif t == WireType.SEQUENCE_START:
-            out.append(("seq", fld.id))
+        elif e[0] in ("ua", "sa", "f32a", "f64a"):
+            out.append((e[0], e[1], list(e[2])))
+        else:
+            out.append(e)
     return out
 
 
@@ -391,13 +371,11 @@ def test_invalid_utf8_suite_present():
 def _decode_reading_strings(data: bytes, *, chunk: int | None = None):
     """Decode `data`, materializing every STRING field (so UTF-8 validation runs)
     and skipping everything else. Raises SofaDecodeError on an invalid string."""
-    src = ChunkReader(data, chunk) if chunk is not None else io.BytesIO(data)
-    dec = Decoder(src)
-    while (fld := dec.next()) is not None:
-        if fld.type == WireType.FIXLEN and fld.subtype == FixlenSubtype.STRING:
-            dec.string()
-        else:
-            dec.skip()
+    def decline(fld):
+        return not (fld.type == WireType.FIXLEN and fld.subtype == FixlenSubtype.STRING)
+
+    status, _rec, dec = walk(Decoder, data, chunk=chunk, recorder=Recorder(decline=decline))
+    raise_for(status, dec)
 
 
 @pytest.mark.parametrize("vec", INVALID_UTF8, ids=_UTF8_IDS)
@@ -428,6 +406,6 @@ def test_invalid_utf8_skipped_field_not_validated(vec):
     # Skipped fields are never UTF-8-validated (§6.4): the same message decodes
     # cleanly when its string field is skip()-ped rather than read.
     data = bytes.fromhex(vec["serialized_hex"])
-    dec = Decoder(io.BytesIO(data))
-    while dec.next() is not None:
-        dec.skip()  # never raises: no string is materialized
+    # Nothing is materialized, so nothing is validated.
+    status, _rec, dec = walk(Decoder, data, recorder=Recorder(decline=lambda f: True))
+    raise_for(status, dec)

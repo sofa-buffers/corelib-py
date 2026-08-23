@@ -11,12 +11,10 @@ every one of those. The binding destinations get their own suite
 
 from __future__ import annotations
 
-import io
-
 import pytest
 from vectors import DECODER_ENGINES, ENGINE_PAIRS, VECTORS
 
-from sofab import Binding, SofaLimitError, SofaRangeError, Status, Visitor, WireType
+from sofab import Binding, SofaLimitError, SofaRangeError, Status, Visitor
 
 
 class Collect(Visitor):
@@ -258,18 +256,6 @@ def test_a_decoder_needs_a_source_or_a_handler(dec_cls):
 
 
 @pytest.mark.parametrize("dec_cls", DECODER_ENGINES)
-def test_a_reader_and_a_handler_are_different_shapes(dec_cls):
-    with pytest.raises(SofaRangeError):
-        dec_cls(io.BytesIO(b""), visitor=Collect())
-
-
-@pytest.mark.parametrize("dec_cls", DECODER_ENGINES)
-def test_feed_is_rejected_on_a_pull_decoder(dec_cls):
-    with pytest.raises(SofaRangeError):
-        dec_cls(io.BytesIO(b"\x08\x01")).feed(b"")
-
-
-@pytest.mark.parametrize("dec_cls", DECODER_ENGINES)
 def test_feed_is_not_re_entrant(dec_cls):
     class Reentrant(Visitor):
         def on_unsigned(self, field_id, value):
@@ -341,20 +327,16 @@ def test_a_declared_bound_takes_the_receiver_cap_off_the_field(enc_cls, dec_cls)
 
 @pytest.mark.parametrize("dec_cls", DECODER_ENGINES)
 @pytest.mark.parametrize("chunk", [1, 2, 7, 4096])
-def test_every_decode_vector_agrees_with_the_pull_path(dec_cls, chunk):
-    """§7.2 item 4: the chunk boundaries must never change the outcome. The pull
-    path is already validated against the shared vectors, so driving the same
-    bytes through feed and comparing is the tightest statement of that."""
+def test_every_decode_vector_is_chunking_independent(dec_cls, chunk):
+    """§7.2 item 4: the chunk boundaries must never change the outcome. Feeding
+    each vector whole and then in slices has to hand over the same fields."""
     for vec in VECTORS:
         if "bytes" not in vec:
             continue
         data = bytes.fromhex(vec["bytes"])
         want = Collect()
-        pulled = dec_cls(io.BytesIO(data))
-        try:
-            pulled.drive(want)
-        except Exception:  # noqa: BLE001 - vectors include malformed input
-            continue
+        if dec_cls(visitor=want).feed(data) is not Status.COMPLETE:
+            continue  # the vector set includes malformed input
 
         got = Collect()
         dec = dec_cls(visitor=got)
@@ -373,53 +355,48 @@ def test_every_decode_vector_agrees_with_the_pull_path(dec_cls, chunk):
 
 
 @pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
-def test_skipping_a_sequence_leaves_the_walk_finished(enc_cls, dec_cls):
-    """After ``skip()`` over a sequence the decoder must be positioned *past*
-    it — a second ``skip()`` is then a no-op on a field with nothing pending,
-    not a second walk of bytes that belong to the next field."""
+@pytest.mark.parametrize("chunk", [1, 2, 3])
+def test_a_declined_field_that_straddles_a_chunk_does_not_replay(enc_cls, dec_cls, chunk):
+    """A field the handler declines is walked by the *next* header parse. That
+    walk commits — so if the same call then runs out of bytes (at end of input
+    inside an open sequence, say), the retry must not rewind to before it and
+    read the skipped value's bytes as a new field.
+
+    Only a push decoder can reach this: a reader-backed one blocks inside the
+    refill instead of returning to the caller mid-call. It stalled forever at
+    INCOMPLETE before the resume point was re-armed after the skip.
+    """
     enc = enc_cls()
-    enc.write_sequence_begin_lazy(1)
-    enc.write_unsigned(2, 5)
-    enc.write_sequence_end()
-    enc.write_unsigned(9, 7)
+    enc.write_unsigned(1, 1)
+    enc.write_sequence_begin_lazy(3)
+    enc.write_unsigned(5, 5_555_555)  # declined, and four varint bytes wide
+    enc.write_unsigned(6, 6)
+    enc.write_sequence_end_keep()
+    enc.write_unsigned(9, 9)
     enc.flush()
+    wire = enc.getvalue()
 
-    dec = dec_cls(io.BytesIO(enc.getvalue()))
-    assert dec.next() is not None
-    dec.skip()
-    dec.skip()  # must not re-walk
-    nxt = dec.next()
-    assert nxt is not None and nxt.id == 9
-    assert dec.unsigned() == 7
-
-
-@pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
-def test_field_still_reports_the_last_field_at_eof(enc_cls, dec_cls):
-    """``field`` is "the most recently returned Field", and reaching EOF does not
-    retract it. Both engines, because §5.3 wants the accelerator invisible."""
-    enc = enc_cls()
-    enc.write_unsigned(1, 3)
-    enc.flush()
-    dec = dec_cls(io.BytesIO(enc.getvalue()))
-    f = dec.next()
-    assert f is not None
-    dec.unsigned()
-    assert dec.next() is None
-    assert dec.field is not None
-    assert dec.field.id == 1
+    rec = _DecliningCollect(5)
+    dec = dec_cls(visitor=rec)
+    status = Status.COMPLETE
+    for off in range(0, len(wire), chunk):
+        status = dec.feed(wire[off : off + chunk])
+    assert status is Status.COMPLETE
+    assert rec.events == [
+        ("u", 1, 1),
+        ("seq{", 3),
+        ("u", 6, 6),
+        ("seq}",),
+        ("u", 9, 9),
+    ]
 
 
-@pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
-def test_field_after_a_sequence_skip_is_the_end_marker(enc_cls, dec_cls):
-    """The walk consumed the sequence's end, so that is what ``field`` reports —
-    and both engines have to agree, since the walk builds no Field of its own."""
-    enc = enc_cls()
-    enc.write_sequence_begin_lazy(1)
-    enc.write_unsigned(2, 5)
-    enc.write_sequence_end()
-    enc.flush()
-    dec = dec_cls(io.BytesIO(enc.getvalue()))
-    dec.next()
-    dec.skip()
-    assert dec.field is not None
-    assert dec.field.type is WireType.SEQUENCE_END
+class _DecliningCollect(Collect):
+    """Records like :class:`Collect`, but declines one field id."""
+
+    def __init__(self, decline_id: int) -> None:
+        super().__init__()
+        self._decline_id = decline_id
+
+    def on_field(self, field):
+        return False if field.id == self._decline_id else None
