@@ -9,6 +9,12 @@ them is large enough to be an architecture decision rather than a preference:
   ``pull``          the caller drives — ``while d.next()`` plus an ``if
                     fld.id ==`` chain, one typed read per field. What generated
                     ``message.py`` does today.
+  ``pull_cheap``    the same loop with the id chain replaced by one set test —
+                    not a shape a generator can emit, but a floor for what
+                    dispatch could cost, which is what makes the chain's share
+                    of ``pull`` visible.
+  ``pull_bare``     ``next()`` per field and nothing else: no dispatch, no value
+                    read. The parser on its own.
   ``drive``         the corelib drives, the caller answers — ``Decoder.drive``
                     over a ``Visitor``, still a ``Field`` object and two Python
                     calls per field.
@@ -31,6 +37,18 @@ them is large enough to be an architecture decision rather than a preference:
 The message is shaped after the ``vehicle_telemetry.yaml`` of issue #109 —
 **36 fields, 12 arrays, 51 elements** — and every driver decodes the same bytes,
 so the rows are directly comparable to each other and to that issue's report.
+
+**Read the visitor rows against ``pull_cheap``, not against ``pull``.** Two
+things pull in opposite directions here and cancel into a misleading number:
+``pull`` carries a 36-branch id chain, which on the native engine costs more per
+field than the whole parse, while the visitor below does not branch on the field
+id at all — a real one would have to. Measured on the native engine, the chain
+alone is 87 937 of ``pull``'s 160 941 Ir, so at equal dispatch ``pull``
+(``pull_cheap``, 73 004) is 1.6x *faster* than ``feed_visitor`` (114 800) —
+while compared as written ``feed_visitor`` looks 1.4x better. Only ``feed_bound`` is structurally ahead, because there the
+field-to-destination resolution happens in C and no dispatch reaches Python at
+all. This was got wrong once already (PR #110's table), which is why these two
+extra rows exist.
 
 Usage:
     python bench/decode_shapes.py <driver> [reps]     # for run_shapes_callgrind.sh
@@ -62,6 +80,9 @@ assert len(ARRAY_IDS) == 12 and sum(ARRAY_LENS.values()) == 51
 #: Every destination is sized by the caller from the schema, never from the wire
 #: (§6.6): the longest array a conforming message may carry.
 ARRAY_CAP = max(ARRAY_LENS.values())
+
+#: Hoisted for ``decode_pull_cheap``, so its dispatch really is one set test.
+ARRAY_IDS_SET = frozenset(ARRAY_IDS)
 
 
 def _scalar(fid: int) -> int:
@@ -156,6 +177,42 @@ def _make_pull_decoder():
 
 
 decode_pull = _make_pull_decoder()
+
+
+def decode_pull_cheap(data: bytes) -> int:
+    """The same pull loop with the id chain replaced by one set test.
+
+    Not a shape a generator can emit — it works only because this schema's types
+    fall out of one membership test, and it handles no unknown ids. It is here
+    as a *floor*: the difference to ``pull`` is what the chain costs, and that
+    turns out to be most of what separates ``pull`` from the visitor rows.
+    """
+    d = Decoder(io.BytesIO(data))
+    acc = 0
+    arrays = ARRAY_IDS_SET
+    while True:
+        fld = d.next()
+        if fld is None:
+            break
+        if fld.id in arrays:
+            acc += d.read_unsigned_array()[0]
+        else:
+            acc += d.unsigned()
+    return acc
+
+
+def decode_pull_bare(data: bytes) -> int:
+    """``next()`` per field and nothing else — the parser on its own.
+
+    Reads no values and dispatches on nothing; ``next()`` auto-skips the pending
+    value, so the whole message is still walked. Everything above this row is
+    parse cost plus what the shape adds.
+    """
+    d = Decoder(io.BytesIO(data))
+    n = 0
+    while d.next() is not None:
+        n += 1
+    return n
 
 
 # --- driver 2/3: the visitor, pulled and pushed ------------------------------
@@ -270,6 +327,8 @@ def make_feed_bound_fresh():
 
 WORKLOADS = {
     "pull": decode_pull,
+    "pull_cheap": decode_pull_cheap,
+    "pull_bare": decode_pull_bare,
     "drive": decode_drive,
     "feed_visitor": make_feed_visitor,
     "feed_bound": make_feed_bound,
@@ -289,7 +348,7 @@ FACTORIES = frozenset(
     }
 )
 #: Drivers that decode but hand nothing back, so they have no checksum.
-NO_CHECKSUM = frozenset({"feed_bound"})
+NO_CHECKSUM = frozenset({"feed_bound", "pull_bare"})
 
 
 def resolve(name: str):

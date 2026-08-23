@@ -19,7 +19,7 @@ R2="${R2:-110}"
 export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
 DRIVERS=("$@")
 if [ ${#DRIVERS[@]} -eq 0 ]; then
-    DRIVERS=(pull drive feed_visitor feed_bound feed_bound_read feed_bound_bulk feed_bound_fresh)
+    DRIVERS=(pull pull_cheap pull_bare drive feed_visitor feed_bound feed_bound_read feed_bound_bulk feed_bound_fresh)
 fi
 
 command -v valgrind >/dev/null 2>&1 || { echo "error: valgrind not found" >&2; exit 1; }
