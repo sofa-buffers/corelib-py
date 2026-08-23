@@ -96,6 +96,23 @@ _R_VISIT = 3
 
 _WT = tuple(WireType)
 
+# The wire types and fixlen subtypes as plain ints. ``WireType.FIXLEN`` inside a
+# comparison is a global load plus an attribute lookup on the enum class, paid
+# on every field for a number that is a compile-time constant everywhere it is
+# used. The names below are the same values with only the global load left.
+_WT_UNSIGNED = int(WireType.UNSIGNED)
+_WT_SIGNED = int(WireType.SIGNED)
+_WT_FIXLEN = int(WireType.FIXLEN)
+_WT_ARRAY_UNSIGNED = int(WireType.ARRAY_UNSIGNED)
+_WT_ARRAY_SIGNED = int(WireType.ARRAY_SIGNED)
+_WT_ARRAY_FIXLEN = int(WireType.ARRAY_FIXLEN)
+_WT_SEQUENCE_START = int(WireType.SEQUENCE_START)
+_WT_SEQUENCE_END = int(WireType.SEQUENCE_END)
+_ST_FP32 = int(FixlenSubtype.FP32)
+_ST_FP64 = int(FixlenSubtype.FP64)
+_ST_STRING = int(FixlenSubtype.STRING)
+_ST_BLOB = int(FixlenSubtype.BLOB)
+
 # The lowest value a signed element can carry, used as the open lower side when
 # a field declares only the upper half of its element width (``_read_varints``).
 _I64_MIN = -(1 << 63)
@@ -164,7 +181,23 @@ class Decoder:
         self._max_array_count = max_array_count
         self._max_string_len = max_string_len
         self._max_blob_len = max_blob_len
+        # Whether any receiver cap is configured at all. All three default to
+        # off, and the header walk otherwise pays two or three steps per field
+        # to rediscover that — a subtype test, an attribute load and a None
+        # test — for every string, blob and array it passes. One test here skips
+        # all of it; a decoder that does configure a cap falls through to the
+        # full check unchanged.
+        self._capped = (
+            max_array_count is not None
+            or max_string_len is not None
+            or max_blob_len is not None
+        )
         self._buf: bytes | bytearray = b""
+        # len(self._buf), kept in step with it. The buffer only ever changes in
+        # feed() and reset(), while the walk asks for its length constantly —
+        # 5.2 len() calls per field on the composite workload, each a builtin
+        # call. Holding the number is what the native engine already does.
+        self._n = 0
         self._pos = 0
         self._depth = 0
         self._cur: Field | None = None
@@ -182,7 +215,7 @@ class Decoder:
         self._cur_wtype_resume = -1
         # Whether _next_wire maintains the two above. Only a binding resolves a
         # field by id without a Field to read it from.
-        self._track_ids = binding is not None or visitor is not None
+
 
         self._binding = binding
         self._visitor = visitor
@@ -300,37 +333,42 @@ class Decoder:
         refilling only if it runs off the end mid-value."""
         buf = self._buf
         pos = self._pos
-        if pos >= len(buf):
+        if pos >= self._n:
             raise self._suspend("truncated varint")
         b = buf[pos]
         pos += 1
         if b < 0x80:  # one-byte fast path (ids, small counts, small values)
             self._pos = pos
             return b
+        # An overlong (>64-bit) varint is INVALID, not something to mask away on
+        # return (§4.1.3/§6.3, issue #43) -- but only the tenth byte can be the
+        # one to overflow. The first nine carry bits 0..62, so the check belongs
+        # on the tenth, where exactly one payload bit still fits, and not on
+        # every byte. An eleventh cannot follow: a byte that small is already a
+        # terminator. Same shape as the array reader's inner loop.
         result = b & 0x7F
         shift = 7
-        n = len(buf)
-        while True:
+        n = self._n
+        while shift < 63:
             if pos >= n:
                 self._pos = pos
                 raise self._suspend("truncated varint")
             b = buf[pos]
             pos += 1
-            # Reject an overlong (>64-bit) varint before OR-ing: if this byte's
-            # 7 payload bits would spill past bit 63 they are unrepresentable in
-            # u64 and must be INVALID, not silently masked away on return
-            # (§4.1/§6.3, issue #43). ``room`` is the bits left below 64; only
-            # when fewer than 7 remain can a payload bit overflow.
-            room = 64 - shift
-            if room < 7 and (b & 0x7F) >> room:
-                raise SofaDecodeError("overlong varint")
             result |= (b & 0x7F) << shift
             if b < 0x80:
                 self._pos = pos
-                return result & MASK64
+                return result
             shift += 7
-            if shift >= 64:
-                raise SofaDecodeError("overlong varint")
+        if pos >= n:
+            self._pos = pos
+            raise self._suspend("truncated varint")
+        b = buf[pos]
+        pos += 1
+        if b > 0x01:
+            raise SofaDecodeError("overlong varint")
+        self._pos = pos
+        return result | (b << 63)
 
     def _read_exact(self, n: int) -> bytes:
         """Return the next ``n`` bytes. Fast path is a single buffer slice; the
@@ -341,13 +379,16 @@ class Decoder:
         buf = self._buf
         pos = self._pos
         end = pos + n
-        if end > len(buf):
+        if end > self._n:
             raise self._suspend("truncated payload")
         self._pos = end
-        # One copy out of the buffer, and always a real ``bytes``: while a
-        # construct is being accumulated the buffer *is* a bytearray, and a
-        # slice of one would both be the wrong type and alias storage the next
-        # feed can move.
+        # Always a real ``bytes``: while a construct is being accumulated the
+        # buffer *is* a bytearray, and a slice of one would both be the wrong
+        # type and alias storage the next feed can move. Slicing bytes already
+        # gives bytes, so the memoryview detour — three objects to make one — is
+        # only worth it for the bytearray case, where it saves the second copy.
+        if type(buf) is bytes:
+            return buf[pos:end]
         return bytes(memoryview(buf)[pos:end])
 
     def _skip_exact(self, n: int) -> None:
@@ -361,7 +402,7 @@ class Decoder:
         byte, and a declined sequence replays a whole nested walk. Retention is
         the resume contract's; the copy was pure waste."""
         end = self._pos + n
-        if end > len(self._buf):
+        if end > self._n:
             raise self._suspend("truncated payload")
         self._pos = end
 
@@ -433,9 +474,11 @@ class Decoder:
         )
         buf = self._buf
         pos = self._pos
-        n = len(buf)
-        i = 0
-        while i < count:
+        n = self._n
+        # ``for``, not a hand-rolled counter: range() advances the index in the
+        # interpreter's own loop instead of costing a compare and an add per
+        # element.
+        for i in range(count):
             if pos >= n:
                 self._pos = pos
                 raise self._suspend("truncated varint")
@@ -450,33 +493,44 @@ class Decoder:
                     into[base + i] = (b >> 1) ^ -(b & 1) if zigzag else b
                 else:
                     append(b)
-                i += 1
                 continue
-            result = b & 0x7F
-            shift = 7
-            while True:
-                if pos >= n:
-                    self._pos = pos
-                    raise self._suspend("truncated varint")
-                b = buf[pos]
-                pos += 1
-                # An element value is a varint like any other, so the 64-bit
-                # bound of §4.1 applies to it: if this byte's payload bits would
-                # land at bit >= 64 they are unrepresentable and the encoding is
-                # INVALID — masking them off on return would silently corrupt
-                # the value instead (issue #64). Same guard, same wording as
-                # ``_varint`` above; this loop inlines the codec for speed and
-                # so has to carry it itself. ``room`` is the bits left below 64.
-                room = 64 - shift
-                if room < 7 and (b & 0x7F) >> room:
-                    raise SofaDecodeError("overlong varint")
-                result |= (b & 0x7F) << shift
-                if b < 0x80:
-                    break
-                shift += 7
-                if shift >= 64:
-                    raise SofaDecodeError("overlong varint")
-            result &= MASK64
+            # A multi-byte element. The 64-bit bound of §4.1 applies to it like
+            # to any other varint: payload bits landing at bit >= 64 are
+            # unrepresentable and the encoding is INVALID, and masking them off
+            # on return would silently corrupt the value instead (issue #64).
+            #
+            # Both of the tests that enforce it are out of the loop. A u64 fills
+            # its first nine bytes with bits 0..62, so no byte before the tenth
+            # can overflow, and the tenth carries only bit 63 — one payload bit,
+            # which is what the `> 0x01` below tests. An eleventh byte cannot
+            # follow, because a value that small is already a terminator.
+            #
+            # The per-byte bounds test is out of the loop too, on the outer test
+            # that ten bytes are buffered — a varint is at most ten bytes, so
+            # inside that window no read can run off the end. When fewer remain,
+            # _varint takes the element and suspends properly if it is truncated.
+            if n - pos >= 9:
+                result = b & 0x7F
+                shift = 7
+                while shift < 63:
+                    b = buf[pos]
+                    pos += 1
+                    result |= (b & 0x7F) << shift
+                    if b < 0x80:
+                        break
+                    shift += 7
+                else:
+                    b = buf[pos]
+                    pos += 1
+                    if b > 0x01:
+                        raise SofaDecodeError("overlong varint")
+                    result |= b << 63
+            else:
+                self._pos = pos - 1  # replay this element from its first byte
+                result = self._varint()
+                buf = self._buf
+                pos = self._pos
+                n = self._n
             if bounded:
                 x = (result >> 1) ^ -(result & 1) if zigzag else result
                 if x < blo or x > bhi:
@@ -485,7 +539,6 @@ class Decoder:
                 into[base + i] = (result >> 1) ^ -(result & 1) if zigzag else result
             else:
                 append(result)
-            i += 1
         self._pos = pos
         return out
 
@@ -493,7 +546,7 @@ class Decoder:
         """Advance the cursor past ``count`` varints without materialising them."""
         buf = self._buf
         pos = self._pos
-        n = len(buf)
+        n = self._n
         i = 0
         while i < count:
             if pos < n:
@@ -505,7 +558,7 @@ class Decoder:
             self._varint()
             buf = self._buf
             pos = self._pos
-            n = len(buf)
+            n = self._n
             i += 1
         self._pos = pos
 
@@ -534,23 +587,41 @@ class Decoder:
             # blocks inside its refill instead of returning to the caller here.
             self._keep = self._pos
 
-        if len(self._buf) - self._pos < 1:
+        buf = self._buf
+        pos = self._pos
+        if pos >= self._n:
             if self._depth != 0:
                 raise self._suspend("truncated: unbalanced sequence")
             # ``_cur`` deliberately keeps the last field past EOF: `field` is
             # documented as "the most recently returned Field".
             return -1
 
-        header = self._varint()
+        # The header varint, read inline. A call into _varint costs more than
+        # the one or two bytes it usually returns, and the EOF test above has
+        # already proved the first of them is there.
+        #
+        # Two bytes, not one: a header packs the wire type into the low 3 bits,
+        # so it stays single-byte only while the id is below 16. Ids run past
+        # that in any real schema — 53 of the 77 headers on the composite
+        # workload are two bytes — and a fast path that misses two thirds of the
+        # time is not one. Nothing longer than two bytes is handled here;
+        # ``_varint`` owns the 64-bit bound and the overlong verdict (§4.1.3),
+        # and a two-byte varint cannot reach either.
+        header = buf[pos]
+        if header < 0x80:
+            self._pos = pos + 1
+        elif pos + 1 < self._n and buf[pos + 1] < 0x80:
+            header = (header & 0x7F) | (buf[pos + 1] << 7)
+            self._pos = pos + 2
+        else:
+            header = self._varint()
         wtype = header & 0x07
         field_id = header >> 3
-        if self._track_ids:
-            # Only a decoder with a binding resolves fields by id without a
-            # Field object. Everything else reads the id off the Field it is
-            # handed, so it must not pay for maintaining a second copy.
-            self._cur_id = field_id
-            self._cur_subtype = -1
-
+        # A decoder always has a binding or a visitor (the constructor refuses
+        # one with neither), and both resolve fields by id without a Field, so
+        # the id is always published here.
+        self._cur_id = field_id
+        self._cur_subtype = -1
         # The id is bounded by ID_MAX on every header without exception (§6.2),
         # including a sequence end whose id is otherwise discarded (§4.9): the
         # bound is on the id's value, so this must run before the wire-type
@@ -558,54 +629,50 @@ class Decoder:
         if field_id > ID_MAX:
             raise SofaDecodeError(f"id {field_id} out of range")
 
-        if wtype == WireType.SEQUENCE_END:
-            if self._depth <= 0:
-                raise SofaDecodeError("unbalanced sequence end")
-            self._depth -= 1
-            if want_field:
-                self._cur = Field(0, WireType.SEQUENCE_END)
-            return wtype
-
-        if wtype == WireType.SEQUENCE_START:
-            if self._depth >= MAX_DEPTH:
-                raise SofaDecodeError(f"nesting exceeds MAX_DEPTH={MAX_DEPTH}")
-            self._depth += 1
-            if want_field:
-                self._cur = Field(field_id, WireType.SEQUENCE_START)
-            return wtype
-
-        if wtype == WireType.UNSIGNED or wtype == WireType.SIGNED:
-            if want_field:
-                self._cur = Field(field_id, _WT[wtype])
-            self._pending = (_SCALAR, wtype)
-            return wtype
-
-        if wtype == WireType.FIXLEN:
-            length_header = self._varint()
+        if wtype == _WT_FIXLEN:
+            # Same one-byte fast path as the header above, but this byte is not
+            # guaranteed to be buffered, so the bound is tested first. A length
+            # word is one byte for any payload under 16 bytes.
+            pos = self._pos
+            n = self._n
+            if pos < n:
+                length_header = buf[pos]
+                if length_header < 0x80:
+                    self._pos = pos + 1
+                elif pos + 1 < n and buf[pos + 1] < 0x80:
+                    length_header = (length_header & 0x7F) | (buf[pos + 1] << 7)
+                    self._pos = pos + 2
+                else:
+                    length_header = self._varint()
+            else:
+                length_header = self._varint()
             length = length_header >> 3
             subtype = length_header & 0x07
-            if subtype > FixlenSubtype.BLOB:
-                raise SofaDecodeError(f"invalid fixlen subtype {subtype}")
-            if length > FIXLEN_MAX:
-                raise SofaDecodeError("fixlen length out of range")
-            # A wrong-width fp field is malformed regardless of what bytes
-            # follow, so this INVALID verdict must be reached at header time —
-            # before any payload read — so it takes precedence over the
-            # INCOMPLETE a truncated payload would otherwise raise (§7). Mirrors
-            # the eager element-width check on the fixlen-array path below. Do
-            # not eager-check STRING/BLOB: those are variable-length, so a
-            # truncated string/blob is legitimately INCOMPLETE.
-            if subtype == FixlenSubtype.FP32 and length != 4:
-                raise SofaDecodeError("fp32 fixlen length must be 4")
-            if subtype == FixlenSubtype.FP64 and length != 8:
+            # The two subtype families want different checks, and splitting on
+            # them costs one comparison instead of four. STRING (2) and BLOB (3)
+            # are variable-length, so only the format-wide ceiling binds them; a
+            # truncated one is legitimately INCOMPLETE. FP32 (0) and FP64 (1)
+            # carry one fixed width each, and a wrong one is malformed whatever
+            # follows — so that INVALID must be reached here, at header time,
+            # ahead of the INCOMPLETE a truncated payload would otherwise raise
+            # (§7). Mirrors the eager element-width check on the fixlen-array
+            # path below.
+            if subtype >= _ST_STRING:
+                if subtype > _ST_BLOB:
+                    raise SofaDecodeError(f"invalid fixlen subtype {subtype}")
+                if length > FIXLEN_MAX:
+                    raise SofaDecodeError("fixlen length out of range")
+            elif subtype == _ST_FP32:
+                if length != 4:
+                    raise SofaDecodeError("fp32 fixlen length must be 4")
+            elif length != 8:
                 raise SofaDecodeError("fp64 fixlen length must be 8")
             if want_field:
                 self._cur = Field(
                     field_id, WireType.FIXLEN, size=length,
                     subtype=FixlenSubtype(subtype),
                 )
-            if self._track_ids:
-                self._cur_subtype = subtype
+            self._cur_subtype = subtype
             pending: tuple[Any, ...] = (_FIXLEN, subtype, length)
             # Receiver-configured caps (policy, not malformation): the verdict on
             # an oversize string/blob is reached here, on the length word alone —
@@ -616,26 +683,49 @@ class Decoder:
             # protection nothing; what it buys is the window
             # §6.2.1 requires, in which the caller can declare the field
             # schema-bounded and take the cap off it (:meth:`schema_bounded`).
-            if subtype == FixlenSubtype.STRING:
-                cap = self._max_string_len
-                if cap is not None and length > cap:
-                    pending = (
-                        _LIMIT,
-                        f"string length {length} exceeds max_string_len {cap}",
-                        pending,
-                    )
-            elif subtype == FixlenSubtype.BLOB:
-                cap = self._max_blob_len
-                if cap is not None and length > cap:
-                    pending = (
-                        _LIMIT,
-                        f"blob length {length} exceeds max_blob_len {cap}",
-                        pending,
-                    )
+            if self._capped:
+                if subtype == _ST_STRING:
+                    cap = self._max_string_len
+                    if cap is not None and length > cap:
+                        pending = (
+                            _LIMIT,
+                            f"string length {length} exceeds max_string_len {cap}",
+                            pending,
+                        )
+                elif subtype == _ST_BLOB:
+                    cap = self._max_blob_len
+                    if cap is not None and length > cap:
+                        pending = (
+                            _LIMIT,
+                            f"blob length {length} exceeds max_blob_len {cap}",
+                            pending,
+                        )
             self._pending = pending
             return wtype
 
-        if wtype == WireType.ARRAY_UNSIGNED or wtype == WireType.ARRAY_SIGNED:
+        if wtype < _WT_FIXLEN:  # UNSIGNED (0) or SIGNED (1)
+            if want_field:
+                self._cur = Field(field_id, _WT[wtype])
+            self._pending = (_SCALAR, wtype)
+            return wtype
+
+        if wtype == _WT_SEQUENCE_END:
+            if self._depth <= 0:
+                raise SofaDecodeError("unbalanced sequence end")
+            self._depth -= 1
+            if want_field:
+                self._cur = Field(0, WireType.SEQUENCE_END)
+            return wtype
+
+        if wtype == _WT_SEQUENCE_START:
+            if self._depth >= MAX_DEPTH:
+                raise SofaDecodeError(f"nesting exceeds MAX_DEPTH={MAX_DEPTH}")
+            self._depth += 1
+            if want_field:
+                self._cur = Field(field_id, WireType.SEQUENCE_START)
+            return wtype
+
+        if wtype == _WT_ARRAY_UNSIGNED or wtype == _WT_ARRAY_SIGNED:
             count = self._varint()
             if count < 0 or count > ARRAY_MAX:
                 raise SofaDecodeError(f"array count {count} out of range")
@@ -643,7 +733,7 @@ class Decoder:
                 self._cur = Field(field_id, _WT[wtype], count=count)
             pending = (_VARRAY, wtype, count)
             # Parked, not raised — see the fixlen branch above (§6.2.1).
-            cap = self._max_array_count
+            cap = self._max_array_count if self._capped else None
             if cap is not None and count > cap:
                 pending = (_LIMIT, f"array count {count} exceeds max_array_count {cap}", pending)
             self._pending = pending
@@ -659,7 +749,7 @@ class Decoder:
         elem_header = self._varint()
         elem_size = elem_header >> 3
         subtype = elem_header & 0x07
-        if subtype > FixlenSubtype.FP64:
+        if subtype > _ST_FP64:
             raise SofaDecodeError(f"invalid fixlen-array subtype {subtype}")
         # §4.8/§5.2: a fixlen array carries fp32 (element size 4) or fp64
         # (element size 8) — any other width is malformed. This INVALID verdict
@@ -668,9 +758,9 @@ class Decoder:
         # Mirrors the eager element-width check on the scalar fixlen path above.
         # subtype is already narrowed to fp32/fp64, so these exact-width checks
         # bound elem_size completely — no separate FIXLEN_MAX check is needed.
-        if subtype == FixlenSubtype.FP32 and elem_size != 4:
+        if subtype == _ST_FP32 and elem_size != 4:
             raise SofaDecodeError("fp32 fixlen-array element size must be 4")
-        if subtype == FixlenSubtype.FP64 and elem_size != 8:
+        if subtype == _ST_FP64 and elem_size != 8:
             raise SofaDecodeError("fp64 fixlen-array element size must be 8")
         if want_field:
             self._cur = Field(
@@ -680,11 +770,10 @@ class Decoder:
                 size=elem_size,
                 subtype=FixlenSubtype(subtype),
             )
-        if self._track_ids:
-            self._cur_subtype = subtype
+        self._cur_subtype = subtype
         pending = (_FARRAY, subtype, count, elem_size)
         # Parked, not raised — see the fixlen branch above (§6.2.1).
-        cap = self._max_array_count
+        cap = self._max_array_count if self._capped else None
         if cap is not None and count > cap:
             pending = (_LIMIT, f"array count {count} exceeds max_array_count {cap}", pending)
         self._pending = pending
@@ -827,8 +916,9 @@ class Decoder:
         # chunk — a 1 MB blob fed in 4 KiB pieces costs ~122 MB of copying that
         # way.
         buf = self._buf
-        if self._pos >= len(buf):
-            self._buf = data if isinstance(data, bytes) else bytes(data)
+        if self._pos >= self._n:
+            buf = data if isinstance(data, bytes) else bytes(data)
+            self._buf = buf
         else:
             if not isinstance(buf, bytearray):
                 buf = bytearray(buf)
@@ -836,6 +926,7 @@ class Decoder:
             if self._pos:
                 del buf[: self._pos]
             buf += data
+        self._n = len(buf)
         self._pos = 0
         self._keep = 0
         self._running = True
@@ -862,6 +953,7 @@ class Decoder:
         the next message does not write keeps whatever is in it, which is how
         absence is reported)."""
         self._buf = b""
+        self._n = 0
         self._pos = 0
         self._depth = 0
         self._cur = None
@@ -889,7 +981,7 @@ class Decoder:
         pending = self._pending
         assert pending is not None  # only asked while a value is pending
         kind = pending[0]
-        have = len(self._buf) - self._pos
+        have = self._n - self._pos
         if kind == _FIXLEN:
             return bool(have >= pending[2])
         if kind == _FARRAY:
@@ -932,7 +1024,7 @@ class Decoder:
             if t < 0:
                 return False
 
-            if t == WireType.SEQUENCE_END:
+            if t == _WT_SEQUENCE_END:
                 if self._bstack:
                     self._bmap = self._bstack.pop()
                 if visitor is not None:
@@ -948,10 +1040,10 @@ class Decoder:
                 # §7.3: the wire tag contradicts what the schema declared for
                 # this id. Not an error — treat it exactly like an unknown id.
                 entry = None
-                if t != WireType.SEQUENCE_START:
+                if t != _WT_SEQUENCE_START:
                     continue
 
-            if t == WireType.SEQUENCE_START:
+            if t == _WT_SEQUENCE_START:
                 if entry is not None:
                     child = entry.child
                     assert child is not None
@@ -1142,40 +1234,55 @@ class Decoder:
         pending = self._pending
         assert pending is not None
         fid = self._cur_id
-        if t == WireType.UNSIGNED:
+        if t == _WT_UNSIGNED:
             visitor.on_unsigned(fid, self._take_scalar_matched())
-        elif t == WireType.SIGNED:
+        elif t == _WT_SIGNED:
             raw = self._take_scalar_matched()
             visitor.on_signed(fid, (raw >> 1) ^ -(raw & 1))
-        elif t == WireType.FIXLEN:
-            self._visit_fixlen(visitor, fid, pending)
-        elif t == WireType.ARRAY_UNSIGNED:
+        elif t == _WT_FIXLEN:
+            # Folded in rather than delegated. A string field is the commonest
+            # thing on the wire and used to cost four nested calls to deliver —
+            # _visit_value, _visit_fixlen, _take_fixlen_matched, _read_exact —
+            # three of which only chose the next one. Everything they did is
+            # here: the parked-cap check, the resume transaction, the bounds
+            # test, and the one copy out of the buffer.
+            if pending[0] == _LIMIT:
+                # A parked receiver cap (§6.2.1): the field is being refused, and
+                # the walk over its payload is what the cap exists to prevent.
+                raise SofaLimitError(pending[1])
+            self._keep = pos = self._pos
+            end = pos + pending[2]
+            if end > self._n:
+                raise self._suspend("truncated payload")
+            buf = self._buf
+            # Always a real ``bytes`` — see _read_exact for why the bytearray
+            # case takes the memoryview.
+            data = buf[pos:end] if type(buf) is bytes else bytes(memoryview(buf)[pos:end])
+            self._pos = end
+            self._pending = None  # committed once the payload is in hand (§5.2)
+            subtype = pending[1]
+            if subtype == _ST_STRING:
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise SofaDecodeError("invalid UTF-8 in string field") from exc
+                visitor.on_string(fid, text)
+            elif subtype == _ST_BLOB:
+                visitor.on_bytes(fid, data)
+            elif subtype == _ST_FP32:
+                # _next_wire already refused any other width for these two, so
+                # the payload is exactly 4 or 8 bytes.
+                visitor.on_float32(fid, _core.unpack_f32(data))
+            else:
+                visitor.on_float64(fid, _core.unpack_f64(data))
+        elif t == _WT_ARRAY_UNSIGNED:
             visitor.on_unsigned_array(fid, self._take_varints(pending[2], False))
-        elif t == WireType.ARRAY_SIGNED:
+        elif t == _WT_ARRAY_SIGNED:
             visitor.on_signed_array(fid, self._take_varints(pending[2], True))
-        elif pending[1] == FixlenSubtype.FP32:
+        elif pending[1] == _ST_FP32:
             visitor.on_float32_array(fid, self._take_farray_values(pending, 4))
         else:
             visitor.on_float64_array(fid, self._take_farray_values(pending, 8))
-
-    def _visit_fixlen(self, visitor: Visitor, fid: int, pending: tuple[Any, ...]) -> None:
-        if pending[0] == _LIMIT:
-            # A parked receiver cap (§6.2.1): the field is being refused, and the
-            # walk over its payload is exactly what the cap exists to prevent.
-            raise SofaLimitError(pending[1])
-        subtype = pending[1]
-        if subtype == FixlenSubtype.FP32:
-            visitor.on_float32(fid, _core.unpack_f32(self._take_fixlen_matched(4)))
-        elif subtype == FixlenSubtype.FP64:
-            visitor.on_float64(fid, _core.unpack_f64(self._take_fixlen_matched(8)))
-        elif subtype == FixlenSubtype.STRING:
-            data = self._take_fixlen_matched(pending[2])
-            try:
-                visitor.on_string(fid, data.decode("utf-8"))
-            except UnicodeDecodeError as exc:
-                raise SofaDecodeError("invalid UTF-8 in string field") from exc
-        else:
-            visitor.on_bytes(fid, self._take_fixlen_matched(pending[2]))
 
     def _take_varints(self, count: int, zigzag: bool) -> list[int]:
         """The whole pending integer array, as a list (the visitor's shape)."""

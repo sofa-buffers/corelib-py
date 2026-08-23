@@ -1779,6 +1779,10 @@ cdef class Decoder:
 
     # Receiver-configured decode limits (None = no limit); kept as Python objects
     # so the comparison stays exact for a caller-supplied int of any magnitude.
+    # Whether any receiver cap is configured at all. All three default to off,
+    # and without this the header walk touches a Python attribute per string,
+    # blob and array field only to find None there.
+    cdef bint _capped
     cdef object _max_array_count
     cdef object _max_string_len
     cdef object _max_blob_len
@@ -1880,6 +1884,8 @@ cdef class Decoder:
             self._btab = self._tables.btab
             self._bind_words(words, objects)
             self._tab = 0
+        self._capped = (max_array_count is not None or max_string_len is not None
+                        or max_blob_len is not None)
         self._max_array_count = max_array_count
         self._max_string_len = max_string_len
         self._max_blob_len = max_blob_len
@@ -2174,48 +2180,27 @@ cdef class Decoder:
         if fid > _ID_MAX:
             raise SofaDecodeError("id %d out of range" % PyLong_FromUnsignedLongLong(fid))
 
-        if wtype == _WT_SEQUENCE_END:
-            if self._depth <= 0:
-                raise SofaDecodeError("unbalanced sequence end")
-            self._depth -= 1
-            if want_field:
-                self._cur = _mkfield(_ZERO, _WT[_WT_SEQUENCE_END], _ZERO, _ZERO, _NONE)
-            return wtype
-
-        if wtype == _WT_SEQUENCE_START:
-            if self._depth >= _MAX_DEPTH:
-                raise SofaDecodeError("nesting exceeds MAX_DEPTH=%d" % _MAX_DEPTH)
-            self._depth += 1
-            if want_field:
-                self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
-                                     _WT[_WT_SEQUENCE_START], _ZERO, _ZERO, _NONE)
-            return wtype
-
-        if wtype == _WT_UNSIGNED or wtype == _WT_SIGNED:
-            self._pk = _PEND_SCALAR
-            self._pend_wtype = wtype
-            if want_field:
-                self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
-                                     _WT[wtype], _ZERO, _ZERO, _NONE)
-            return wtype
-
         if wtype == _WT_FIXLEN:
             length_header = self._varint()
             length = length_header >> 3
             subtype = <int>(length_header & 0x07)
-            if subtype > _ST_BLOB:
-                raise SofaDecodeError("invalid fixlen subtype %d" % subtype)
-            if length > _FIXLEN_MAX:
-                raise SofaDecodeError("fixlen length out of range")
-            # A wrong-width fp field is malformed regardless of what bytes
-            # follow, so raise this INVALID verdict at header time — before any
-            # payload read — so it takes precedence over the INCOMPLETE a
-            # truncated payload would otherwise raise (§7). Keeps this engine
-            # byte-for-byte identical to the pure decoder. STRING/BLOB are
-            # variable-length, so a truncated one is legitimately INCOMPLETE.
-            if subtype == _ST_FP32 and length != 4:
-                raise SofaDecodeError("fp32 fixlen length must be 4")
-            if subtype == _ST_FP64 and length != 8:
+            # Split on the subtype family, one comparison instead of four, and
+            # the same split the pure engine makes. STRING/BLOB are
+            # variable-length, so only the format-wide ceiling binds them and a
+            # truncated one is legitimately INCOMPLETE. FP32/FP64 carry one
+            # fixed width each; a wrong one is malformed whatever follows, so
+            # that INVALID is raised here at header time, before any payload
+            # read, taking precedence over the INCOMPLETE a truncated payload
+            # would otherwise raise (§7).
+            if subtype >= _ST_STRING:
+                if subtype > _ST_BLOB:
+                    raise SofaDecodeError("invalid fixlen subtype %d" % subtype)
+                if length > _FIXLEN_MAX:
+                    raise SofaDecodeError("fixlen length out of range")
+            elif subtype == _ST_FP32:
+                if length != 4:
+                    raise SofaDecodeError("fp32 fixlen length must be 4")
+            elif length != 8:
                 raise SofaDecodeError("fp64 fixlen length must be 8")
             self._pk = _PEND_FIXLEN
             self._pend_subtype = subtype
@@ -2227,10 +2212,11 @@ cdef class Decoder:
             # which it can declare the field schema-bounded and take the cap off
             # it. Every consume path raises it; see _park_limit / _mismatch.
             cap = _NONE
-            if subtype == _ST_STRING:
-                cap = self._max_string_len
-            elif subtype == _ST_BLOB:
-                cap = self._max_blob_len
+            if self._capped:
+                if subtype == _ST_STRING:
+                    cap = self._max_string_len
+                elif subtype == _ST_BLOB:
+                    cap = self._max_blob_len
             if want_field or cap is not None:
                 # One boxed length, reused: it is the Field's ``size`` and the
                 # value a configured cap is compared against and named in its
@@ -2249,6 +2235,31 @@ cdef class Decoder:
                                          % (boxed, cap))
             return wtype
 
+        if wtype < _WT_FIXLEN:  # UNSIGNED (0) or SIGNED (1)
+            self._pk = _PEND_SCALAR
+            self._pend_wtype = wtype
+            if want_field:
+                self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
+                                     _WT[wtype], _ZERO, _ZERO, _NONE)
+            return wtype
+
+        if wtype == _WT_SEQUENCE_END:
+            if self._depth <= 0:
+                raise SofaDecodeError("unbalanced sequence end")
+            self._depth -= 1
+            if want_field:
+                self._cur = _mkfield(_ZERO, _WT[_WT_SEQUENCE_END], _ZERO, _ZERO, _NONE)
+            return wtype
+
+        if wtype == _WT_SEQUENCE_START:
+            if self._depth >= _MAX_DEPTH:
+                raise SofaDecodeError("nesting exceeds MAX_DEPTH=%d" % _MAX_DEPTH)
+            self._depth += 1
+            if want_field:
+                self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
+                                     _WT[_WT_SEQUENCE_START], _ZERO, _ZERO, _NONE)
+            return wtype
+
         if wtype == _WT_ARRAY_UNSIGNED or wtype == _WT_ARRAY_SIGNED:
             count = self._varint()
             if count > _ARRAY_MAX:
@@ -2256,7 +2267,7 @@ cdef class Decoder:
             self._pk = _PEND_VARRAY
             self._pend_wtype = wtype
             self._pend_count = count
-            cap = self._max_array_count
+            cap = self._max_array_count if self._capped else _NONE
             if want_field or cap is not None:
                 boxed = PyLong_FromUnsignedLongLong(count)   # see the fixlen branch
                 if want_field:
@@ -2293,7 +2304,7 @@ cdef class Decoder:
         self._pend_subtype = subtype
         self._pend_count = count
         self._pend_size = elem_size
-        cap = self._max_array_count
+        cap = self._max_array_count if self._capped else _NONE
         if want_field or cap is not None:
             boxed = PyLong_FromUnsignedLongLong(count)      # see the fixlen branch
             if want_field:
