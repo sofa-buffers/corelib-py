@@ -96,6 +96,23 @@ _R_VISIT = 3
 
 _WT = tuple(WireType)
 
+# The wire types and fixlen subtypes as plain ints. ``WireType.FIXLEN`` inside a
+# comparison is a global load plus an attribute lookup on the enum class, paid
+# on every field for a number that is a compile-time constant everywhere it is
+# used. The names below are the same values with only the global load left.
+_WT_UNSIGNED = int(WireType.UNSIGNED)
+_WT_SIGNED = int(WireType.SIGNED)
+_WT_FIXLEN = int(WireType.FIXLEN)
+_WT_ARRAY_UNSIGNED = int(WireType.ARRAY_UNSIGNED)
+_WT_ARRAY_SIGNED = int(WireType.ARRAY_SIGNED)
+_WT_ARRAY_FIXLEN = int(WireType.ARRAY_FIXLEN)
+_WT_SEQUENCE_START = int(WireType.SEQUENCE_START)
+_WT_SEQUENCE_END = int(WireType.SEQUENCE_END)
+_ST_FP32 = int(FixlenSubtype.FP32)
+_ST_FP64 = int(FixlenSubtype.FP64)
+_ST_STRING = int(FixlenSubtype.STRING)
+_ST_BLOB = int(FixlenSubtype.BLOB)
+
 # The lowest value a signed element can carry, used as the open lower side when
 # a field declares only the upper half of its element width (``_read_varints``).
 _I64_MIN = -(1 << 63)
@@ -187,7 +204,7 @@ class Decoder:
         self._cur_wtype_resume = -1
         # Whether _next_wire maintains the two above. Only a binding resolves a
         # field by id without a Field to read it from.
-        self._track_ids = binding is not None or visitor is not None
+
 
         self._binding = binding
         self._visitor = visitor
@@ -563,13 +580,11 @@ class Decoder:
             header = self._varint()
         wtype = header & 0x07
         field_id = header >> 3
-        if self._track_ids:
-            # Only a decoder with a binding resolves fields by id without a
-            # Field object. Everything else reads the id off the Field it is
-            # handed, so it must not pay for maintaining a second copy.
-            self._cur_id = field_id
-            self._cur_subtype = -1
-
+        # A decoder always has a binding or a visitor (the constructor refuses
+        # one with neither), and both resolve fields by id without a Field, so
+        # the id is always published here.
+        self._cur_id = field_id
+        self._cur_subtype = -1
         # The id is bounded by ID_MAX on every header without exception (§6.2),
         # including a sequence end whose id is otherwise discarded (§4.9): the
         # bound is on the id's value, so this must run before the wire-type
@@ -577,7 +592,7 @@ class Decoder:
         if field_id > ID_MAX:
             raise SofaDecodeError(f"id {field_id} out of range")
 
-        if wtype == WireType.SEQUENCE_END:
+        if wtype == _WT_SEQUENCE_END:
             if self._depth <= 0:
                 raise SofaDecodeError("unbalanced sequence end")
             self._depth -= 1
@@ -585,7 +600,7 @@ class Decoder:
                 self._cur = Field(0, WireType.SEQUENCE_END)
             return wtype
 
-        if wtype == WireType.SEQUENCE_START:
+        if wtype == _WT_SEQUENCE_START:
             if self._depth >= MAX_DEPTH:
                 raise SofaDecodeError(f"nesting exceeds MAX_DEPTH={MAX_DEPTH}")
             self._depth += 1
@@ -593,13 +608,13 @@ class Decoder:
                 self._cur = Field(field_id, WireType.SEQUENCE_START)
             return wtype
 
-        if wtype == WireType.UNSIGNED or wtype == WireType.SIGNED:
+        if wtype == _WT_UNSIGNED or wtype == _WT_SIGNED:
             if want_field:
                 self._cur = Field(field_id, _WT[wtype])
             self._pending = (_SCALAR, wtype)
             return wtype
 
-        if wtype == WireType.FIXLEN:
+        if wtype == _WT_FIXLEN:
             # Same one-byte fast path as the header above, but this byte is not
             # guaranteed to be buffered, so the bound is tested first. A length
             # word is one byte for any payload under 16 bytes.
@@ -614,7 +629,7 @@ class Decoder:
                 length_header = self._varint()
             length = length_header >> 3
             subtype = length_header & 0x07
-            if subtype > FixlenSubtype.BLOB:
+            if subtype > _ST_BLOB:
                 raise SofaDecodeError(f"invalid fixlen subtype {subtype}")
             if length > FIXLEN_MAX:
                 raise SofaDecodeError("fixlen length out of range")
@@ -625,17 +640,16 @@ class Decoder:
             # the eager element-width check on the fixlen-array path below. Do
             # not eager-check STRING/BLOB: those are variable-length, so a
             # truncated string/blob is legitimately INCOMPLETE.
-            if subtype == FixlenSubtype.FP32 and length != 4:
+            if subtype == _ST_FP32 and length != 4:
                 raise SofaDecodeError("fp32 fixlen length must be 4")
-            if subtype == FixlenSubtype.FP64 and length != 8:
+            if subtype == _ST_FP64 and length != 8:
                 raise SofaDecodeError("fp64 fixlen length must be 8")
             if want_field:
                 self._cur = Field(
                     field_id, WireType.FIXLEN, size=length,
                     subtype=FixlenSubtype(subtype),
                 )
-            if self._track_ids:
-                self._cur_subtype = subtype
+            self._cur_subtype = subtype
             pending: tuple[Any, ...] = (_FIXLEN, subtype, length)
             # Receiver-configured caps (policy, not malformation): the verdict on
             # an oversize string/blob is reached here, on the length word alone —
@@ -646,7 +660,7 @@ class Decoder:
             # protection nothing; what it buys is the window
             # §6.2.1 requires, in which the caller can declare the field
             # schema-bounded and take the cap off it (:meth:`schema_bounded`).
-            if subtype == FixlenSubtype.STRING:
+            if subtype == _ST_STRING:
                 cap = self._max_string_len
                 if cap is not None and length > cap:
                     pending = (
@@ -654,7 +668,7 @@ class Decoder:
                         f"string length {length} exceeds max_string_len {cap}",
                         pending,
                     )
-            elif subtype == FixlenSubtype.BLOB:
+            elif subtype == _ST_BLOB:
                 cap = self._max_blob_len
                 if cap is not None and length > cap:
                     pending = (
@@ -665,7 +679,7 @@ class Decoder:
             self._pending = pending
             return wtype
 
-        if wtype == WireType.ARRAY_UNSIGNED or wtype == WireType.ARRAY_SIGNED:
+        if wtype == _WT_ARRAY_UNSIGNED or wtype == _WT_ARRAY_SIGNED:
             count = self._varint()
             if count < 0 or count > ARRAY_MAX:
                 raise SofaDecodeError(f"array count {count} out of range")
@@ -689,7 +703,7 @@ class Decoder:
         elem_header = self._varint()
         elem_size = elem_header >> 3
         subtype = elem_header & 0x07
-        if subtype > FixlenSubtype.FP64:
+        if subtype > _ST_FP64:
             raise SofaDecodeError(f"invalid fixlen-array subtype {subtype}")
         # §4.8/§5.2: a fixlen array carries fp32 (element size 4) or fp64
         # (element size 8) — any other width is malformed. This INVALID verdict
@@ -698,9 +712,9 @@ class Decoder:
         # Mirrors the eager element-width check on the scalar fixlen path above.
         # subtype is already narrowed to fp32/fp64, so these exact-width checks
         # bound elem_size completely — no separate FIXLEN_MAX check is needed.
-        if subtype == FixlenSubtype.FP32 and elem_size != 4:
+        if subtype == _ST_FP32 and elem_size != 4:
             raise SofaDecodeError("fp32 fixlen-array element size must be 4")
-        if subtype == FixlenSubtype.FP64 and elem_size != 8:
+        if subtype == _ST_FP64 and elem_size != 8:
             raise SofaDecodeError("fp64 fixlen-array element size must be 8")
         if want_field:
             self._cur = Field(
@@ -710,8 +724,7 @@ class Decoder:
                 size=elem_size,
                 subtype=FixlenSubtype(subtype),
             )
-        if self._track_ids:
-            self._cur_subtype = subtype
+        self._cur_subtype = subtype
         pending = (_FARRAY, subtype, count, elem_size)
         # Parked, not raised — see the fixlen branch above (§6.2.1).
         cap = self._max_array_count
@@ -965,7 +978,7 @@ class Decoder:
             if t < 0:
                 return False
 
-            if t == WireType.SEQUENCE_END:
+            if t == _WT_SEQUENCE_END:
                 if self._bstack:
                     self._bmap = self._bstack.pop()
                 if visitor is not None:
@@ -981,10 +994,10 @@ class Decoder:
                 # §7.3: the wire tag contradicts what the schema declared for
                 # this id. Not an error — treat it exactly like an unknown id.
                 entry = None
-                if t != WireType.SEQUENCE_START:
+                if t != _WT_SEQUENCE_START:
                     continue
 
-            if t == WireType.SEQUENCE_START:
+            if t == _WT_SEQUENCE_START:
                 if entry is not None:
                     child = entry.child
                     assert child is not None
@@ -1175,12 +1188,12 @@ class Decoder:
         pending = self._pending
         assert pending is not None
         fid = self._cur_id
-        if t == WireType.UNSIGNED:
+        if t == _WT_UNSIGNED:
             visitor.on_unsigned(fid, self._take_scalar_matched())
-        elif t == WireType.SIGNED:
+        elif t == _WT_SIGNED:
             raw = self._take_scalar_matched()
             visitor.on_signed(fid, (raw >> 1) ^ -(raw & 1))
-        elif t == WireType.FIXLEN:
+        elif t == _WT_FIXLEN:
             # Folded in rather than delegated. A string field is the commonest
             # thing on the wire and used to cost four nested calls to deliver —
             # _visit_value, _visit_fixlen, _take_fixlen_matched, _read_exact —
@@ -1202,25 +1215,25 @@ class Decoder:
             self._pos = end
             self._pending = None  # committed once the payload is in hand (§5.2)
             subtype = pending[1]
-            if subtype == FixlenSubtype.STRING:
+            if subtype == _ST_STRING:
                 try:
                     text = data.decode("utf-8")
                 except UnicodeDecodeError as exc:
                     raise SofaDecodeError("invalid UTF-8 in string field") from exc
                 visitor.on_string(fid, text)
-            elif subtype == FixlenSubtype.BLOB:
+            elif subtype == _ST_BLOB:
                 visitor.on_bytes(fid, data)
-            elif subtype == FixlenSubtype.FP32:
+            elif subtype == _ST_FP32:
                 # _next_wire already refused any other width for these two, so
                 # the payload is exactly 4 or 8 bytes.
                 visitor.on_float32(fid, _core.unpack_f32(data))
             else:
                 visitor.on_float64(fid, _core.unpack_f64(data))
-        elif t == WireType.ARRAY_UNSIGNED:
+        elif t == _WT_ARRAY_UNSIGNED:
             visitor.on_unsigned_array(fid, self._take_varints(pending[2], False))
-        elif t == WireType.ARRAY_SIGNED:
+        elif t == _WT_ARRAY_SIGNED:
             visitor.on_signed_array(fid, self._take_varints(pending[2], True))
-        elif pending[1] == FixlenSubtype.FP32:
+        elif pending[1] == _ST_FP32:
             visitor.on_float32_array(fid, self._take_farray_values(pending, 4))
         else:
             visitor.on_float64_array(fid, self._take_farray_values(pending, 8))
