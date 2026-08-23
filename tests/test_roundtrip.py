@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 
 import pytest
-from vectors import reader
+from vectors import Recorder, Status, pairs, values, walk
 
 from sofab import (
     ARRAY_MAX,
@@ -19,38 +19,44 @@ from sofab import (
 )
 
 
-def _roundtrip(build):
+def _roundtrip(build) -> list[tuple]:
+    """Encode, then decode back to the event list the handler was handed."""
     enc = Encoder()
     build(enc)
-    return Decoder(reader(enc.getvalue()))
+    return values(Decoder, enc.getvalue())
+
+
+def _roundtrip_pairs(build) -> list[tuple]:
+    """Same, but with each field's wire metadata alongside its value."""
+    enc = Encoder()
+    build(enc)
+    return pairs(Decoder, enc.getvalue())
 
 
 @pytest.mark.parametrize("value", [0, 1, 127, 128, 0x4000, UNSIGNED_MAX])
 def test_unsigned(value):
-    dec = _roundtrip(lambda e: e.write_unsigned(5, value))
-    f = dec.next()
+    f, ev = _roundtrip_pairs(lambda e: e.write_unsigned(5, value))[0]
     assert f.id == 5 and f.type == WireType.UNSIGNED
-    assert dec.unsigned() == value
+    assert ev == ("u", 5, value)
 
 
 @pytest.mark.parametrize("value", [0, -1, 1, SIGNED_MIN, SIGNED_MAX])
 def test_signed(value):
-    dec = _roundtrip(lambda e: e.write_signed(3, value))
-    dec.next()
-    assert dec.signed() == value
+    assert _roundtrip(lambda e: e.write_signed(3, value)) == [("s", 3, value)]
 
 
 def test_bool():
-    dec = _roundtrip(lambda e: (e.write_bool(0, True), e.write_bool(1, False)))
-    dec.next(); assert dec.bool() is True
-    dec.next(); assert dec.bool() is False
+    # A boolean has no wire type (§4.4): it arrives as the unsigned 1 / 0 it was
+    # written as, and the caller reads truth from that.
+    assert _roundtrip(lambda e: (e.write_bool(0, True), e.write_bool(1, False))) == [
+        ("u", 0, 1),
+        ("u", 1, 0),
+    ]
 
 
 @pytest.mark.parametrize("value", [0.0, -0.0, 1.5, math.inf, -math.inf])
 def test_float64(value):
-    dec = _roundtrip(lambda e: e.write_float64(0, value))
-    dec.next()
-    got = dec.float64()
+    got = _roundtrip(lambda e: e.write_float64(0, value))[0][2]
     assert got == value or (math.isinf(value) and math.isinf(got))
 
 
@@ -58,38 +64,31 @@ def test_string_and_bytes_unicode():
     dec = _roundtrip(
         lambda e: (e.write_string(0, "héllo ✓ 日本"), e.write_bytes(1, bytes(range(256))))
     )
-    dec.next(); assert dec.string() == "héllo ✓ 日本"
-    dec.next(); assert dec.bytes() == bytes(range(256))
+    assert dec == [("str", 0, "héllo ✓ 日本"), ("blob", 1, bytes(range(256)))]
 
 
-def test_fixlen_len_peeks_wire_byte_length_without_consuming():
-    # fixlen_len() reports a string/blob field's exact wire byte length (from the
-    # length header) without advancing, so a following string()/bytes() still reads
-    # the same field. It is the value a schema maxlen bounds against — no re-encode
-    # of the decoded str needed to measure it (generator #155).
+def test_fixlen_length_is_on_the_field_not_the_value():
+    """The wire byte length of a string/blob is metadata, reported on the Field
+    the handler is given — so a schema ``maxlen`` is bounded against the bytes
+    the sender declared, without re-encoding the decoded ``str`` to measure it
+    (generator #155). A binding does this for you (``maxlen=``); a visitor reads
+    it off the Field."""
     s = "héllo ✓ 日本"  # 17 UTF-8 bytes across 1-, 2- and 3-byte code points
     blob = bytes(range(200))
-    dec = _roundtrip(lambda e: (e.write_string(0, s), e.write_bytes(1, blob)))
+    got = _roundtrip_pairs(lambda e: (e.write_string(0, s), e.write_bytes(1, blob)))
 
-    dec.next()
-    assert dec.fixlen_len() == len(s.encode("utf-8"))  # byte length, not char count
-    assert dec.fixlen_len() == len(s.encode("utf-8"))  # idempotent: a pure peek, no consume
-    assert dec.string() == s                            # field still readable after peeking
-
-    dec.next()
-    assert dec.fixlen_len() == len(blob)                # works for blobs too
-    assert dec.bytes() == blob
+    (f_str, ev_str), (f_blob, ev_blob) = got
+    assert f_str.size == len(s.encode("utf-8"))  # byte length, not char count
+    assert ev_str == ("str", 0, s)
+    assert f_blob.size == len(blob)
+    assert ev_blob == ("blob", 1, blob)
 
 
-def test_fixlen_len_on_non_fixlen_field_returns_none():
-    from sofab import SofaRangeError
-
-    dec = _roundtrip(lambda e: e.write_unsigned(0, 42))
-    dec.next()  # a scalar (unsigned) field is not a fixlen value
-    assert dec.fixlen_len() is None  # §7.3: no fixlen length to report
-    assert dec.unsigned() == 42  # the peek consumed nothing either way
-    with pytest.raises(SofaRangeError):  # now there is no pending value at all
-        dec.fixlen_len()
+def test_a_scalar_field_carries_no_fixlen_length():
+    """§7.3: a non-fixlen field simply has none — ``size`` stays 0."""
+    f, ev = _roundtrip_pairs(lambda e: e.write_unsigned(0, 42))[0]
+    assert f.size == 0
+    assert ev == ("u", 0, 42)
 
 
 def test_arrays():
@@ -99,11 +98,12 @@ def test_arrays():
         e.write_float32_array(2, [1.0, 2.0, 3.0])
         e.write_float64_array(3, [1.0, 2.0, 3.0])
 
-    dec = _roundtrip(build)
-    dec.next(); assert dec.read_unsigned_array() == [0, 1, UNSIGNED_MAX]
-    dec.next(); assert dec.read_signed_array() == [SIGNED_MIN, -1, 0, SIGNED_MAX]
-    dec.next(); assert dec.read_float32_array() == [1.0, 2.0, 3.0]
-    dec.next(); assert dec.read_float64_array() == [1.0, 2.0, 3.0]
+    assert _roundtrip(build) == [
+        ("ua", 0, (0, 1, UNSIGNED_MAX)),
+        ("sa", 1, (SIGNED_MIN, -1, 0, SIGNED_MAX)),
+        ("f32a", 2, (1.0, 2.0, 3.0)),
+        ("f64a", 3, (1.0, 2.0, 3.0)),
+    ]
 
 
 def test_zero_count_arrays_roundtrip_to_empty():
@@ -114,16 +114,13 @@ def test_zero_count_arrays_roundtrip_to_empty():
         e.write_float32_array(2, [])
         e.write_float64_array(3, [])
 
-    dec = _roundtrip(build)
-    f = dec.next(); assert f.type == WireType.ARRAY_UNSIGNED and f.count == 0
-    assert dec.read_unsigned_array() == []
-    f = dec.next(); assert f.type == WireType.ARRAY_SIGNED and f.count == 0
-    assert dec.read_signed_array() == []
-    f = dec.next(); assert f.type == WireType.ARRAY_FIXLEN and f.count == 0
-    assert dec.read_float32_array() == []
-    f = dec.next(); assert f.type == WireType.ARRAY_FIXLEN and f.count == 0
-    assert dec.read_float64_array() == []
-    assert dec.next() is None
+    got = _roundtrip_pairs(build)
+    assert [f.type for f, _ in got] == [
+        WireType.ARRAY_UNSIGNED, WireType.ARRAY_SIGNED,
+        WireType.ARRAY_FIXLEN, WireType.ARRAY_FIXLEN,
+    ]
+    assert all(f.count == 0 for f, _ in got)
+    assert [ev[2] for _, ev in got] == [(), (), (), ()]
 
 
 def test_max_depth_nesting_roundtrips():
@@ -137,13 +134,10 @@ def test_max_depth_nesting_roundtrips():
         for _ in range(MAX_DEPTH):
             e.write_sequence_end()
 
-    dec = _roundtrip(build)
-    for _ in range(MAX_DEPTH):
-        assert dec.next().type == WireType.SEQUENCE_START
-    f = dec.next(); assert f.id == 1 and dec.unsigned() == 42
-    for _ in range(MAX_DEPTH):
-        assert dec.next().type == WireType.SEQUENCE_END
-    assert dec.next() is None
+    ev = _roundtrip(build)
+    assert ev == (
+        [("seq{", 0)] * MAX_DEPTH + [("u", 1, 42)] + [("seq}",)] * MAX_DEPTH
+    )
 
 
 def test_nested_sequences_skip_whole():
@@ -157,18 +151,27 @@ def test_nested_sequences_skip_whole():
         e.write_sequence_end()
         e.write_unsigned(9, 99)
 
-    dec = _roundtrip(build)
-    dec.next(); assert dec.unsigned() == 7
-    f = dec.next(); assert f.type == WireType.SEQUENCE_START and f.id == 1
-    dec.skip()  # skip the whole nested sequence
-    f = dec.next(); assert f.id == 9 and dec.unsigned() == 99
-    assert dec.next() is None
+    # A handler that declines sequence 1 makes the decoder walk the whole
+    # sub-tree without reporting anything inside it.
+    enc = Encoder()
+    build(enc)
+    status, rec, _dec = walk(
+        Decoder, enc.getvalue(),
+        recorder=Recorder(decline=lambda f: False),
+    )
+    assert status is Status.COMPLETE
+    assert rec.events == [
+        ("u", 0, 7),
+        ("seq{", 1), ("u", 0, 1),
+        ("seq{", 2), ("s", 0, -9), ("seq}",), ("seq}",),
+        ("u", 9, 99),
+    ]
 
 
 def test_boundary_ids():
-    dec = _roundtrip(lambda e: (e.write_unsigned(0, 0), e.write_unsigned(ID_MAX, 1)))
-    assert dec.next().id == 0; dec.unsigned()
-    assert dec.next().id == ID_MAX; assert dec.unsigned() == 1
+    assert _roundtrip(
+        lambda e: (e.write_unsigned(0, 0), e.write_unsigned(ID_MAX, 1))
+    ) == [("u", 0, 0), ("u", ID_MAX, 1)]
 
 
 def test_max_count_not_required():

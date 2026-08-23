@@ -230,6 +230,16 @@ def pairs(dec_cls, data: bytes, **kw) -> list[tuple]:
     return list(zip(rec.fields, vals))
 
 
+def verdict(dec_cls, data: bytes, **kw) -> None:
+    """Decode ``data`` and raise the verdict on it, if it is not COMPLETE.
+
+    The shorthand most malformed-input tests want: they assert *what a message
+    is*, and ``pytest.raises`` says that most directly. See :func:`raise_for`.
+    """
+    status, _rec, dec = walk(dec_cls, data, **kw)
+    raise_for(status, dec)
+
+
 def values(dec_cls, data: bytes, **kw) -> list[tuple]:
     """Just the value events of a message that must decode cleanly."""
     status, rec, _dec = walk(dec_cls, data, **kw)
