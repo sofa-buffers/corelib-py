@@ -400,3 +400,16 @@ class _DecliningCollect(Collect):
 
     def on_field(self, field):
         return False if field.id == self._decline_id else None
+
+
+@pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
+def test_a_truncated_fixlen_payload_is_incomplete(enc_cls, dec_cls):
+    """The payload read and the skip over one both run out in their own place;
+    neither may report anything but INCOMPLETE."""
+    enc = enc_cls()
+    enc.write_bytes(1, b"\xa5" * 40)
+    enc.flush()
+    cut = enc.getvalue()[:-10]
+
+    assert dec_cls(visitor=Collect()).feed(cut) is Status.INCOMPLETE
+    assert dec_cls(visitor=_DecliningCollect(1)).feed(cut) is Status.INCOMPLETE

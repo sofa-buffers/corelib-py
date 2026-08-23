@@ -1908,21 +1908,13 @@ cdef class Decoder:
         self._keep_cur_wtype = self._cur_wtype
 
     cdef object _suspend(self, msg):
-        # _keep tracks buffer compaction in _need, so it names the call's start
+        # _keep tracks buffer compaction in feed(), so it names the call's start
         # byte in the current buffer.
         self._pos = self._keep
         self._cur_wtype = self._keep_cur_wtype
         return SofaIncompleteError(msg)
 
     # --- byte sourcing ------------------------------------------------------
-
-    cdef inline bint _need(self, Py_ssize_t n) noexcept:
-        # Are n bytes available at _pos? There is nothing to pull from: the
-        # bytes are in the buffer or the caller has to feed more, which is
-        # exactly §5.2's INCOMPLETE. Compaction happens in feed(), between
-        # calls, so this never moves the cursor and never has to rebase a
-        # resume transaction underneath one.
-        return self._n - self._pos >= n
 
     cdef inline uint64_t _varint(self) except? 0xDEAD:
         # Fast path: a varint is at most 10 bytes, so with that many buffered the
@@ -1948,11 +1940,7 @@ cdef class Decoder:
         cdef int shift
         cdef int room
         if pos >= n:
-            if not self._need(1):
-                raise self._suspend("truncated varint")
-            p = self._p
-            pos = self._pos
-            n = self._n
+            raise self._suspend("truncated varint")
         b = p[pos]
         pos += 1
         if b < 0x80:
@@ -1963,11 +1951,7 @@ cdef class Decoder:
         while True:
             if pos >= n:
                 self._pos = pos
-                if not self._need(1):
-                    raise self._suspend("truncated varint")
-                p = self._p
-                pos = self._pos
-                n = self._n
+                raise self._suspend("truncated varint")
             b = p[pos]
             pos += 1
             # Reject an overlong (>64-bit) varint before OR-ing: if this byte's
@@ -1987,18 +1971,12 @@ cdef class Decoder:
                 raise SofaDecodeError("overlong varint")
 
     cdef bytes _read_exact(self, Py_ssize_t n):
-        # The slow path accumulates inside the buffer (via _need) rather than in
-        # a local, so a payload that stops halfway is still buffered when the
-        # truncation is reported and the next attempt continues from it (§5.2).
+        # A payload that stops halfway stays buffered when the truncation is
+        # reported, so the next attempt continues from it (§5.2).
         cdef Py_ssize_t pos = self._pos
         cdef bytes out
-        if pos + n <= self._n:
-            out = self._buf[pos:pos + n]
-            self._pos = pos + n
-            return out
-        if not self._need(n):
+        if pos + n > self._n:
             raise self._suspend("truncated payload")
-        pos = self._pos
         out = self._buf[pos:pos + n]
         self._pos = pos + n
         return out
@@ -2010,12 +1988,9 @@ cdef class Decoder:
         # Decoder._skip_exact in the pure engine — the bytes stay buffered on the
         # slow path (the resume contract replays them), only the copy is gone.
         cdef Py_ssize_t pos = self._pos
-        if pos + n <= self._n:
-            self._pos = pos + n
-            return 0
-        if not self._need(n):
+        if pos + n > self._n:
             raise self._suspend("truncated payload")
-        self._pos += n
+        self._pos = pos + n
         return 0
 
     cdef list _read_varints(
@@ -2149,7 +2124,7 @@ cdef class Decoder:
             # those bytes as a new field. See the pure engine for the long note.
             self._arm()
 
-        if self._pos >= self._n and not self._need(1):
+        if self._pos >= self._n:
             if self._depth != 0:
                 raise self._suspend("truncated: unbalanced sequence")
             self._cur_wtype = -1
@@ -2977,7 +2952,7 @@ cdef class Decoder:
         cdef const unsigned char* p
         cdef Py_ssize_t i
         self._arm()
-        if self._n - self._pos < nbytes and not self._need(nbytes):
+        if self._n - self._pos < nbytes:
             raise self._suspend("truncated payload")
         p = self._p + self._pos
         if width == 4:

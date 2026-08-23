@@ -39,7 +39,6 @@ from array import array as _array
 from typing import TYPE_CHECKING, Any
 
 from . import _core
-from ._varint import zigzag_decode
 from .binding import (
     K_ARRAY_FLOAT32,
     K_ARRAY_SIGNED,
@@ -81,7 +80,7 @@ _FARRAY = 3
 # A pending value a receiver-side cap has rejected (§6.2.1). The real pending
 # tuple is parked inside it — ``(_LIMIT, message, pending)`` — so the rejection
 # can still be waived by :meth:`Decoder.schema_bounded` and so a peek can read
-# through it. Every consume path re-raises it; see ``_mismatch``.
+# through it. Every path that would consume the field raises it instead.
 _LIMIT = 4
 
 # Wire-type members indexed by their integer value, so the per-field hot path
@@ -252,7 +251,7 @@ class Decoder:
     # * **every call is one field.** ``_keep`` is re-armed by ``next()`` and by
     #   each typed read, so it is always meaningful and never has to be cleared:
     #   it simply names the start of the most recent call. It doubles as the
-    #   floor :meth:`_need` may compact to, which is what keeps a suspended
+    #   point a suspension rewinds to, which is what keeps a suspended
     #   construct's bytes in the buffer for the retry.
     #
     # ``skip()`` over a whole *sequence* is the one call that spans many fields.
@@ -269,8 +268,8 @@ class Decoder:
 
         Called at every truncation site, so the rewind happens whether the raise
         is nested inside a field walk or not. ``_keep`` is maintained by
-        :meth:`_need` across compaction, so it names the call's start byte in the
-        *current* buffer even if the buffer was rebased while the call ran.
+        :meth:`feed` across compaction, so it names the call's start byte in the
+        *current* buffer even if the buffer was rebased between calls.
         """
         self._pos = self._keep
         return SofaIncompleteError(msg)
@@ -280,26 +279,13 @@ class Decoder:
     # The buffer is never sliced per byte: ``_pos`` advances over ``_buf`` and
     # the consumed prefix is dropped only when a refill is actually needed.
 
-    def _need(self, n: int) -> bool:
-        """Are ``n`` bytes available at ``_pos``?
-
-        There is nothing to pull from: the bytes are in the buffer or the caller
-        has to feed more, which is exactly §5.2's INCOMPLETE. Compaction happens
-        in :meth:`feed`, between calls, so this never moves the cursor and never
-        has to rebase a resume transaction underneath one.
-        """
-        return len(self._buf) - self._pos >= n
-
     def _varint(self) -> int:
         """Decode one base-128 varint by advancing the cursor over the buffer,
         refilling only if it runs off the end mid-value."""
         buf = self._buf
         pos = self._pos
         if pos >= len(buf):
-            if not self._need(1):
-                raise self._suspend("truncated varint")
-            buf = self._buf
-            pos = self._pos
+            raise self._suspend("truncated varint")
         b = buf[pos]
         pos += 1
         if b < 0x80:  # one-byte fast path (ids, small counts, small values)
@@ -311,11 +297,7 @@ class Decoder:
         while True:
             if pos >= n:
                 self._pos = pos
-                if not self._need(1):
-                    raise self._suspend("truncated varint")
-                buf = self._buf
-                pos = self._pos
-                n = len(buf)
+                raise self._suspend("truncated varint")
             b = buf[pos]
             pos += 1
             # Reject an overlong (>64-bit) varint before OR-ing: if this byte's
@@ -338,20 +320,13 @@ class Decoder:
         """Return the next ``n`` bytes. Fast path is a single buffer slice; the
         slow path accumulates across refills for a chunk-fed reader.
 
-        The accumulation happens inside ``_buf`` rather than in a local, so a
-        payload that stops halfway is still buffered when the truncation is
-        reported and the next attempt continues from it (§5.2)."""
+        A payload that stops halfway stays buffered when the truncation is
+        reported, so the next attempt continues from it (§5.2)."""
         buf = self._buf
         pos = self._pos
         end = pos + n
-        if end <= len(buf):
-            self._pos = end
-            return buf[pos:end]
-        if not self._need(n):
+        if end > len(buf):
             raise self._suspend("truncated payload")
-        buf = self._buf
-        pos = self._pos
-        end = pos + n
         self._pos = end
         return buf[pos:end]
 
@@ -361,21 +336,14 @@ class Decoder:
         away). Same sourcing and same suspension as :meth:`_read_exact` — only
         the result object is missing.
 
-        The bytes are still buffered on the slow path, because they are not free
-        to drop: a suspension has to be able to replay the skipped construct from
-        its first byte, and ``skip()`` over a sequence replays a whole nested
-        walk. Retention is therefore the resume contract's,
-        while the copy was pure waste — this drops the copy and keeps the
-        contract, so nothing observable changes."""
-        buf = self._buf
-        pos = self._pos
-        end = pos + n
-        if end <= len(buf):
-            self._pos = end
-            return
-        if not self._need(n):
+        The bytes stay buffered either way, because they are not free to drop: a
+        suspension has to be able to replay the skipped construct from its first
+        byte, and a declined sequence replays a whole nested walk. Retention is
+        the resume contract's; the copy was pure waste."""
+        end = self._pos + n
+        if end > len(self._buf):
             raise self._suspend("truncated payload")
-        self._pos += n
+        self._pos = end
 
     def _read_varints(
         self,
@@ -450,11 +418,7 @@ class Decoder:
         while i < count:
             if pos >= n:
                 self._pos = pos
-                if not self._need(1):
-                    raise self._suspend("truncated varint")
-                buf = self._buf
-                pos = self._pos
-                n = len(buf)
+                raise self._suspend("truncated varint")
             b = buf[pos]
             pos += 1
             if b < 0x80:  # one-byte element
@@ -473,11 +437,7 @@ class Decoder:
             while True:
                 if pos >= n:
                     self._pos = pos
-                    if not self._need(1):
-                        raise self._suspend("truncated varint")
-                    buf = self._buf
-                    pos = self._pos
-                    n = len(buf)
+                    raise self._suspend("truncated varint")
                 b = buf[pos]
                 pos += 1
                 # An element value is a varint like any other, so the 64-bit
@@ -551,10 +511,10 @@ class Decoder:
             # same call (the EOF check below, or the header parse) rewinds to
             # before the skipped value, and the retry re-reads those bytes as a
             # new field. Only a push decoder can reach it — a reader-backed one
-            # blocks in _need instead of returning to the caller here.
+            # blocks inside its refill instead of returning to the caller here.
             self._keep = self._pos
 
-        if not self._need(1):
+        if len(self._buf) - self._pos < 1:
             if self._depth != 0:
                 raise self._suspend("truncated: unbalanced sequence")
             # ``_cur`` deliberately keeps the last field past EOF: `field` is
@@ -632,8 +592,8 @@ class Decoder:
             # before its payload is read or buffered, which is where §6.2.1 wants
             # it — and parked on the pending value rather than raised. Nothing is
             # read or allocated until the field is consumed, and every consume
-            # path raises it (``_mismatch``), so deferring the raise by one
-            # call costs the protection nothing; what it buys is the window
+            # path raises it, so deferring the raise by one step costs the
+            # protection nothing; what it buys is the window
             # §6.2.1 requires, in which the caller can declare the field
             # schema-bounded and take the cap off it (:meth:`schema_bounded`).
             if subtype == FixlenSubtype.STRING:
@@ -710,27 +670,6 @@ class Decoder:
         self._pending = pending
         return wtype
 
-    @staticmethod
-    def _mismatch(pending: tuple[Any, ...] | None) -> None:
-        """The answer a typed read owes a pending value whose wire tag
-        contradicts it: ``None`` — see "typed reads and §7.3" below.
-
-        Two conditions reach here that are not that. No pending value **at all**
-        is a caller mistake, the §6.3 ``InvalidArgument`` outcome. And a parked
-        receiver-cap rejection (§6.2.1) stands in the way of the skip as much as
-        of the read — skipping the field still buffers its payload (see
-        :meth:`_skip_pending`) — and is a terminal rejection of the *message*,
-        not an answer about one read. Both raise.
-
-        Reached only from paths that have already found the pending kind wrong,
-        so the ordinary read costs nothing for it.
-        """
-        if pending is None:
-            raise SofaRangeError("no value pending for the current field")
-        if pending[0] == _LIMIT:
-            raise SofaLimitError(pending[1])
-        return None
-
     # --- skipping -----------------------------------------------------------
 
     def _farray_nbytes(self, count: int, elem_size: int) -> int:
@@ -799,9 +738,6 @@ class Decoder:
             # marker the walk stopped on, exactly as a Field-building walk would
             # have left it. One object per skip, not one per field.
             self._cur = Field(0, WireType.SEQUENCE_END)
-            return
-        if self._pending is not None:
-            self._skip_pending()
 
     # --- push-feed driver (CORELIB_PLAN §5.2) -------------------------------
     #
@@ -1047,8 +983,8 @@ class Decoder:
             elif pending[0] == _LIMIT:
                 # No declared bound, so the configured cap still governs the
                 # field and has already rejected it. The typed reads reach this
-                # through _mismatch; here it has to be raised explicitly, or the
-                # consume below would walk straight past the verdict.
+                # It has to be raised explicitly here, or the consume below
+                # would walk straight past the verdict.
                 raise SofaLimitError(pending[1])
             data = self._take_fixlen_matched(pending[2])
             if k == K_BYTES:
@@ -1110,311 +1046,90 @@ class Decoder:
         if c >= 0:
             self._wu[c] = got
 
-    def _visit_value(self, visitor: Visitor, f: Field) -> None:
-        """The value half of a visitor dispatch. Every read is chosen by the
-        field's own wire type, so none of them can return the §7.3 ``None``."""
-        t = f.type
-        if t == WireType.UNSIGNED:
-            visitor.on_unsigned(f.id, self._unsigned())  # type: ignore[arg-type]
-        elif t == WireType.SIGNED:
-            visitor.on_signed(f.id, self._signed())  # type: ignore[arg-type]
-        elif t == WireType.FIXLEN:
-            st = f.subtype
-            if st == FixlenSubtype.FP32:
-                visitor.on_float32(f.id, self._float32())  # type: ignore[arg-type]
-            elif st == FixlenSubtype.FP64:
-                visitor.on_float64(f.id, self._float64())  # type: ignore[arg-type]
-            elif st == FixlenSubtype.STRING:
-                visitor.on_string(f.id, self._string())  # type: ignore[arg-type]
-            else:
-                visitor.on_bytes(f.id, self._bytes())  # type: ignore[arg-type]
-        elif t == WireType.ARRAY_UNSIGNED:
-            visitor.on_unsigned_array(f.id, self._read_unsigned_array())  # type: ignore[arg-type]
-        elif t == WireType.ARRAY_SIGNED:
-            visitor.on_signed_array(f.id, self._read_signed_array())  # type: ignore[arg-type]
-        elif f.subtype == FixlenSubtype.FP32:
-            visitor.on_float32_array(f.id, self._read_float32_array())  # type: ignore[arg-type]
-        else:
-            visitor.on_float64_array(f.id, self._read_float64_array())  # type: ignore[arg-type]
-
-    # --- visitor driver -----------------------------------------------------
-
-    # --- typed reads and §7.3 -----------------------------------------------
-    #
-    # Every typed read below compares the whole tag of the pending value — the
-    # wire type plus, for the fixlen kinds, the subtype, since fp32/fp64/string/
-    # blob share WireType.FIXLEN — against the type the read declares, and
-    # answers a contradiction the way MESSAGE_SPEC §7.3 requires: **not** as an
-    # error. The field is left pending and unconsumed, so the next `next()` (or
-    # an explicit `skip()`) discards it exactly like a field with an unknown id,
-    # the caller's destination is never written, and a decode that meets nothing
-    # else stays COMPLETE. The read reports that by returning None — the one
-    # answer that cannot be mistaken for a decoded value; returning a zero would
-    # be writing the destination, which is what §7.3 forbids. Because the value
-    # is still pending, a caller may immediately re-read the same field with the
-    # type the wire actually carries.
-    #
-    # Having **no** pending value at all is the other half, and is a genuine
-    # caller mistake — a read before next(), a second read of one field, or a
-    # read on a sequence start/end. CORELIB_PLAN §6.3 has exactly one code for
-    # that, InvalidArgument, so it raises SofaRangeError.
-
-    def _take_scalar(self, wtype: WireType) -> int | None:
-        pending = self._pending
-        if pending is None or pending[0] != _SCALAR or pending[1] != wtype:
-            return self._mismatch(pending)  # §7.3
-        self._keep = self._pos
-        value = self._varint()
-        self._pending = None  # committed only once the value is in hand (§5.2)
-        return value
-
     def _take_scalar_matched(self) -> int:
-        """The consume half of :meth:`_take_scalar`, for the bound driver, which
-        matched the whole tag before it got here (§7.3). Skipping the re-check
-        saves a tuple index and two compares per scalar field, and lets the
-        result be typed ``int`` rather than ``int | None``."""
+        """Consume the pending scalar. The caller has already matched the whole
+        tag, so this only consumes — and the result is an ``int``, not
+        ``int | None``."""
         self._keep = self._pos
         value = self._varint()
         self._pending = None  # committed only once the value is in hand (§5.2)
         return value
 
     def _take_fixlen_matched(self, length: int) -> bytes:
-        """:meth:`_take_fixlen` for an already-matched tag; see
-        :meth:`_take_scalar_matched`."""
+        """:meth:`_take_scalar_matched` for a fixlen payload."""
         self._keep = self._pos
         data = self._read_exact(length)
         self._pending = None  # committed only once the payload is in hand (§5.2)
         return data
 
-    def _unsigned(self) -> int | None:
-        """Consume the current field as an unsigned integer.
+    # --- value reads for the visitor path -----------------------------------
+    #
+    # The driver dispatches on the field's own wire type before calling, so every
+    # read here is reached with a tag that already matches. There is no §7.3
+    # mismatch to answer: a *binding* can contradict the wire and is skipped by
+    # the driver (see _drive_push), and a visitor declares nothing about a
+    # field's type at all — it is simply handed what the wire carried.
 
-        Returns ``None`` if the field is not unsigned (§7.3), leaving it for the
-        skip; raises :class:`SofaRangeError` if no value is pending at all.
-        """
-        return self._take_scalar(WireType.UNSIGNED)
-
-    def _signed(self) -> int | None:
-        """Consume the current field as a ZigZag-decoded signed integer.
-
-        Returns ``None`` if the field is not signed (§7.3), leaving it for the
-        skip; raises :class:`SofaRangeError` if no value is pending at all.
-        """
-        raw = self._take_scalar(WireType.SIGNED)
-        return None if raw is None else zigzag_decode(raw)
-
-    def _bool(self) -> bool | None:
-        """Consume the current unsigned field as a boolean (non-zero is true).
-
-        Returns ``None`` if the field is not unsigned (§7.3), leaving it for the
-        skip; raises :class:`SofaRangeError` if no value is pending at all. Test
-        it with ``is True`` / ``is not None`` rather than truthiness, which cannot
-        tell ``None`` apart from ``False``.
-        """
-        raw = self._take_scalar(WireType.UNSIGNED)
-        return None if raw is None else raw != 0
-
-    def _take_fixlen(self, subtype: FixlenSubtype) -> bytes | None:
+    def _visit_value(self, visitor: Visitor, f: Field) -> None:
+        """Hand the current field's value to ``visitor``'s typed hook."""
+        t = f.type
         pending = self._pending
-        if pending is None or pending[0] != _FIXLEN or pending[1] != subtype:
-            return self._mismatch(pending)  # §7.3
+        assert pending is not None
+        if t == WireType.UNSIGNED:
+            visitor.on_unsigned(f.id, self._take_scalar_matched())
+        elif t == WireType.SIGNED:
+            raw = self._take_scalar_matched()
+            visitor.on_signed(f.id, (raw >> 1) ^ -(raw & 1))
+        elif t == WireType.FIXLEN:
+            self._visit_fixlen(visitor, f, pending)
+        elif t == WireType.ARRAY_UNSIGNED:
+            visitor.on_unsigned_array(f.id, self._take_varints(pending[2], False))
+        elif t == WireType.ARRAY_SIGNED:
+            visitor.on_signed_array(f.id, self._take_varints(pending[2], True))
+        elif f.subtype == FixlenSubtype.FP32:
+            visitor.on_float32_array(f.id, self._take_farray_values(pending, 4))
+        else:
+            visitor.on_float64_array(f.id, self._take_farray_values(pending, 8))
+
+    def _visit_fixlen(self, visitor: Visitor, f: Field, pending: tuple[Any, ...]) -> None:
+        if pending[0] == _LIMIT:
+            # A parked receiver cap (§6.2.1): the field is being refused, and the
+            # walk over its payload is exactly what the cap exists to prevent.
+            raise SofaLimitError(pending[1])
+        subtype = pending[1]
+        if subtype == FixlenSubtype.FP32:
+            visitor.on_float32(f.id, _core.unpack_f32(self._take_fixlen_matched(4)))
+        elif subtype == FixlenSubtype.FP64:
+            visitor.on_float64(f.id, _core.unpack_f64(self._take_fixlen_matched(8)))
+        elif subtype == FixlenSubtype.STRING:
+            data = self._take_fixlen_matched(pending[2])
+            try:
+                visitor.on_string(f.id, data.decode("utf-8"))
+            except UnicodeDecodeError as exc:
+                raise SofaDecodeError("invalid UTF-8 in string field") from exc
+        else:
+            visitor.on_bytes(f.id, self._take_fixlen_matched(pending[2]))
+
+    def _take_varints(self, count: int, zigzag: bool) -> list[int]:
+        """The whole pending integer array, as a list (the visitor's shape)."""
+        if self._pending is not None and self._pending[0] == _LIMIT:
+            raise SofaLimitError(self._pending[1])
         self._keep = self._pos
-        data = self._read_exact(pending[2])
-        self._pending = None  # committed only once the payload is in hand (§5.2)
-        return data
-
-    def _float32(self) -> float | None:
-        """Consume the current fixlen field as a 32-bit IEEE-754 float.
-
-        Returns ``None`` if the field is not an fp32 fixlen (§7.3), leaving it
-        for the skip; raises :class:`SofaRangeError` if no value is pending at
-        all. The payload is necessarily 4 bytes: §4.6's width rule is settled at the
-        length header by :meth:`next`, which is where §5.2 wants that INVALID
-        verdict reached — before any payload read, so it outranks a truncation
-        behind it. Re-deciding the width here could only restate a check no
-        input can reach (the native engine does not carry one either).
-        """
-        data = self._take_fixlen(FixlenSubtype.FP32)
-        return None if data is None else _core.unpack_f32(data)
-
-    def _float64(self) -> float | None:
-        """Consume the current fixlen field as a 64-bit IEEE-754 float.
-
-        Returns ``None`` if the field is not an fp64 fixlen (§7.3), leaving it
-        for the skip; raises :class:`SofaRangeError` if no value is pending at
-        all. The payload is necessarily 8 bytes (see :meth:`float32`).
-        """
-        data = self._take_fixlen(FixlenSubtype.FP64)
-        return None if data is None else _core.unpack_f64(data)
-
-    def _fixlen_len(self) -> int | None:
-        """Return the current fixlen field's payload byte length without consuming it.
-
-        The length is read straight from the field's length header, so this is a
-        pure peek: it does not advance the decoder and a following
-        :meth:`string`/:meth:`bytes`/:meth:`float32`/:meth:`float64` still reads
-        the same field. It lets a caller bound a string or blob against its schema
-        ``maxlen`` using the exact wire byte length the decoder already parsed —
-        checked before allocation, and without re-encoding a decoded ``str`` just
-        to measure it (the string field is UTF-8 on the wire, so the payload byte
-        length is the length ``maxlen`` bounds).
-
-        Returns ``None`` if the current field is not a fixlen value at all
-        (§7.3) — there is no fixlen length to report, and nothing is consumed
-        either way; raises :class:`SofaRangeError` if no value is pending.
-        """
-        pending = self._pending
-        if pending is None:
-            raise SofaRangeError("no value pending for the current field")
-        if pending[0] != _FIXLEN:
-            # A parked receiver-cap rejection (§6.2.1) keeps the real pending
-            # value inside it, and this peek reads nothing and allocates
-            # nothing — so it answers through the wrapper, and for the same
-            # reason it does not re-raise the cap the way a consuming read
-            # does. That is deliberate: this is the length generated code
-            # measures the SCHEMA bound against, and that bound's INVALID
-            # outranks the cap (§7.1), so it must be decidable whether or not
-            # :meth:`schema_bounded` has been called yet.
-            if pending[0] == _LIMIT and pending[2][0] == _FIXLEN:
-                return int(pending[2][2])
-            return None  # §7.3: not a fixlen field, so it has no fixlen length
-        return int(pending[2])
-
-    def _string(self) -> str | None:
-        """Consume the current fixlen field as a UTF-8 decoded string.
-
-        Returns ``None`` if the field is not a STRING fixlen (§7.3), leaving it
-        for the skip; raises :class:`SofaRangeError` if no value is pending at
-        all, or :class:`SofaDecodeError` if the payload is not valid UTF-8.
-        """
-        raw = self._take_fixlen(FixlenSubtype.STRING)
-        if raw is None:
-            return None
-        try:
-            return raw.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise SofaDecodeError("invalid UTF-8 in string field") from exc
-
-    def _bytes(self) -> bytes | None:
-        """Consume the current fixlen field as a raw byte blob.
-
-        Returns ``None`` if the field is not a BLOB fixlen (§7.3), leaving it for
-        the skip; raises :class:`SofaRangeError` if no value is pending at all.
-        """
-        return self._take_fixlen(FixlenSubtype.BLOB)
-
-    # --- array reads --------------------------------------------------------
-
-    def _take_varray(self, wtype: WireType) -> int | None:
-        """Validate the pending array and return its count.
-
-        The pending value is *not* cleared here — the caller clears it once the
-        payload has actually been decoded, so a suspension leaves the array
-        re-readable from its first element (§5.2).
-        """
-        pending = self._pending
-        if pending is None or pending[0] != _VARRAY or pending[1] != wtype:
-            return self._mismatch(pending)  # §7.3
-        return int(pending[2])
-
-    def _read_unsigned_array(self, elem_max: int | None = None) -> list[int] | None:
-        """Consume the current field as a list of unsigned integers.
-
-        Pass the schema's declared element width as ``elem_max`` (``255`` for a
-        ``u8`` array, and so on): an element outside it is INVALID (§7.1) and is
-        rejected as its own bytes are decoded, so the verdict is the same whether
-        the array completes or is truncated behind that element, and §5.2's
-        precedence of INVALID over the INCOMPLETE such a truncation would
-        otherwise report follows from the order alone (generator#267, issue #67).
-        Omit for ``u64``, whose range is the value domain, and for an unbounded
-        consumer.
-
-        Returns ``None`` if the field is not an unsigned array (§7.3), leaving it
-        for the skip; raises :class:`SofaRangeError` if no value is pending at
-        all.
-        """
-        count = self._take_varray(WireType.ARRAY_UNSIGNED)
-        if count is None:
-            return None
-        self._keep = self._pos
-        # No lower bound: an unsigned element decodes to 0..2**64-1 by
-        # construction, so passing 0 would only cost the loop a compare per
-        # element (and would arm the bound check for an unbounded u64 array).
-        out = self._read_varints(count, None, elem_max)
+        out = self._read_varints(count, None, None, zigzag)
+        if zigzag:
+            out = [(v >> 1) ^ -(v & 1) for v in out]
         self._pending = None  # committed only once the payload is in hand (§5.2)
         return out
 
-    def _read_signed_array(
-        self,
-        elem_min: int | None = None,
-        elem_max: int | None = None,
-    ) -> list[int] | None:
-        """Consume the current field as a list of ZigZag-decoded signed integers.
-
-        ``elem_min``/``elem_max`` bound each element to its declared width — see
-        :meth:`read_unsigned_array`. Either may be given on its own, which bounds
-        that side and leaves the other open.
-
-        Returns ``None`` if the field is not a signed array (§7.3), leaving it
-        for the skip; raises :class:`SofaRangeError` if no value is pending at
-        all.
-        """
-        count = self._take_varray(WireType.ARRAY_SIGNED)
-        if count is None:
-            return None
+    def _take_farray_values(self, pending: tuple[Any, ...], width: int) -> list[float]:
+        if pending[0] == _LIMIT:
+            raise SofaLimitError(pending[1])
+        count = pending[2]
         self._keep = self._pos
-        # ZigZag inlined rather than calling zigzag_decode per element: the
-        # transform is two operations, the call around it was the expensive part.
-        out = [
-            (v >> 1) ^ -(v & 1)
-            for v in self._read_varints(count, elem_min, elem_max, True)
-        ]
+        data = self._read_exact(self._farray_nbytes(count, pending[3]))
         self._pending = None  # committed only once the payload is in hand (§5.2)
-        return out
-
-    def _take_farray(self, subtype: FixlenSubtype) -> tuple[int, int] | None:
-        pending = self._pending
-        # §4.8: a fixlen array always carries its fixlen_word, so the subtype is
-        # known even for a zero-count array — check it like any other read.
-        if pending is None or pending[0] != _FARRAY or pending[1] != subtype:
-            return self._mismatch(pending)  # §7.3
-        # Like _take_varray, the pending value is cleared by the caller only
-        # after the payload has been read (§5.2).
-        return int(pending[2]), int(pending[3])  # count, elem_size
-
-    def _read_float32_array(self) -> list[float] | None:
-        """Consume the current field as a list of 32-bit IEEE-754 floats.
-
-        Returns ``None`` if the field is not an fp32 array (§7.3), leaving it for
-        the skip; raises :class:`SofaRangeError` if no value is pending at all.
-        """
-        taken = self._take_farray(FixlenSubtype.FP32)
-        if taken is None:
-            return None
-        count, elem_size = taken
-        self._keep = self._pos
-        # ``elem_size`` is necessarily 4 here: §4.8's width rule is settled at
-        # the fixlen_word by ``next()``, which is where §5.2 wants that INVALID
-        # verdict reached — before any payload read, so it outranks a truncation
-        # behind it. The payload is therefore exactly ``count * 4`` bytes or this
-        # read raises, and re-deciding the width afterwards could only restate a
-        # check no input can reach (issue #75).
-        data = self._read_exact(self._farray_nbytes(count, elem_size))
-        self._pending = None  # committed only once the payload is in hand (§5.2)
-        return _core.unpack_f32_array(data, count)
-
-    def _read_float64_array(self) -> list[float] | None:
-        """Consume the current field as a list of 64-bit IEEE-754 floats.
-
-        Returns ``None`` if the field is not an fp64 array (§7.3), leaving it for
-        the skip; raises :class:`SofaRangeError` if no value is pending at all.
-        """
-        taken = self._take_farray(FixlenSubtype.FP64)
-        if taken is None:
-            return None
-        count, elem_size = taken
-        self._keep = self._pos
-        # ``elem_size`` is necessarily 8 here; see read_float32_array.
-        data = self._read_exact(self._farray_nbytes(count, elem_size))
-        self._pending = None  # committed only once the payload is in hand (§5.2)
-        return _core.unpack_f64_array(data, count)
+        return (
+            _core.unpack_f32_array(data, count)
+            if width == 4
+            else _core.unpack_f64_array(data, count)
+        )
