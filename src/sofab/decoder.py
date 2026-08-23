@@ -859,12 +859,14 @@ class Decoder:
     def _value_ready(self) -> bool:
         """Are all of the pending value's bytes buffered?
 
-        Only asked for the two kinds whose length is known from the header —
-        a fixlen payload and a fixlen array. It is a *cheap* stand-in for
-        attempting the read and catching its suspension: a payload larger than
-        one chunk would otherwise raise once per chunk, and a 1 MB blob fed in
-        4 KiB pieces spends more on the exception machinery than on the bytes.
-        Every other kind answers ``True`` and takes the ordinary path.
+        Asked once per feed, on the resume path only, and only for the two kinds
+        whose length is known from the header — a fixlen payload and a fixlen
+        array. The *first* attempt at a value still just tries and catches; what
+        this removes is the retry raising again on every later chunk. A 1 MB blob
+        fed in 4 KiB pieces suspends 244 times, and 243 of those would otherwise
+        spend more on the exception machinery than on the bytes. Putting the
+        check in the field walk instead would charge every field for it, which on
+        the pure engine costs more than it saves.
         """
         pending = self._pending
         assert pending is not None  # only asked while a value is pending
@@ -964,10 +966,6 @@ class Decoder:
                 continue
 
             if entry is not None:
-                if not self._value_ready():
-                    self._resume_kind = _R_BOUND
-                    self._resume_entry = entry
-                    return True
                 try:
                     self._take_bound(entry)
                 except SofaIncompleteError:
@@ -981,9 +979,6 @@ class Decoder:
                 assert f is not None
                 if visitor.on_field(f) is False:
                     continue
-                if not self._value_ready():
-                    self._resume_kind = _R_VISIT
-                    return True
                 try:
                     self._visit_value(visitor, f)
                 except SofaIncompleteError:

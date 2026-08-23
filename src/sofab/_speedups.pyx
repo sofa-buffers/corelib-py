@@ -2756,13 +2756,11 @@ cdef class Decoder:
         self._tab = 0 if self._binding is not None else -1
 
     cdef inline bint _value_ready(self) noexcept:
-        # Are all of the pending value's bytes buffered? Only asked for the two
-        # kinds whose length is known from the header — a fixlen payload and a
-        # fixlen array. It is a cheap stand-in for attempting the read and
-        # catching its suspension: a payload larger than one chunk would
-        # otherwise raise once per chunk, and a 1 MB blob fed in 4 KiB pieces
-        # spends more on the exception machinery than on the bytes. Every other
-        # kind answers True and takes the ordinary path.
+        # Are all of the pending value's bytes buffered? Asked once per feed, on
+        # the resume path only, and only for the two kinds whose length is known
+        # from the header. The first attempt at a value still just tries and
+        # catches; what this removes is the retry raising again on every later
+        # chunk — a 1 MB blob fed in 4 KiB pieces suspends 244 times.
         cdef uint64_t want
         if self._pk == _PEND_FIXLEN:
             return <uint64_t>(self._n - self._pos) >= self._pend_size
@@ -2844,10 +2842,6 @@ cdef class Decoder:
                 continue
 
             if ei >= 0:
-                if not self._value_ready():
-                    self._resume_kind = _R_BOUND
-                    self._resume_entry = ei
-                    return 1
                 try:
                     self._take_bound(&self._bent[ei])
                 except SofaIncompleteError:
@@ -2859,9 +2853,6 @@ cdef class Decoder:
             if visitor is not None:
                 if visitor.on_field(self._cur) is False:
                     continue
-                if not self._value_ready():
-                    self._resume_kind = _R_VISIT
-                    return 1
                 try:
                     self._visit_value(visitor)
                 except SofaIncompleteError:
