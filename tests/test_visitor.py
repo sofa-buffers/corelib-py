@@ -176,6 +176,7 @@ def test_the_base_control_hooks_do_not_decline():
     # on_array_begin's default is the same promise in its own shape: no
     # destination, no declared width, so the array takes the list route.
     assert base.on_array_begin(1, WireType.ARRAY_UNSIGNED, 3) is None
+    assert base.on_blob_begin(1, 3) is None
 
 
 class _Delegating(Visitor):

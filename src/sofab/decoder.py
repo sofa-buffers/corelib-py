@@ -118,6 +118,23 @@ _ST_BLOB = int(FixlenSubtype.BLOB)
 _I64_MIN = -(1 << 63)
 
 
+def _writable(dst: Any, who: str) -> memoryview:
+    """The caller's destination as a memoryview, or the §6.3 verdict on why not."""
+    try:
+        view = memoryview(dst)
+    except TypeError as exc:
+        raise SofaRangeError(
+            f"{who} returned a destination that is not a writable, "
+            "contiguous buffer"
+        ) from exc
+    if view.readonly or not view.c_contiguous:
+        raise SofaRangeError(
+            f"{who} returned a destination that is not a writable, "
+            "contiguous buffer"
+        )
+    return view
+
+
 def _width_fits(itemsize: int, zigzag: bool, lo: int | None, hi: int | None) -> bool:
     """Does the declared element width fit an ``itemsize``-byte slot?"""
     bits = itemsize * 8
@@ -193,6 +210,7 @@ class Decoder:
         "_status",
         "_visitor",
         "_wants_array_begin",
+        "_wants_blob_begin",
         "_wants_field",
         "_wants_seq_begin",
         "_wd",
@@ -312,6 +330,10 @@ class Decoder:
         self._wants_array_begin = (
             visitor is not None
             and type(visitor).on_array_begin is not Visitor.on_array_begin
+        )
+        self._wants_blob_begin = (
+            visitor is not None
+            and type(visitor).on_blob_begin is not Visitor.on_blob_begin
         )
         # The active table and the stack of enclosing ones. A sequence opens a
         # fresh id scope (§4.9), so descending *replaces* the table rather than
@@ -1412,6 +1434,11 @@ class Decoder:
                 # A parked receiver cap (§6.2.1): the field is being refused, and
                 # the walk over its payload is what the cap exists to prevent.
                 raise SofaLimitError(pending[1])
+            if self._wants_blob_begin and pending[1] == _ST_BLOB:
+                dst = visitor.on_blob_begin(fid, pending[2])
+                if dst is not None:
+                    self._take_blob_into(dst, pending[2])
+                    return
             self._keep = pos = self._pos
             end = pos + pending[2]
             if end > self._n:
@@ -1445,6 +1472,30 @@ class Decoder:
             visitor.on_float32_array(fid, self._take_farray_values(pending, 4))
         else:
             visitor.on_float64_array(fid, self._take_farray_values(pending, 8))
+
+    def _take_blob_into(self, dst: Any, size: int) -> None:
+        """Copy a blob's payload into the caller's buffer (§6.6.3).
+
+        No ``bytes`` is built on the way -- which is the point: the only size a
+        codec could build one from is the wire's, and a megabyte blob would cost
+        a megabyte allocation per message.
+        """
+        view = _writable(dst, "on_blob_begin")
+        if view.itemsize != 1:
+            raise SofaRangeError(
+                "on_blob_begin's destination must hold single bytes"
+            )
+        if view.nbytes < size:
+            raise SofaRangeError(
+                f"on_blob_begin returned {view.nbytes} bytes for a blob of {size}"
+            )
+        self._keep = pos = self._pos
+        end = pos + size
+        if end > self._n:
+            raise self._suspend("truncated payload")
+        view[:size] = memoryview(self._buf)[pos:end]
+        self._pos = end
+        self._pending = None  # committed once the payload is in hand (§5.2)
 
     def _visit_varints(
         self, visitor: Visitor, fid: int, wtype: int, count: int, zigzag: bool
@@ -1482,18 +1533,7 @@ class Decoder:
         # not one element ever boxed. The buffer is the caller's, so a short one
         # is refused rather than grown (§6.6) -- and every verdict below is
         # reached here, at the count header, before an element is read.
-        try:
-            view = memoryview(dst)
-        except TypeError as exc:
-            raise SofaRangeError(
-                "on_array_begin returned a destination that is not a writable, "
-                "contiguous buffer"
-            ) from exc
-        if view.readonly or not view.c_contiguous:
-            raise SofaRangeError(
-                "on_array_begin returned a destination that is not a writable, "
-                "contiguous buffer"
-            )
+        view = _writable(dst, "on_array_begin")
         isz = view.itemsize
         if isz not in (1, 2, 4, 8):
             raise SofaRangeError(

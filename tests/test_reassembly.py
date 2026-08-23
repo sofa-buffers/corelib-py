@@ -143,7 +143,7 @@ def test_the_buffer_is_slid_back_rather_than_declared_full(engine):
     the buffer is only too small once that has been tried."""
     enc = Encoder()
     for i in range(1, 25):
-        enc.write_string(i, "payload-%02d" % i)
+        enc.write_string(i, f"payload-{i:02d}")
     enc.flush()
     wire = enc.getvalue()
 
@@ -151,7 +151,7 @@ def test_the_buffer_is_slid_back_rather_than_declared_full(engine):
     # near the message, so the slide happens on almost every chunk.
     status, rec, _dec = _feed(engine, wire, 13, reassembly=bytearray(48))
     assert status is Status.COMPLETE
-    assert rec.events == [("str", i, "payload-%02d" % i) for i in range(1, 25)]
+    assert rec.events == [("str", i, f"payload-{i:02d}") for i in range(1, 25)]
 
 
 @pytest.mark.parametrize("engine", ENGINES)

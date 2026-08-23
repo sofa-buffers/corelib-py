@@ -261,6 +261,29 @@ there for the bound and the storage, not for speed.
 `on_array_begin` is not called for float arrays: they carry no declared width and
 are already moved in one piece.
 
+#### Blobs: `on_blob_begin`
+
+`on_bytes` receives a `bytes` the decoder had to build, and the only size it
+could build it from is the wire's — a megabyte blob costs a megabyte allocation
+per message. §6.6.3's other shape is a destination you hand back once you know
+the size:
+
+```python
+class Handler(Visitor):
+    def __init__(self):
+        self.frame = bytearray(1 << 20)     # your buffer, your ceiling
+
+    def on_blob_begin(self, field_id, size):
+        if field_id == 9:
+            return self.frame               # filled; on_bytes is not called
+        return None                         # anything else: a bytes as before
+```
+
+A buffer too short is `SofaRangeError` — refused at the length word, before a
+byte is written, and never grown. Strings are not offered: a string you read must
+be validated (§6.7.2), and this port validates by decoding, which builds the
+`str` a destination would exist to avoid.
+
 #### Bounding what a decode holds: `reassembly`
 
 A construct split across two fed chunks has to be joined somewhere. By default
