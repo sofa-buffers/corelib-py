@@ -439,11 +439,14 @@ def test_fixlen_array_payload_beyond_the_address_space_is_truncated(monkeypatch)
     monkeypatch.setattr(_pydec_module, "sys", SimpleNamespace(maxsize=2**31 - 1))
     data = [0x05] + _uvarint(0x7FFFFFFF) + _uvarint((8 << 3) | int(FixlenSubtype.FP64))
 
+    # Both ways in: the driver's readiness check answers first for a field it
+    # would read, and the auto-skip reaches the same ceiling for one it walks
+    # past.
     with pytest.raises(SofaIncompleteError):
         verdict(_PyDecoder, bytes(data))
 
     with pytest.raises(SofaIncompleteError):
-        verdict(_PyDecoder, bytes(data))
+        verdict(_PyDecoder, bytes(data), recorder=Recorder(decline=lambda f: True))
 
 
 def test_max_array_count_rejects_oversize_before_alloc():
@@ -736,3 +739,15 @@ def test_seqend_header_in_range_id_is_accepted(decoder_cls, data, label):
     assert len(ev) == 2
     assert ev[0][0] == "seq{"       # the sequence start keeps its own id
     assert ev[1] == ("seq}",)       # the end marker carries none
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_fixlen_array_huge_count_is_bounded_on_the_skip_path_too(decoder_cls):
+    """The payload size of a fixlen array is a *product*, and both factors come
+    off the wire. Walking past such a field without reading it must reach the
+    same bound: 2^31-1 fp64 elements claim a 16 GB payload, which is reported as
+    truncated rather than attempted."""
+    data = bytes([0x05] + _uvarint(0x7FFFFFFF) + _uvarint((8 << 3) | int(FixlenSubtype.FP64)))
+    with pytest.raises(SofaIncompleteError):
+        # No binding, no visitor hook for it: the field is walked, not read.
+        verdict(decoder_cls, data, recorder=Recorder(decline=lambda f: True))

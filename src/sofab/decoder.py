@@ -867,8 +867,7 @@ class Decoder:
         Every other kind answers ``True`` and takes the ordinary path.
         """
         pending = self._pending
-        if pending is None:
-            return True
+        assert pending is not None  # only asked while a value is pending
         kind = pending[0]
         have = len(self._buf) - self._pos
         if kind == _FIXLEN:
