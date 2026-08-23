@@ -77,6 +77,24 @@ from .types import (
 #: a per-message encoder.
 _SCRATCH_SIZE = 1024
 
+# The wire types and fixlen subtypes as plain ints. Every one of these is used
+# as a *number* -- OR-ed into a header, passed to _header -- and reaching it
+# through the enum class costs a global load plus an attribute lookup on every
+# write call. The enum members stay in the public signatures; only the arithmetic
+# uses these.
+_WT_UNSIGNED = int(WireType.UNSIGNED)
+_WT_SIGNED = int(WireType.SIGNED)
+_WT_FIXLEN = int(WireType.FIXLEN)
+_WT_ARRAY_UNSIGNED = int(WireType.ARRAY_UNSIGNED)
+_WT_ARRAY_SIGNED = int(WireType.ARRAY_SIGNED)
+_WT_ARRAY_FIXLEN = int(WireType.ARRAY_FIXLEN)
+_WT_SEQUENCE_START = int(WireType.SEQUENCE_START)
+_WT_SEQUENCE_END = int(WireType.SEQUENCE_END)
+_ST_FP32 = int(FixlenSubtype.FP32)
+_ST_FP64 = int(FixlenSubtype.FP64)
+_ST_STRING = int(FixlenSubtype.STRING)
+_ST_BLOB = int(FixlenSubtype.BLOB)
+
 #: Bytes a varint can occupy (§4.1), and therefore the room the in-place
 #: fast path in :meth:`Encoder._emit_varint` requires before it writes.
 _VARINT_MAX = 10
@@ -388,7 +406,7 @@ class Encoder:
         else:
             self._put(encode_varint(value))
 
-    def _header(self, field_id: SupportsIndex, wtype: WireType) -> None:
+    def _header(self, field_id: SupportsIndex, wtype: int) -> None:
         """Write a field header — the single choke point every field write passes
         through, and therefore where a held-back sequence run is committed.
 
@@ -418,7 +436,7 @@ class Encoder:
         run = self._pending
         self._pending = None
         for field_id in run or ():
-            self._emit_varint((field_id << 3) | WireType.SEQUENCE_START)
+            self._emit_varint((field_id << 3) | _WT_SEQUENCE_START)
 
     def _begin(self) -> bool:
         """Sticky-mode gate. Returns ``False`` if the op should be skipped."""
@@ -449,7 +467,7 @@ class Encoder:
                 value = _as_int(value, "unsigned value")
             if value < 0 or value > UNSIGNED_MAX:
                 raise SofaRangeError(f"unsigned value {value} out of range")
-            self._header(field_id, WireType.UNSIGNED)
+            self._header(field_id, _WT_UNSIGNED)
             self._emit_varint(value)
         except SofaError as exc:
             self._fail(exc)
@@ -468,7 +486,7 @@ class Encoder:
                 value = _as_int(value, "signed value")
             if value < SIGNED_MIN or value > SIGNED_MAX:
                 raise SofaRangeError(f"signed value {value} out of range")
-            self._header(field_id, WireType.SIGNED)
+            self._header(field_id, _WT_SIGNED)
             self._emit_varint(zigzag_encode(value))
         except SofaError as exc:
             self._fail(exc)
@@ -479,11 +497,11 @@ class Encoder:
 
     def write_float32(self, field_id: SupportsIndex, value: float) -> None:
         """Write a 32-bit IEEE-754 float as a little-endian fixlen field."""
-        self._write_fixlen(field_id, _core.pack_f32(value), FixlenSubtype.FP32)
+        self._write_fixlen(field_id, _core.pack_f32(value), _ST_FP32)
 
     def write_float64(self, field_id: SupportsIndex, value: float) -> None:
         """Write a 64-bit IEEE-754 float as a little-endian fixlen field."""
-        self._write_fixlen(field_id, _core.pack_f64(value), FixlenSubtype.FP64)
+        self._write_fixlen(field_id, _core.pack_f64(value), _ST_FP64)
 
     def write_string(self, field_id: SupportsIndex, text: str) -> None:
         r"""Write a UTF-8 string as a fixlen field (STRING subtype).
@@ -505,7 +523,7 @@ class Encoder:
         except UnicodeEncodeError as exc:
             self._fail(SofaRangeError(f"string field is not valid UTF-8: {exc}"))
             return
-        self._write_fixlen(field_id, data, FixlenSubtype.STRING)
+        self._write_fixlen(field_id, data, _ST_STRING)
 
     def write_bytes(self, field_id: SupportsIndex,
                     data: bytes | bytearray | memoryview) -> None:
@@ -523,10 +541,10 @@ class Encoder:
             self._fail(SofaRangeError(
                 f"fixlen payload of {n} bytes exceeds FIXLEN_MAX={FIXLEN_MAX}"))
             return
-        self._write_fixlen(field_id, bytes(data), FixlenSubtype.BLOB)
+        self._write_fixlen(field_id, bytes(data), _ST_BLOB)
 
     def _write_fixlen(self, field_id: SupportsIndex, data: bytes,
-                      subtype: FixlenSubtype) -> None:
+                      subtype: int) -> None:
         if not self._begin():
             return
         try:
@@ -542,7 +560,7 @@ class Encoder:
             if n > FIXLEN_MAX:
                 raise SofaRangeError(
                     f"fixlen payload of {n} bytes exceeds FIXLEN_MAX={FIXLEN_MAX}")
-            self._header(field_id, WireType.FIXLEN)
+            self._header(field_id, _WT_FIXLEN)
             self._emit_varint((n << 3) | subtype)
             self._put(data)
         except SofaError as exc:
@@ -564,7 +582,7 @@ class Encoder:
             return
         try:
             seq = list(values)
-            self._array_header(field_id, WireType.ARRAY_UNSIGNED, len(seq))
+            self._array_header(field_id, _WT_ARRAY_UNSIGNED, len(seq))
             # Hot path: the varint codec is inlined over the whole array so each
             # element costs a loop iteration rather than a Python call, and the
             # cursor lives in a local until the loop ends or has to drain. The
@@ -620,7 +638,7 @@ class Encoder:
             return
         try:
             seq = list(values)
-            self._array_header(field_id, WireType.ARRAY_SIGNED, len(seq))
+            self._array_header(field_id, _WT_ARRAY_SIGNED, len(seq))
             buf = self._fixed_ba   # see write_unsigned_array: codec inlined
             limit = self._cap - _VARINT_MAX
             cursor = self._cursor
@@ -659,7 +677,7 @@ class Encoder:
         ``fixlen_word`` is always present (so empty fp32/fp64 arrays stay
         distinguishable) but there is no payload (§4.8).
         """
-        self._write_float_array(field_id, values, FixlenSubtype.FP32, _core.pack_f32_array, 4)
+        self._write_float_array(field_id, values, _ST_FP32, _core.pack_f32_array, 4)
 
     def write_float64_array(self, field_id: SupportsIndex, values: Iterable[float]) -> None:
         """Write an array of 64-bit floats as a packed little-endian fixlen array.
@@ -669,13 +687,13 @@ class Encoder:
         ``fixlen_word`` is always present (so empty fp32/fp64 arrays stay
         distinguishable) but there is no payload (§4.8).
         """
-        self._write_float_array(field_id, values, FixlenSubtype.FP64, _core.pack_f64_array, 8)
+        self._write_float_array(field_id, values, _ST_FP64, _core.pack_f64_array, 8)
 
     def _write_float_array(
         self,
         field_id: SupportsIndex,
         values: Iterable[float],
-        subtype: FixlenSubtype,
+        subtype: int,
         pack_array: Callable[[list[float]], bytes],
         elem_size: int,
     ) -> None:
@@ -683,7 +701,7 @@ class Encoder:
             return
         try:
             seq = [float(v) for v in values]
-            self._array_header(field_id, WireType.ARRAY_FIXLEN, len(seq))
+            self._array_header(field_id, _WT_ARRAY_FIXLEN, len(seq))
             # §4.8: a fixlen array ALWAYS carries its fixlen_word (the shared
             # element subtype/width), even when empty, so an empty fp32 and fp64
             # array stay distinguishable on the wire. The payload loop then runs
@@ -693,7 +711,7 @@ class Encoder:
         except SofaError as exc:
             self._fail(exc)
 
-    def _array_header(self, field_id: SupportsIndex, wtype: WireType, count: int) -> None:
+    def _array_header(self, field_id: SupportsIndex, wtype: int, count: int) -> None:
         # Defensive: count is always len() of a materialized list, so it is
         # non-negative and can't exceed ARRAY_MAX without exhausting memory first.
         if count < 0 or count > ARRAY_MAX:  # pragma: no cover
@@ -774,7 +792,7 @@ class Encoder:
                 self._pending.pop()
                 self._depth -= 1
                 return
-            self._emit_varint(WireType.SEQUENCE_END)
+            self._emit_varint(_WT_SEQUENCE_END)
             self._depth -= 1
         except SofaError as exc:
             self._fail(exc)
@@ -811,7 +829,7 @@ class Encoder:
                 raise SofaRangeError("sequence_end without matching begin")
             if self._pending:
                 self._commit_pending()
-            self._emit_varint(WireType.SEQUENCE_END)
+            self._emit_varint(_WT_SEQUENCE_END)
             self._depth -= 1
         except SofaError as exc:
             self._fail(exc)
