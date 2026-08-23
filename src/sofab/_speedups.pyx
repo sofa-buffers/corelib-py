@@ -53,6 +53,11 @@ from cpython.bytearray cimport PyByteArray_AS_STRING, PyByteArray_GET_SIZE
 from cpython.list cimport PyList_Append, PyList_GET_ITEM, PyList_GET_SIZE, PyList_New
 from cpython.buffer cimport (PyObject_GetBuffer, PyBuffer_Release,
                              PyBUF_WRITABLE, PyBUF_SIMPLE)
+cdef extern from "Python.h":
+    # One object over the memory, with no Py_buffer round trip and no slice of a
+    # parent view -- the flush path builds one of these per drain.
+    object PyMemoryView_FromMemory(char* mem, Py_ssize_t size, int flags)
+    int PyBUF_READ
 from cpython.long cimport PyLong_FromUnsignedLongLong, PyLong_FromLongLong
 from cpython.ref cimport PyObject, Py_INCREF
 from libc.stdint cimport (uint8_t, uint16_t, uint32_t, uint64_t,
@@ -940,6 +945,9 @@ cdef class Encoder:
     # output buffer (always installed: the convenience constructors install a
     # scratch buffer, over_buffer the caller's)
     cdef object _fixed_obj          # the bytearray being written into (keeps it alive)
+    # One memoryview per installation, so a flush costs a slice of it rather than
+    # a fresh view plus a slice. The blob-streaming row flushes ~977 times.
+    cdef object _fixed_view
     # The convenience constructors' scratch: one fixed block, allocated at
     # construction and never resized (S5.1 -- an output buffer is never grown).
     # Raw C memory rather than a bytearray because nothing outside the encoder
@@ -981,6 +989,7 @@ cdef class Encoder:
 
     def __cinit__(self):
         self._fixed_obj = None
+        self._fixed_view = None
         self._scratch = NULL
         self._fixed_ptr = NULL
         self._fixed_cap = 0
@@ -1063,6 +1072,7 @@ cdef class Encoder:
                 "MIN_OUTPUT_BUFFER=%d usable byte(s), got %d"
                 % (_MIN_OUTPUT_BUFFER, size - <Py_ssize_t>offset))
         self._fixed_obj = buffer
+        self._fixed_view = memoryview(buffer)
         self._fixed_ptr = <unsigned char*>PyByteArray_AS_STRING(buffer)
         self._fixed_cap = <size_t>size
         self._cursor = <size_t>offset
@@ -1137,23 +1147,23 @@ cdef class Encoder:
         # both "other memory" and the thing that makes §5.1.5's take-the-buffer
         # half unreachable.
         cdef Py_ssize_t used = <Py_ssize_t>self._cursor
-        cdef bint owned = self._fixed_obj is not None
-        if owned:
-            view = memoryview(self._fixed_obj)[0:used]
+        # A caller-installed buffer keeps its object behind the view, so a sink
+        # can see whose buffer it holds and the bytearray stays alive while it
+        # does. The scratch shape has no such object -- one memoryview straight
+        # over the memory then, which is also the cheaper of the two and the one
+        # the streaming rows take.
+        if self._fixed_view is not None:
+            view = self._fixed_view[0:used]
         else:
-            # The scratch shape has no Python object behind it, so the view is
-            # made over the pointer. Same memory either way: the sink still sees
-            # only the installed buffer.
-            view = <unsigned char[:used]>self._fixed_ptr
+            view = PyMemoryView_FromMemory(<char*>self._fixed_ptr, used, PyBUF_READ)
         if self._writer is not None:
             self._writer.write(view)
         else:
             self._flush_sink(view)
         if self._installs == installs:
-            if owned:
-                # The sink copied, so the buffer is ours again and the export has
-                # to go -- it would otherwise block the next buffer_set.
-                view.release()
+            # The sink copied, so the buffer is ours again and the export has to
+            # go -- it would otherwise block the next buffer_set.
+            view.release()
             self._cursor = 0
         return 0
 
@@ -1933,14 +1943,17 @@ cdef class Decoder:
         # than read as "no limit"; the defaults are the format ceilings above
         # which the value is already INVALID, which is the widest a limit can be
         # while still being one. See the pure engine for the full note.
-        for _lname, _lval, _lceil in (
-                ("max_dyn_array_count", max_dyn_array_count, _ARRAY_MAX_OBJ),
-                ("max_dyn_string_len", max_dyn_string_len, _FIXLEN_MAX_OBJ),
-                ("max_dyn_blob_len", max_dyn_blob_len, _FIXLEN_MAX_OBJ)):
-            if _lval is None:
-                raise SofaRangeError("%s has no unset state (§6.2.1)" % _lname)
-            if _lval < 0 or _lval > _lceil:
-                raise SofaRangeError("%s=%s is outside 0..%s" % (_lname, _lval, _lceil))
+        # Written out rather than looped: a decoder is constructed per message on
+        # the one-shot path, and a Python-level loop over three tuples is a
+        # measurable share of that.
+        # The identity test is not a shortcut past the check: a default IS the
+        # ceiling object, and the ceiling is what the check would accept.
+        if max_dyn_array_count is not _ARRAY_MAX_OBJ:
+            self._check_limit("max_dyn_array_count", max_dyn_array_count, _ARRAY_MAX_OBJ)
+        if max_dyn_string_len is not _FIXLEN_MAX_OBJ:
+            self._check_limit("max_dyn_string_len", max_dyn_string_len, _FIXLEN_MAX_OBJ)
+        if max_dyn_blob_len is not _FIXLEN_MAX_OBJ:
+            self._check_limit("max_dyn_blob_len", max_dyn_blob_len, _FIXLEN_MAX_OBJ)
         self._capped = (max_dyn_array_count < _ARRAY_MAX_OBJ
                         or max_dyn_string_len < _FIXLEN_MAX_OBJ
                         or max_dyn_blob_len < _FIXLEN_MAX_OBJ)
@@ -1970,6 +1983,14 @@ cdef class Decoder:
             PyBuffer_Release(self._wview)
             free(self._wview)
             self._wview = NULL
+
+    cdef inline int _check_limit(self, str name, object value, object ceiling) except -1:
+        # §6.2.1: no unset state, no unlimited mode, and a domain of 0..ceiling.
+        if value is None:
+            raise SofaRangeError("%s has no unset state (§6.2.1)" % name)
+        if value < 0 or value > ceiling:
+            raise SofaRangeError("%s=%s is outside 0..%s" % (name, value, ceiling))
+        return 0
 
     cdef inline void _rebind(self, object newbuf):
         self._buf = newbuf

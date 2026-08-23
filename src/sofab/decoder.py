@@ -273,6 +273,8 @@ class Decoder:
             ("max_dyn_string_len", max_dyn_string_len, FIXLEN_MAX),
             ("max_dyn_blob_len", max_dyn_blob_len, FIXLEN_MAX),
         ):
+            if value is ceiling:
+                continue  # a default: the ceiling is what the check would accept
             if value is None:
                 raise SofaRangeError(f"{name} has no unset state (§6.2.1)")
             if value < 0 or value > ceiling:
