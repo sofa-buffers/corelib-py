@@ -181,6 +181,17 @@ class Decoder:
         self._max_array_count = max_array_count
         self._max_string_len = max_string_len
         self._max_blob_len = max_blob_len
+        # Whether any receiver cap is configured at all. All three default to
+        # off, and the header walk otherwise pays two or three steps per field
+        # to rediscover that — a subtype test, an attribute load and a None
+        # test — for every string, blob and array it passes. One test here skips
+        # all of it; a decoder that does configure a cap falls through to the
+        # full check unchanged.
+        self._capped = (
+            max_array_count is not None
+            or max_string_len is not None
+            or max_blob_len is not None
+        )
         self._buf: bytes | bytearray = b""
         # len(self._buf), kept in step with it. The buffer only ever changes in
         # feed() and reset(), while the walk asks for its length constantly —
@@ -655,22 +666,23 @@ class Decoder:
             # protection nothing; what it buys is the window
             # §6.2.1 requires, in which the caller can declare the field
             # schema-bounded and take the cap off it (:meth:`schema_bounded`).
-            if subtype == _ST_STRING:
-                cap = self._max_string_len
-                if cap is not None and length > cap:
-                    pending = (
-                        _LIMIT,
-                        f"string length {length} exceeds max_string_len {cap}",
-                        pending,
-                    )
-            elif subtype == _ST_BLOB:
-                cap = self._max_blob_len
-                if cap is not None and length > cap:
-                    pending = (
-                        _LIMIT,
-                        f"blob length {length} exceeds max_blob_len {cap}",
-                        pending,
-                    )
+            if self._capped:
+                if subtype == _ST_STRING:
+                    cap = self._max_string_len
+                    if cap is not None and length > cap:
+                        pending = (
+                            _LIMIT,
+                            f"string length {length} exceeds max_string_len {cap}",
+                            pending,
+                        )
+                elif subtype == _ST_BLOB:
+                    cap = self._max_blob_len
+                    if cap is not None and length > cap:
+                        pending = (
+                            _LIMIT,
+                            f"blob length {length} exceeds max_blob_len {cap}",
+                            pending,
+                        )
             self._pending = pending
             return wtype
 
@@ -704,7 +716,7 @@ class Decoder:
                 self._cur = Field(field_id, _WT[wtype], count=count)
             pending = (_VARRAY, wtype, count)
             # Parked, not raised — see the fixlen branch above (§6.2.1).
-            cap = self._max_array_count
+            cap = self._max_array_count if self._capped else None
             if cap is not None and count > cap:
                 pending = (_LIMIT, f"array count {count} exceeds max_array_count {cap}", pending)
             self._pending = pending
@@ -744,7 +756,7 @@ class Decoder:
         self._cur_subtype = subtype
         pending = (_FARRAY, subtype, count, elem_size)
         # Parked, not raised — see the fixlen branch above (§6.2.1).
-        cap = self._max_array_count
+        cap = self._max_array_count if self._capped else None
         if cap is not None and count > cap:
             pending = (_LIMIT, f"array count {count} exceeds max_array_count {cap}", pending)
         self._pending = pending

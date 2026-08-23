@@ -55,6 +55,31 @@ def test_fixlen_length_limit_overflow():
         _decode_fully(data)
 
 
+def _fixlen_header_over_the_ceiling(subtype):
+    """id 1, FIXLEN, a length one past FIXLEN_MAX carrying ``subtype``."""
+    out = [0x0A]
+    word = ((0x7FFF_FFFF + 1) << 3) | subtype
+    while True:
+        b = word & 0x7F
+        word >>= 7
+        out.append(b | (0x80 if word else 0))
+        if not word:
+            return out
+
+
+@pytest.mark.parametrize("subtype", [0x2, 0x3], ids=["string", "blob"])
+def test_fixlen_length_over_the_ceiling_on_a_variable_length_subtype(subtype):
+    """The ceiling is what rejects an oversize string or blob.
+
+    The case above uses an fp subtype, where the exact-width check gets there
+    first and FIXLEN_MAX is never consulted -- fp32 and fp64 carry 4 and 8 bytes
+    and nothing else. STRING and BLOB have no such width, so §6.2's format-wide
+    ceiling is the only thing bounding them, and this is where it fires.
+    """
+    with pytest.raises(SofaDecodeError):
+        _decode_fully(_fixlen_header_over_the_ceiling(subtype))
+
+
 def test_array_count_varint_overflow():
     data = [0x04, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x53]
     with pytest.raises(SofaDecodeError):
