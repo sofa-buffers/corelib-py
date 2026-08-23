@@ -3263,6 +3263,9 @@ cdef class Decoder:
         cdef bint bounded
         cdef int64_t clo = INT64_MIN
         cdef uint64_t chi = <uint64_t>0xFFFFFFFFFFFFFFFF
+        # The receiver limit first (§6.2.1) — see the pure engine for why.
+        if self._pk == _PEND_LIMIT:
+            raise SofaLimitError(self._limit_msg)
         if self._wants_array_begin:
             spec = visitor.on_array_begin(fid, _WT[wtype], count)
             if spec is not None:
@@ -3340,7 +3343,12 @@ cdef class Decoder:
             elif st == _ST_STRING:
                 visitor.on_string(fid, self._string())
             else:
-                if self._wants_blob_begin:
+                # The receiver limit first (§6.2.1): a parked rejection means the
+                # decoder has already refused this blob, so the handler must not
+                # be asked for storage for it. The list route reaches the same
+                # verdict inside _bytes(); this path bypasses that, so it asks
+                # here.
+                if self._wants_blob_begin and self._pk != _PEND_LIMIT:
                     dst = visitor.on_blob_begin(fid, self._pend_size)
                     if dst is not None:
                         self._take_blob_into(dst, <Py_ssize_t>self._pend_size)

@@ -1534,6 +1534,13 @@ class Decoder:
         reject an array that never arrived (§7.1), and a destination offered
         there is a destination the values have already been built without.
         """
+        # The receiver limit first (§6.2.1): it is enforced at the count header,
+        # *before* the allocation it exists to prevent — so the handler is never
+        # asked for storage for an array this decoder has already refused, and
+        # what it sees is the LimitExceeded the message earned rather than a
+        # complaint about the size of a buffer it should not have been asked for.
+        if self._pending is not None and self._pending[0] == _LIMIT:
+            raise SofaLimitError(self._pending[1])
         dst: Any = None
         lo: int | None = None
         hi: int | None = None
@@ -1541,8 +1548,6 @@ class Decoder:
             spec = visitor.on_array_begin(fid, _WT[wtype], count)
             if spec is not None:
                 dst, lo, hi = spec
-        if self._pending is not None and self._pending[0] == _LIMIT:
-            raise SofaLimitError(self._pending[1])
         self._keep = self._pos
         if dst is None:
             out = self._read_varints(count, lo, hi, zigzag)

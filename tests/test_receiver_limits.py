@@ -82,3 +82,67 @@ def test_the_defaults_admit_everything_the_format_admits(engine):
     dec = engine(visitor=rec)
     dec.feed(enc.getvalue())
     assert [e[0] for e in rec.events] == ["str", "blob", "ua"]
+
+
+# --- the limit is reached before anything is committed (§6.2.1) -------------
+
+
+def _uvarint(x):
+    out = bytearray()
+    while True:
+        b = x & 0x7F
+        x >>= 7
+        out.append(b | 0x80 if x else b)
+        if not x:
+            return bytes(out)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_the_limit_precedes_the_handlers_destination_for_an_array(engine):
+    """§6.2.1 enforces at the count header, "before the allocation it is meant
+    to prevent". The handler must therefore never be asked for storage for an
+    array the decoder has already refused -- and what it sees must be the
+    LimitExceeded the message earned, not a complaint about the size of a buffer
+    it should not have been asked for (§6.3)."""
+    from array import array
+
+    asked = []
+
+    class Handler(Recorder):
+        def on_array_begin(self, field_id, wtype, count):
+            asked.append(count)
+            return (array("Q", [0] * 4), None, None)
+
+    # id 1, unsigned array, count 2**31-1, then one lone element byte.
+    wire = bytes([0x0B]) + _uvarint(0x7FFFFFFF) + b"\x01"
+    dec = engine(visitor=Handler(), max_dyn_array_count=4)
+    with pytest.raises(SofaLimitError):
+        dec.feed(wire)
+    assert asked == [], "the handler was asked for storage anyway"
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_the_limit_precedes_the_handlers_destination_for_a_blob(engine):
+    asked = []
+
+    class Handler(Recorder):
+        def on_blob_begin(self, field_id, size):
+            asked.append(size)
+            return bytearray(size)
+
+    wire = bytes([0x0A]) + _uvarint((1_000_000 << 3) | 0x3)
+    dec = engine(visitor=Handler(), max_dyn_blob_len=16)
+    with pytest.raises(SofaLimitError):
+        dec.feed(wire)
+    assert asked == []
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_the_limit_leaves_a_reassembly_buffer_untouched(engine):
+    """The verdict is on the length word alone, so not a byte of payload is
+    buffered -- the caller's reassembly buffer never sees the field."""
+    buf = bytearray(64)
+    dec = engine(visitor=Recorder(), max_dyn_blob_len=16, reassembly=buf)
+    with pytest.raises(SofaLimitError):
+        dec.feed(bytes([0x0A]) + _uvarint((1_000_000 << 3) | 0x3))
+    assert buf == bytearray(64)
