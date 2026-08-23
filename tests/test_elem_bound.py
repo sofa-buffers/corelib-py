@@ -16,10 +16,9 @@ behind the offending element (issue #67).
 
 from __future__ import annotations
 
-import io
-
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
+from vectors import Binding, bound, raise_for
 from vectors import uvarint as _varint
 from vectors import zzvarint as _zz
 
@@ -40,9 +39,24 @@ def _sarray(values: list[int]) -> bytes:
 
 
 def _read(engine, data: bytes, signed: bool, *bounds):
-    d = engine(io.BytesIO(data))
-    d.next()
-    return d.read_signed_array(*bounds) if signed else d.read_unsigned_array(*bounds)
+    """Decode the one array in ``data`` against its declared element width.
+
+    The width lives on the binding now (``elem_min`` / ``elem_max``), which is
+    where a schema-declared bound belongs; ``raise_for`` turns the outcome back
+    into the verdict these tests assert on.
+    """
+    b = Binding()
+    if signed:
+        lo, hi = (list(bounds) + [None, None])[:2]
+        # id 1 for the signed header, id 0 for the unsigned one — see S_HDR/U_HDR.
+        b.signed_array(1, at=0, cap=64, count_at=100, elem_min=lo, elem_max=hi)
+    else:
+        hi = (list(bounds) + [None])[0]
+        b.unsigned_array(0, at=0, cap=64, count_at=100, elem_max=hi)
+    st, dec, slots = bound(engine, data, b)
+    raise_for(st, dec)
+    n = slots.u[100]
+    return slots.arr_q(0, n) if signed else slots.arr_u(0, n)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -163,9 +177,7 @@ class TestOneSidedSignedBounds:
 
 @pytest.mark.parametrize("engine", ENGINES)
 def test_bounds_do_not_change_a_valid_array(engine):
-    d = engine(io.BytesIO(S_HDR + b"\x03\x02\x04\x06"))
-    d.next()
-    assert d.read_signed_array(-128, 127) == [1, 2, 3]
+    assert _read(engine, S_HDR + b"\x03\x02\x04\x06", True, -128, 127) == [1, 2, 3]
 
 
 # --- the verdict is exactly "lo <= value <= hi", for every bound and value ---

@@ -24,7 +24,7 @@ Embedded U+0000 is valid UTF-8 and round-trips unchanged in both directions.
 from __future__ import annotations
 
 import pytest
-from vectors import ChunkReader, reader
+from vectors import Recorder, Status, raise_for, walk
 
 from sofab import (
     Decoder,
@@ -67,12 +67,13 @@ def _string_message(payload: bytes, field_id: int = 0) -> bytes:
 
 
 def _read_first_string(data: bytes, *, chunk: int | None = None) -> str:
-    src = ChunkReader(data, chunk) if chunk is not None else reader(data)
-    dec = Decoder(src)
-    fld = dec.next()
-    assert fld is not None and fld.type == WireType.FIXLEN
-    assert fld.subtype == FixlenSubtype.STRING
-    return dec.string()
+    status, rec, dec = walk(Decoder, data, chunk=chunk)
+    raise_for(status, dec)
+    assert rec.fields and rec.fields[0].type == WireType.FIXLEN
+    assert rec.fields[0].subtype == FixlenSubtype.STRING
+    kind, _fid, value = rec.events[0]
+    assert kind == "str"
+    return value
 
 
 # --- decode: invalid UTF-8 is the INVALID outcome ----------------------------
@@ -94,12 +95,13 @@ def test_decode_invalid_utf8_is_invalid_chunked(payload):
 @pytest.mark.parametrize("payload", _INVALID_PAYLOADS.values(), ids=list(_INVALID_PAYLOADS))
 def test_skipped_invalid_string_is_not_validated(payload):
     # A skipped field is never materialized, so its bytes are never validated.
-    data = _string_message(payload)
-    dec = Decoder(reader(data))
-    fld = dec.next()
-    assert fld is not None
-    dec.skip()  # must not raise
-    assert dec.next() is None
+    # A visitor that declines the field: the driver walks its bytes without
+    # materialising them, so they are never validated.
+    status, rec, _dec = walk(
+        Decoder, _string_message(payload), recorder=Recorder(decline=lambda f: True)
+    )
+    assert status is Status.COMPLETE
+    assert rec.fields and rec.events == []
 
 
 # --- encode: unencodable str is InvalidArgument ------------------------------

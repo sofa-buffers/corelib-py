@@ -40,13 +40,12 @@ Usage:
 
 from __future__ import annotations
 
-import io
 import os
 import sys
 import time
 from typing import Callable
 
-from sofab import IMPL, Decoder, Encoder, WireType
+from sofab import IMPL, Decoder, Encoder, Visitor
 
 N = 1000
 GOLDEN = 0x9E3779B97F4A7C15
@@ -104,45 +103,52 @@ def encode_typical_msg() -> bytes:
 # ---- decode workloads (fold values into a checksum so nothing is elided) -----
 
 
+class _U64ArraySink(Visitor):
+    __slots__ = ("acc",)
+
+    def __init__(self) -> None:
+        self.acc = 0
+
+    def on_unsigned_array(self, field_id: int, values: list) -> None:
+        self.acc += values[0] + values[-1]
+
+
 def decode_u64_array(data: bytes) -> int:
-    dec = Decoder(io.BytesIO(data))
-    acc = 0
-    while (f := dec.next()) is not None:
-        if f.type == WireType.ARRAY_UNSIGNED:
-            a = dec.read_unsigned_array()
-            acc += a[0] + a[-1]
-        else:
-            dec.skip()
-    return acc
+    sink = _U64ArraySink()
+    Decoder(visitor=sink).feed(data)
+    return sink.acc
+
+
+class _TypicalSink(Visitor):
+    """The typical message, folded into a checksum. The nested sequence reuses
+    ids 1 and 2, and the decoder gives no depth — but both scopes fold the same
+    way here, so the sum is the same either way."""
+
+    __slots__ = ("acc",)
+
+    def __init__(self) -> None:
+        self.acc = 0
+
+    def on_unsigned(self, field_id: int, value: int) -> None:
+        self.acc += value
+
+    def on_signed(self, field_id: int, value: int) -> None:
+        self.acc += value & MASK64
+
+    def on_float32(self, field_id: int, value: float) -> None:
+        self.acc += int(value)
+
+    def on_string(self, field_id: int, value: str) -> None:
+        self.acc += len(value)
+
+    def on_unsigned_array(self, field_id: int, values: list) -> None:
+        self.acc += values[0]
 
 
 def decode_typical(data: bytes) -> int:
-    dec = Decoder(io.BytesIO(data))
-    acc = 0
-    while (f := dec.next()) is not None:
-        if f.id == 1 and f.type == WireType.UNSIGNED:
-            acc += dec.unsigned()
-        elif f.id == 2 and f.type == WireType.SIGNED:
-            acc += dec.signed() & MASK64
-        elif f.id == 3:
-            acc += 1 if dec.bool() else 0
-        elif f.id == 4:
-            acc += int(dec.float32())
-        elif f.id == 5:
-            acc += len(dec.string())
-        elif f.id == 6:
-            acc += dec.read_unsigned_array()[0]
-        elif f.type == WireType.SEQUENCE_START:
-            while (g := dec.next()) is not None and g.type != WireType.SEQUENCE_END:
-                if g.id == 1:
-                    acc += dec.unsigned()
-                elif g.id == 2:
-                    acc += dec.signed() & MASK64
-                else:
-                    dec.skip()
-        else:
-            dec.skip()
-    return acc
+    sink = _TypicalSink()
+    Decoder(visitor=sink).feed(data)
+    return sink.acc
 
 
 # ---- blob 1MB (BENCH_SPEC "blob 1MB") ---------------------------------------
@@ -227,16 +233,24 @@ def encode_blob_stream(enc: Encoder, blob: bytes) -> int:
     return enc.flush()
 
 
+class _BlobSink(Visitor):
+    __slots__ = ("acc",)
+
+    def __init__(self) -> None:
+        self.acc = 0
+
+    def on_bytes(self, field_id: int, value: bytes) -> None:
+        self.acc += len(value) + value[0]
+
+
 def decode_blob(data: bytes) -> int:
-    dec = Decoder(_ChunkReader(data, STREAM_BUFFER), chunk_size=STREAM_BUFFER)
-    acc = 0
-    while (f := dec.next()) is not None:
-        if f.type == WireType.FIXLEN:
-            payload = dec.bytes()
-            acc += len(payload) + payload[0]
-        else:
-            dec.skip()
-    return acc
+    """Fed in fixed 4096-byte chunks, the same size every port streams with, so
+    the payload straddles the boundary as many times as it does elsewhere."""
+    sink = _BlobSink()
+    dec = Decoder(visitor=sink)
+    for off in range(0, len(data), STREAM_BUFFER):
+        dec.feed(data[off : off + STREAM_BUFFER])
+    return sink.acc
 
 
 # ---- composite (BENCH_SPEC "composite") -------------------------------------
@@ -294,49 +308,56 @@ def encode_composite_msg() -> bytes:
     return enc.getvalue()
 
 
-def _decode_seq(dec: Decoder) -> int:
-    """Read one open sequence to its end, recursing into nested ones."""
-    acc = 0
-    while (g := dec.next()) is not None and g.type != WireType.SEQUENCE_END:
-        if g.type == WireType.SEQUENCE_START:
-            acc += _decode_seq(dec)
-        elif g.type == WireType.UNSIGNED:
-            acc += dec.unsigned()
-        elif g.type == WireType.SIGNED:
-            acc += dec.signed() & MASK64
-        elif g.type == WireType.FIXLEN:
-            acc += len(dec.string())
-        else:
-            dec.skip()
-    return acc
+class _CompositeSink(Visitor):
+    """Reads every field of the composite message, at every depth."""
+
+    __slots__ = ("acc",)
+
+    def __init__(self) -> None:
+        self.acc = 0
+
+    def on_unsigned(self, field_id: int, value: int) -> None:
+        self.acc += value
+
+    def on_signed(self, field_id: int, value: int) -> None:
+        self.acc += value & MASK64
+
+    def on_string(self, field_id: int, value: str) -> None:
+        self.acc += len(value)
 
 
 def decode_composite(data: bytes) -> int:
     """Whole message, all fields read."""
-    dec = Decoder(io.BytesIO(data))
-    acc = 0
-    while (f := dec.next()) is not None:
-        if f.type == WireType.SEQUENCE_START:
-            acc += _decode_seq(dec)
-        elif f.type == WireType.UNSIGNED:
-            acc += dec.unsigned()
-        elif f.type == WireType.FIXLEN:
-            acc += len(dec.string())
-        else:
-            dec.skip()
-    return acc
+    sink = _CompositeSink()
+    Decoder(visitor=sink).feed(data)
+    return sink.acc
+
+
+class _SkipAllSink(Visitor):
+    """Declines every field and every sub-sequence: the decoder walks their
+    bytes and materializes nothing."""
+
+    __slots__ = ("n",)
+
+    def __init__(self) -> None:
+        self.n = 0
+
+    def on_field(self, field) -> bool:
+        self.n += 1
+        return False
+
+    def on_sequence_begin(self, field_id: int) -> bool:
+        self.n += 1
+        return False
 
 
 def decode_composite_skip(data: bytes) -> int:
     """Same bytes, every field and sub-sequence skipped — the path a router or a
-    filter runs: walk the message, materialize nothing. ``skip()`` on a sequence
-    start consumes the whole sub-tree."""
-    dec = Decoder(io.BytesIO(data))
-    n = 0
-    while dec.next() is not None:
-        dec.skip()
-        n += 1
-    return n
+    filter runs: walk the message, materialize nothing."""
+    sink = _SkipAllSink()
+    Decoder(visitor=sink).feed(data)
+    return sink.n
+
 
 
 # ---- workload registry ------------------------------------------------------
@@ -534,43 +555,44 @@ def encode_perf_msg() -> bytes:
     return enc.getvalue()
 
 
+class _PerfSink(Visitor):
+    """The perf message, every value folded into a checksum."""
+
+    __slots__ = ("acc",)
+
+    def __init__(self) -> None:
+        self.acc = 0
+
+    def on_unsigned(self, field_id: int, value: int) -> None:
+        self.acc += value
+
+    def on_signed(self, field_id: int, value: int) -> None:
+        self.acc += value & MASK64
+
+    def on_float32(self, field_id: int, value: float) -> None:
+        self.acc += int(value)
+
+    def on_float64(self, field_id: int, value: float) -> None:
+        self.acc += int(value)
+
+    def on_string(self, field_id: int, value: str) -> None:
+        self.acc += len(value)
+
+    def on_unsigned_array(self, field_id: int, values: list) -> None:
+        self.acc += values[0] + values[-1]
+
+    def on_signed_array(self, field_id: int, values: list) -> None:
+        self.acc += (values[0] + values[-1]) & MASK64
+
+    def on_float64_array(self, field_id: int, values: list) -> None:
+        self.acc += int(values[0])
+
+
 def decode_perf(data: bytes) -> int:
     """Decode the perf message, folding every value into a checksum."""
-    dec = Decoder(io.BytesIO(data))
-    acc = 0
-    while (f := dec.next()) is not None:
-        if f.type == WireType.SEQUENCE_START:
-            while (g := dec.next()) is not None and g.type != WireType.SEQUENCE_END:
-                if g.id == 1:
-                    acc += dec.unsigned()
-                elif g.id == 2:
-                    acc += dec.signed() & MASK64
-                else:
-                    dec.skip()
-        elif f.id in (1, 3):
-            acc += dec.unsigned()
-        elif f.id in (2, 4):
-            acc += dec.signed() & MASK64
-        elif f.id == 5:
-            acc += 1 if dec.bool() else 0
-        elif f.id == 6:
-            acc += int(dec.float32())
-        elif f.id == 7:
-            acc += int(dec.float64())
-        elif f.id == 8:
-            acc += len(dec.string())
-        elif f.id == 9:
-            a = dec.read_unsigned_array()
-            acc += a[0] + a[-1]
-        elif f.id == 10:
-            a = dec.read_signed_array()
-            acc += (a[0] + a[-1]) & MASK64
-        elif f.id == 11:
-            a = dec.read_float64_array()
-            acc += int(a[0])
-        else:
-            dec.skip()
-    return acc
+    sink = _PerfSink()
+    Decoder(visitor=sink).feed(data)
+    return sink.acc
 
 
 def measure_perop(body, msg_bytes: int) -> tuple[int, float, float]:

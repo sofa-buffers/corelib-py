@@ -6,9 +6,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from vectors import ChunkReader, reader
+from vectors import Recorder, Status, pairs, values, verdict
+from vectors import bound as boundfeed
 
 from sofab import (
+    Binding,
     Decoder,
     Encoder,
     FixlenSubtype,
@@ -23,12 +25,8 @@ from sofab import (
 
 
 def _decode_fully(data):
-    dec = Decoder(reader(data))
-    while True:
-        f = dec.next()
-        if f is None:
-            return
-        dec.skip()
+    """Walk the whole message and surface its verdict."""
+    verdict(Decoder, bytes(data))
 
 
 def test_varint_unsigned_overflow():
@@ -75,39 +73,35 @@ def test_array_count_zero_is_valid():
     # Unsigned array (0x03), signed array (0x04): [header][0x00] then next field —
     # integer arrays never carry a fixlen_word.
     for header in (0x03, 0x04):
-        dec = Decoder(reader([header, 0x00]))
-        f = dec.next()
-        assert f is not None and f.count == 0
-        # No fixlen_word / payload may be consumed; the stream is now at EOF.
-        assert dec.next() is None
+        got = pairs(Decoder, bytes([header, 0x00]))
+        # No fixlen_word / payload may be consumed; that is the whole message.
+        assert len(got) == 1 and got[0][0].count == 0
     # Fixlen array (0x05): [header][0x00][fixlen_word] — the fixlen_word is always
     # present (§4.8), here 0x20 = (4<<3)|fp32, but there is no payload.
-    dec = Decoder(reader([0x05, 0x00, 0x20]))
-    f = dec.next()
-    assert f is not None and f.count == 0 and f.subtype == FixlenSubtype.FP32
-    assert dec.next() is None
+    got = pairs(Decoder, bytes([0x05, 0x00, 0x20]))
+    assert len(got) == 1
+    f, _ev = got[0]
+    assert f.count == 0 and f.subtype == FixlenSubtype.FP32
 
 
 def test_array_fixlen_count_zero_reads_the_fixlen_word():
     # §4.8: an empty fixlen array still carries its fixlen_word, so the bytes
     # after [0x05, 0x00, <fixlen_word>] must be parsed as the NEXT field.
     # 0x20 = (4<<3)|fp32 fixlen_word; 0x50 = (10 << 3) | UNSIGNED, 0x07 = value 7.
-    dec = Decoder(reader([0x05, 0x00, 0x20, 0x50, 0x07]))
-    f = dec.next()
-    assert f is not None and f.count == 0 and f.subtype == FixlenSubtype.FP32
-    assert dec.read_float32_array() == []  # empty fixlen array reads as []
-    nxt = dec.next()
-    assert nxt is not None and nxt.id == 10 and dec.unsigned() == 7
+    got = pairs(Decoder, bytes([0x05, 0x00, 0x20, 0x50, 0x07]))
+    assert len(got) == 2
+    (f, ev), (nxt, nxt_ev) = got
+    assert f.count == 0 and f.subtype == FixlenSubtype.FP32
+    assert ev[2] == ()  # empty fixlen array reads as empty
+    assert nxt.id == 10 and nxt_ev == ("u", 10, 7)
 
 
 def test_string_invalid_utf8_raises_decode_error():
     # fixlen STRING (subtype 0x2) of length 2 with invalid UTF-8 bytes.
     # length_header = (2 << 3) | 0x2 = 0x12; payload 0xFF 0xFE is not valid UTF-8.
     data = [0x02, 0x12, 0xFF, 0xFE]
-    dec = Decoder(reader(data))
-    dec.next()
     with pytest.raises(SofaDecodeError):
-        dec.string()
+        verdict(Decoder, bytes(data))
 
 
 def test_decode_nesting_beyond_max_depth_rejected():
@@ -133,9 +127,8 @@ def test_array_fixlen_element_width_mismatch_underflow():
     # payload is read (the native engine used to trust the count and read off
     # the end of the buffer — SIGSEGV). Both engines must reject it at next().
     # 0x05 = (0<<3)|ARRAY_FIXLEN, 0x01 = count 1, 0x00 = fixlen_word (0<<3)|fp32.
-    dec = Decoder(reader([0x05, 0x01, 0x00]))
     with pytest.raises(SofaDecodeError):
-        dec.next()
+        verdict(Decoder, bytes([0x05, 0x01, 0x00]))
 
 
 def test_array_fixlen_element_width_mismatch_overflow():
@@ -144,18 +137,16 @@ def test_array_fixlen_element_width_mismatch_overflow():
     # rejected eagerly at header time.
     # 0x40 = (8<<3)|fp32; eight payload bytes follow the count-1 element.
     data = [0x05, 0x01, 0x40, 0, 0, 0x80, 0x3F, 0, 0, 0, 0]
-    dec = Decoder(reader(data))
     with pytest.raises(SofaDecodeError):
-        dec.next()
+        verdict(Decoder, bytes(data))
 
 
 def test_array_fixlen_fp64_width_mismatch():
     # Same defect on the fp64 path: subtype fp64 (1) with a 4-byte element width.
     # 0x05 = ARRAY_FIXLEN, 0x01 = count 1, 0x21 = (4<<3)|fp64; four payload bytes.
     data = [0x05, 0x01, 0x21, 0, 0, 0, 0]
-    dec = Decoder(reader(data))
     with pytest.raises(SofaDecodeError):
-        dec.next()
+        verdict(Decoder, bytes(data))
 
 
 def _uvarint(n: int) -> list[int]:
@@ -211,14 +202,8 @@ except ImportError:  # pragma: no cover - pure-Python-only install
 
 
 def _decode_one(decoder_cls, data):
-    """next() then consume the single fixlen field, surfacing its verdict."""
-    dec = decoder_cls(reader(data))
-    f = dec.next()
-    assert f is not None
-    if f.subtype == FixlenSubtype.FP32:
-        dec.float32()
-    else:
-        dec.float64()
+    """Decode the single fixlen field, surfacing its verdict."""
+    verdict(decoder_cls, bytes(data))
 
 
 @pytest.mark.parametrize("decoder_cls", _DECODERS)
@@ -268,9 +253,8 @@ def test_array_fixlen_fp32_zero_width_truncated_is_invalid_not_incomplete(decode
     # F-0014 reproducer: 0x75 = field id 14, wtype ARRAY_FIXLEN; 0x60 = count 96;
     # 0x00 = fixlen_word (size 0, fp32) — fp32 must be 4; 0x0d 0x0d = truncated
     # payload. Wrong width *and* truncated: INVALID must win over INCOMPLETE.
-    dec = decoder_cls(reader([0x75, 0x60, 0x00, 0x0D, 0x0D]))
     with pytest.raises(SofaDecodeError) as exc:
-        dec.next()
+        verdict(decoder_cls, bytes([0x75, 0x60, 0x00, 0x0D, 0x0D]))
     assert not isinstance(exc.value, SofaIncompleteError)
 
 
@@ -278,11 +262,8 @@ def test_array_fixlen_fp32_zero_width_truncated_is_invalid_not_incomplete(decode
 def test_array_fixlen_correct_width_truncated_stays_incomplete(decoder_cls):
     # Control: correct fp32 width (0x20 = (4<<3)|fp32) with count 1 but zero
     # payload bytes → genuinely INCOMPLETE, must NOT be reclassified.
-    dec = decoder_cls(reader([0x05, 0x01, 0x20]))
-    f = dec.next()
-    assert f is not None and f.subtype == FixlenSubtype.FP32
     with pytest.raises(SofaIncompleteError):
-        dec.read_float32_array()
+        verdict(decoder_cls, bytes([0x05, 0x01, 0x20]))
 
 
 def test_nested_sequence_extra_end():
@@ -300,10 +281,8 @@ def test_truncated_payload():
     # fixlen string claims 12 bytes but only 2 follow — the bytes end inside the
     # field, so this is INCOMPLETE (§7), not malformed.
     data = [0x02, 0x62, 0x48, 0x65]
-    dec = Decoder(reader(data))
-    dec.next()
     with pytest.raises(SofaIncompleteError):
-        dec.string()
+        verdict(Decoder, bytes(data))
 
 
 # --- three-valued outcome: INCOMPLETE vs INVALID (MESSAGE_SPEC §7) -----------
@@ -313,9 +292,8 @@ def test_lone_continuation_byte_is_incomplete_not_malformed():
     # A single dangling 0x80 (continuation bit set, no terminating byte) is the
     # canonical INCOMPLETE case: the bytes end inside a varint, more could follow.
     # It must be neither COMPLETE (next() returning a field / None) nor INVALID.
-    dec = Decoder(reader([0x80]))
     with pytest.raises(SofaIncompleteError) as exc:
-        dec.next()
+        verdict(Decoder, bytes([0x80]))
     # INCOMPLETE is a *sibling* of the malformed error, never a subclass, so a
     # caller doing `except SofaDecodeError` does not mistake "need more bytes"
     # for "these bytes are garbage".
@@ -356,20 +334,16 @@ _OVER_64_ELEMS = [_OVERLONG_ELEM, _ELEVEN_BYTE_ELEM]
 @pytest.mark.parametrize("elem", _OVER_64_ELEMS, ids=["ten-byte", "eleven-byte"])
 def test_unsigned_array_element_over_64_bits_is_invalid(decoder_cls, elem):
     # (1<<3)|ARRAY_UNSIGNED, count 1, then one out-of-range element.
-    dec = decoder_cls(reader([(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + elem))
-    assert dec.next() is not None
     with pytest.raises(SofaDecodeError) as exc:
-        dec.read_unsigned_array()
+        verdict(decoder_cls, bytes([(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + elem))
     assert not isinstance(exc.value, SofaIncompleteError)
 
 
 @pytest.mark.parametrize("decoder_cls", _DECODERS)
 @pytest.mark.parametrize("elem", _OVER_64_ELEMS, ids=["ten-byte", "eleven-byte"])
 def test_signed_array_element_over_64_bits_is_invalid(decoder_cls, elem):
-    dec = decoder_cls(reader([(1 << 3) | WireType.ARRAY_SIGNED, 0x01] + elem))
-    assert dec.next() is not None
     with pytest.raises(SofaDecodeError) as exc:
-        dec.read_signed_array()
+        verdict(decoder_cls, bytes([(1 << 3) | WireType.ARRAY_SIGNED, 0x01] + elem))
     assert not isinstance(exc.value, SofaIncompleteError)
 
 
@@ -378,10 +352,8 @@ def test_array_element_over_64_bits_is_invalid_when_chunk_fed(decoder_cls):
     # The same element arriving one byte at a time: the guard has to live in the
     # decode loop itself, not only in a "whole element already buffered" path.
     data = bytes([(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + _OVERLONG_ELEM)
-    dec = decoder_cls(ChunkReader(data, 1))
-    assert dec.next() is not None
     with pytest.raises(SofaDecodeError) as exc:
-        dec.read_unsigned_array()
+        verdict(decoder_cls, bytes(data), chunk=1)
     assert not isinstance(exc.value, SofaIncompleteError)
 
 
@@ -390,10 +362,8 @@ def test_array_element_over_64_bits_after_valid_elements_is_invalid(decoder_cls)
     # The bad element sits behind two good ones, so the guard must hold on every
     # iteration of the loop and not just the first.
     data = [(1 << 3) | WireType.ARRAY_UNSIGNED, 0x03, 0x01, 0x02] + _OVERLONG_ELEM
-    dec = decoder_cls(reader(data))
-    assert dec.next() is not None
     with pytest.raises(SofaDecodeError) as exc:
-        dec.read_unsigned_array()
+        verdict(decoder_cls, bytes(data))
     assert not isinstance(exc.value, SofaIncompleteError)
 
 
@@ -401,26 +371,20 @@ def test_array_element_over_64_bits_after_valid_elements_is_invalid(decoder_cls)
 def test_max_u64_array_element_is_accepted(decoder_cls):
     # Control: the boundary value itself is legal and must survive intact — the
     # guard rejects overflowing payload *bits*, not a full-width element.
-    dec = decoder_cls(reader([(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + _MAX_U64_ELEM))
-    assert dec.next() is not None
-    assert dec.read_unsigned_array() == [0xFFFFFFFFFFFFFFFF]
+    assert values(decoder_cls, bytes([(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + _MAX_U64_ELEM))[0][2] == tuple([0xFFFFFFFFFFFFFFFF])
 
 
 @pytest.mark.parametrize("decoder_cls", _DECODERS)
 def test_min_i64_array_element_is_accepted(decoder_cls):
     # Control for the signed path: the zig-zag encoding of INT64_MIN is 2^64-1.
-    dec = decoder_cls(reader([(1 << 3) | WireType.ARRAY_SIGNED, 0x01] + _MAX_U64_ELEM))
-    assert dec.next() is not None
-    assert dec.read_signed_array() == [-(2**63)]
+    assert values(decoder_cls, bytes([(1 << 3) | WireType.ARRAY_SIGNED, 0x01] + _MAX_U64_ELEM))[0][2] == tuple([-(2**63)])
 
 
 @pytest.mark.parametrize("decoder_cls", _DECODERS)
 def test_skipped_array_with_over_64_bit_element_is_invalid(decoder_cls):
     # Skipping does not lower the bar (§4.1: "and inside skipped fields").
-    dec = decoder_cls(reader([(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + _OVERLONG_ELEM))
-    assert dec.next() is not None
     with pytest.raises(SofaDecodeError) as exc:
-        dec.skip()
+        verdict(decoder_cls, bytes([(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01] + _OVERLONG_ELEM))
     assert not isinstance(exc.value, SofaIncompleteError)
 
 
@@ -437,21 +401,15 @@ def test_unsigned_array_huge_count_does_not_preallocate():
     # decoder still did `[0] * count` this would OOM/hang instead of raising.
     # 0x03 = (0<<3)|ARRAY_UNSIGNED, then count = 0x7FFFFFFF, then one lone byte.
     data = [0x03] + _uvarint(0x7FFFFFFF) + [0x01]
-    dec = Decoder(reader(data))
-    f = dec.next()
-    assert f is not None and f.count == 0x7FFFFFFF
     with pytest.raises(SofaIncompleteError):
-        dec.read_unsigned_array()
+        verdict(Decoder, bytes(data))
 
 
 def test_signed_array_huge_count_does_not_preallocate():
     # Same hardening on the signed-array path (0x04 = (0<<3)|ARRAY_SIGNED).
     data = [0x04] + _uvarint(0x7FFFFFFF) + [0x01]
-    dec = Decoder(reader(data))
-    f = dec.next()
-    assert f is not None and f.count == 0x7FFFFFFF
     with pytest.raises(SofaIncompleteError):
-        dec.read_signed_array()
+        verdict(Decoder, bytes(data))
 
 
 @pytest.mark.parametrize("decoder_cls", _DECODERS)
@@ -463,16 +421,11 @@ def test_fixlen_array_huge_count_does_not_preallocate(decoder_cls):
     # promptly as truncated (INCOMPLETE).
     # 0x05 = (0<<3)|ARRAY_FIXLEN, count = 0x7FFFFFFF, fixlen_word = (8<<3)|FP64.
     data = [0x05] + _uvarint(0x7FFFFFFF) + _uvarint((8 << 3) | int(FixlenSubtype.FP64))
-    dec = decoder_cls(reader(data))
-    f = dec.next()
-    assert f is not None and f.count == 0x7FFFFFFF and f.size == 8
     with pytest.raises(SofaIncompleteError):
-        dec.read_float64_array()
+        verdict(decoder_cls, bytes(data))
 
-    dec = decoder_cls(reader(data))
-    dec.next()
     with pytest.raises(SofaIncompleteError):  # and the skip walk is bounded too
-        dec.skip()
+        verdict(decoder_cls, bytes(data))
 
 
 def test_fixlen_array_payload_beyond_the_address_space_is_truncated(monkeypatch):
@@ -486,16 +439,14 @@ def test_fixlen_array_payload_beyond_the_address_space_is_truncated(monkeypatch)
     monkeypatch.setattr(_pydec_module, "sys", SimpleNamespace(maxsize=2**31 - 1))
     data = [0x05] + _uvarint(0x7FFFFFFF) + _uvarint((8 << 3) | int(FixlenSubtype.FP64))
 
-    dec = _PyDecoder(reader(data))
-    f = dec.next()
-    assert f is not None and f.count * f.size > 2**31 - 1
+    # Both ways in: the driver's readiness check answers first for a field it
+    # would read, and the auto-skip reaches the same ceiling for one it walks
+    # past.
     with pytest.raises(SofaIncompleteError):
-        dec.read_float64_array()
+        verdict(_PyDecoder, bytes(data))
 
-    dec = _PyDecoder(reader(data))
-    dec.next()
     with pytest.raises(SofaIncompleteError):
-        dec.skip()
+        verdict(_PyDecoder, bytes(data), recorder=Recorder(decline=lambda f: True))
 
 
 def test_max_array_count_rejects_oversize_before_alloc():
@@ -510,16 +461,12 @@ def test_max_array_count_rejects_oversize_before_alloc():
     enc.write_unsigned_array(7, list(range(65537)))
     data = enc.getvalue()
 
-    dec = Decoder(reader(data), max_array_count=65536)
-    f = dec.next()
-    assert f is not None and f.count == 65537
     with pytest.raises(SofaLimitError):
-        dec.read_unsigned_array()
+        verdict(Decoder, bytes(data), max_array_count=65536)
 
-    dec2 = Decoder(reader(data))
-    f = dec2.next()
-    assert f is not None and f.count == 65537
-    assert dec2.read_unsigned_array() == list(range(65537))
+    f, ev = pairs(Decoder, data)[0]
+    assert f.count == 65537
+    assert ev[2] == tuple(range(65537))
 
 
 def test_max_array_count_fires_before_any_payload():
@@ -528,27 +475,22 @@ def test_max_array_count_fires_before_any_payload():
     # truncation that reading the absent elements would give), proving the check
     # runs before allocation/buffering.
     data = [0x03] + _uvarint(100)  # ARRAY_UNSIGNED, count 100, no elements
-    dec = Decoder(reader(data), max_array_count=10)
-    assert dec.next() is not None
     with pytest.raises(SofaLimitError):
-        dec.read_unsigned_array()
+        verdict(Decoder, bytes(data), max_array_count=10)
 
 
 def test_max_array_count_boundary_is_inclusive():
     # count == max_array_count is allowed; count == max + 1 is rejected.
     ok = Encoder()
     ok.write_unsigned_array(0, list(range(8)))
-    dec = Decoder(reader(ok.getvalue()), max_array_count=8)
-    f = dec.next()
-    assert f is not None and f.count == 8
-    assert dec.read_unsigned_array() == list(range(8))
+    f, ev = pairs(Decoder, ok.getvalue(), max_array_count=8)[0]
+    assert f.count == 8
+    assert ev[2] == tuple(range(8))
 
     over = Encoder()
     over.write_unsigned_array(0, list(range(9)))
-    dec = Decoder(reader(over.getvalue()), max_array_count=8)
-    assert dec.next() is not None
     with pytest.raises(SofaLimitError):
-        dec.read_unsigned_array()
+        verdict(Decoder, bytes(over.getvalue()), max_array_count=8)
 
 
 def test_max_array_count_applies_to_all_array_kinds():
@@ -561,12 +503,13 @@ def test_max_array_count_applies_to_all_array_kinds():
     ):
         enc = Encoder()
         write(enc)
-        dec = Decoder(reader(enc.getvalue()), max_array_count=5)
-        assert dec.next() is not None
-        # skip() is a consume too — the payload it would buffer is exactly what
-        # the cap is protecting, so it is rejected like a typed read.
+        # A declined field is a consume too — the payload the walk would buffer
+        # is exactly what the cap protects, so it is rejected all the same.
         with pytest.raises(SofaLimitError):
-            dec.skip()
+            verdict(
+                Decoder, enc.getvalue(), max_array_count=5,
+                recorder=Recorder(decline=lambda f: True),
+            )
 
 
 def test_max_string_len_fires_before_payload():
@@ -575,10 +518,8 @@ def test_max_string_len_fires_before_payload():
     # read/buffered — the read never gets as far as reporting the truncation.
     # 0x02 = (0<<3)|FIXLEN; length_header = (100 << 3) | 0x2 (STRING).
     data = [0x02] + _uvarint((100 << 3) | 0x2)
-    dec = Decoder(reader(data), max_string_len=10)
-    assert dec.next() is not None
     with pytest.raises(SofaLimitError):
-        dec.string()
+        verdict(Decoder, bytes(data), max_string_len=10)
 
 
 def test_max_string_len_valid_message_roundtrips_without_limit():
@@ -586,20 +527,16 @@ def test_max_string_len_valid_message_roundtrips_without_limit():
     enc.write_string(3, "x" * 100)
     data = enc.getvalue()
 
-    dec = Decoder(reader(data), max_string_len=64)
-    assert dec.next() is not None
     with pytest.raises(SofaLimitError):
-        dec.string()
+        verdict(Decoder, bytes(data), max_string_len=64)
 
-    dec2 = Decoder(reader(data))
-    dec2.next()
-    assert dec2.string() == "x" * 100
+    assert values(Decoder, data) == [("str", 3, "x" * 100)]
 
     within = Encoder()
     within.write_string(3, "y" * 64)  # exactly at the limit: allowed
-    dec3 = Decoder(reader(within.getvalue()), max_string_len=64)
-    dec3.next()
-    assert dec3.string() == "y" * 64
+    assert values(Decoder, within.getvalue(), max_string_len=64) == [
+        ("str", 3, "y" * 64)
+    ]
 
 
 def test_max_blob_len_rejects_oversize():
@@ -607,14 +544,10 @@ def test_max_blob_len_rejects_oversize():
     enc.write_bytes(1, b"\x00" * 100)
     data = enc.getvalue()
 
-    dec = Decoder(reader(data), max_blob_len=16)
-    assert dec.next() is not None
     with pytest.raises(SofaLimitError):
-        dec.bytes()
+        verdict(Decoder, bytes(data), max_blob_len=16)
 
-    dec2 = Decoder(reader(data))
-    dec2.next()
-    assert dec2.bytes() == b"\x00" * 100
+    assert values(Decoder, data)[0][2] == b"\x00" * 100
 
 
 def test_limits_are_independent_per_kind():
@@ -622,15 +555,11 @@ def test_limits_are_independent_per_kind():
     # max_string_len, nor a string by max_blob_len.
     blob = Encoder()
     blob.write_bytes(1, b"z" * 100)
-    dec = Decoder(reader(blob.getvalue()), max_string_len=1)
-    dec.next()
-    assert dec.bytes() == b"z" * 100
+    assert values(Decoder, blob.getvalue(), max_string_len=1)[0][2] == b"z" * 100
 
     text = Encoder()
     text.write_string(1, "z" * 100)
-    dec = Decoder(reader(text.getvalue()), max_blob_len=1)
-    dec.next()
-    assert dec.string() == "z" * 100
+    assert values(Decoder, text.getvalue(), max_blob_len=1)[0][2] == "z" * 100
 
 
 def test_limit_error_is_not_a_decode_or_incomplete_error():
@@ -640,20 +569,16 @@ def test_limit_error_is_not_a_decode_or_incomplete_error():
     enc.write_unsigned_array(0, list(range(4)))
     data = enc.getvalue()
 
-    dec = Decoder(reader(data), max_array_count=2)
-    assert dec.next() is not None
     with pytest.raises(SofaLimitError) as exc:
-        dec.read_unsigned_array()
+        verdict(Decoder, bytes(data), max_array_count=2)
     assert isinstance(exc.value, SofaError)
     assert not isinstance(exc.value, SofaDecodeError)
     assert not isinstance(exc.value, SofaIncompleteError)
 
     # `except SofaDecodeError` genuinely does not intercept it.
     with pytest.raises(SofaLimitError):
-        dec2 = Decoder(reader(data), max_array_count=2)
-        dec2.next()
         try:
-            dec2.read_unsigned_array()
+            verdict(Decoder, data, max_array_count=2)
         except SofaDecodeError:  # pragma: no cover - must not be taken
             pytest.fail("SofaLimitError must not be caught as SofaDecodeError")
 
@@ -716,10 +641,12 @@ def test_wrong_type_read_is_not_an_error():
     an unknown id — not reported as INVALID, and not an error at all."""
     enc = Encoder()
     enc.write_unsigned(0, 5)
-    dec = Decoder(reader(enc.getvalue()))
-    dec.next()
-    assert dec.signed() is None  # field is unsigned
-    assert dec.next() is None  # the skipped field left the decode COMPLETE
+    # A binding that declares field 0 signed contradicts the wire, so the field
+    # is skipped like an unknown id and the decode stays COMPLETE.
+    b = Binding().signed(0, at=0, count_at=1)
+    status, _dec, slots = boundfeed(Decoder, enc.getvalue(), b)
+    assert status is Status.COMPLETE
+    assert slots.u[1] == 0  # never arrived, as far as the binding is concerned
 
 
 # --- sticky mode ------------------------------------------------------------
@@ -755,11 +682,8 @@ _OVERLONG_U64 = [
 @pytest.mark.parametrize("decoder_cls", _DECODERS)
 @pytest.mark.parametrize("data", _OVERLONG_U64)
 def test_overlong_varint_rejected_as_invalid(decoder_cls, data):
-    dec = decoder_cls(reader(data))
-    f = dec.next()
-    assert f is not None and f.id == 6
     with pytest.raises(SofaDecodeError) as exc:
-        dec.unsigned()
+        verdict(decoder_cls, bytes(data))
     # INVALID, never INCOMPLETE — the bytes are garbage, not "need more".
     assert not isinstance(exc.value, SofaIncompleteError)
 
@@ -769,10 +693,9 @@ def test_max_u64_control_still_decodes(decoder_cls):
     # Control: the valid 10-byte maximum (10th byte 0x01 = only bit 63) must
     # still decode to 2^64-1 — the overlong guard must not reject it.
     data = [0x30, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]
-    dec = decoder_cls(reader(data))
-    f = dec.next()
-    assert f is not None and f.id == 6
-    assert dec.unsigned() == (1 << 64) - 1
+    f, ev = pairs(decoder_cls, bytes(data))[0]
+    assert f.id == 6
+    assert ev == ("u", 6, (1 << 64) - 1)
 
 
 # --- ID_MAX bounds a sequence-end header's id too ----------------------------
@@ -801,11 +724,8 @@ _SEQEND_ID_CONTROLS = [
 
 @pytest.mark.parametrize("decoder_cls", _DECODERS)
 def test_seqend_header_id_over_idmax_is_invalid(decoder_cls):
-    dec = decoder_cls(reader(_SEQEND_ID_OVER_IDMAX))
-    start = dec.next()
-    assert start is not None and start.type == WireType.SEQUENCE_START
     with pytest.raises(SofaDecodeError) as exc:
-        dec.next()
+        verdict(decoder_cls, bytes(_SEQEND_ID_OVER_IDMAX))
     # INVALID, never INCOMPLETE — all six bytes are present.
     assert not isinstance(exc.value, SofaIncompleteError)
 
@@ -813,11 +733,21 @@ def test_seqend_header_id_over_idmax_is_invalid(decoder_cls):
 @pytest.mark.parametrize("decoder_cls", _DECODERS)
 @pytest.mark.parametrize("data,label", _SEQEND_ID_CONTROLS)
 def test_seqend_header_in_range_id_is_accepted(decoder_cls, data, label):
-    dec = decoder_cls(reader(data))
-    start = dec.next()
-    assert start is not None and start.type == WireType.SEQUENCE_START
-    end = dec.next()
-    # Whatever the id said on the wire, it is discarded: the field is id 0.
-    assert end is not None
-    assert end.type == WireType.SEQUENCE_END
-    assert end.id == 0
+    # Whatever the id said on the wire, it is discarded: the end marker carries
+    # no id at all.
+    ev = values(decoder_cls, bytes(data))
+    assert len(ev) == 2
+    assert ev[0][0] == "seq{"       # the sequence start keeps its own id
+    assert ev[1] == ("seq}",)       # the end marker carries none
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_fixlen_array_huge_count_is_bounded_on_the_skip_path_too(decoder_cls):
+    """The payload size of a fixlen array is a *product*, and both factors come
+    off the wire. Walking past such a field without reading it must reach the
+    same bound: 2^31-1 fp64 elements claim a 16 GB payload, which is reported as
+    truncated rather than attempted."""
+    data = bytes([0x05] + _uvarint(0x7FFFFFFF) + _uvarint((8 << 3) | int(FixlenSubtype.FP64)))
+    with pytest.raises(SofaIncompleteError):
+        # No binding, no visitor hook for it: the field is walked, not read.
+        verdict(decoder_cls, data, recorder=Recorder(decline=lambda f: True))

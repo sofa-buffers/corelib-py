@@ -456,3 +456,57 @@ def test_a_limit_rejection_stays_rejected(enc_cls, dec_cls):
     with pytest.raises(SofaLimitError):
         dec.feed(b"")
     assert u[1] == 0, "nothing past the rejection may be decoded"
+
+
+# --- the table's own surface -------------------------------------------------
+
+
+def test_binding_exposes_its_rows():
+    b = Binding().unsigned(1, at=0).signed(2, at=1)
+    assert len(b) == 2
+    assert [e.field_id for e in b.entries] == [1, 2]
+    assert "2 fields" in repr(b)
+
+
+@pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
+def test_boolean_binds_as_the_unsigned_it_is_on_the_wire(enc_cls, dec_cls):
+    """§4.4: a boolean has no wire type. The slot gets the 0/1 the sender wrote
+    and the caller tests it for truth."""
+    enc = enc_cls()
+    enc.write_bool(1, True)
+    enc.write_bool(2, False)
+    enc.flush()
+    b = Binding().boolean(1, at=0, count_at=2).boolean(2, at=1, count_at=3)
+    words, objects, u, _q, _f = storage(b)
+    assert dec_cls(binding=b, words=words).feed(enc.getvalue()) is Status.COMPLETE
+    assert (u[0], u[2]) == (1, 1)
+    assert (u[1], u[3]) == (0, 1)
+
+
+def test_a_frozen_child_cannot_be_bound_into_a_new_tree():
+    """Reaching a closed table through a fresh parent would extend it by the
+    back door."""
+    child = Binding().unsigned(1, at=0)
+    Binding().sequence(2, child).freeze()
+    with pytest.raises(SofaRangeError):
+        Binding().sequence(3, child)
+
+
+def test_binding_rejects_out_of_range_sizes():
+    with pytest.raises(SofaRangeError):
+        Binding().unsigned_array(1, at=0, cap=1 << 40)
+    with pytest.raises(SofaRangeError):
+        Binding().string(1, at=0, maxlen=1 << 40)
+    with pytest.raises(SofaRangeError):
+        Binding().unsigned(1, at=0, count_at=-1)
+    with pytest.raises(SofaRangeError):
+        Binding().unsigned_array(1, at=0, cap=4, elem_max=1 << 70)
+    with pytest.raises(SofaRangeError):
+        Binding().signed_array(1, at=0, cap=4, elem_min=-(1 << 70))
+
+
+@pytest.mark.parametrize("dec_cls", DECODER_ENGINES)
+def test_a_binding_with_object_fields_needs_an_objects_list(dec_cls):
+    b = Binding().string(1, at=0)
+    with pytest.raises(SofaRangeError):
+        dec_cls(binding=b, words=bytearray(b.tree_words_required * 8 or 8))

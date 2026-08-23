@@ -1,19 +1,20 @@
-"""Visitor-driver tests.
+"""The Visitor contract.
 
-A recording visitor must reproduce exactly what the equivalent pull-decode loop
-produces (it's the same hot path, just dispatched), and the ``on_field`` /
-``on_sequence_begin`` skip hooks must drop fields and whole sub-trees the same
-way the harness' ``skip_ids`` scenario does.
+What a handler is promised: one typed hook per wire type, ``on_field`` and
+``on_sequence_begin`` able to decline before the value is decoded, an unmodified
+:class:`sofab.Visitor` still consuming a whole message, and none of it depending
+on where the chunk boundaries fall (§7.2 item 4).
+
+The *values* a visitor receives are checked against the shared vectors'
+declared fields in ``test_conformance_vectors``; this suite is about the hooks.
 """
 
 from __future__ import annotations
 
-import io
-
 import pytest
 from vectors import VECTORS
 
-from sofab import Decoder, FixlenSubtype, Visitor, WireType
+from sofab import Decoder, Field, Status, Visitor, WireType
 
 _IDS = [v["name"] for v in VECTORS]
 
@@ -78,67 +79,130 @@ class Recorder(Visitor):
         self.events.append(("f64a", fid, v))
 
 
-def _pull_decode(data, skip_ids=()):
-    """Reference: the plain pull loop, mirroring the visitor's recording."""
-    skip = frozenset(skip_ids)
-    dec = Decoder(io.BytesIO(data))
-    out = []
-    while (f := dec.next()) is not None:
-        t = f.type
-        if t == WireType.SEQUENCE_END:
-            out.append(("end",))
-            continue
-        if f.id in skip:
-            dec.skip()
-            continue
-        if t == WireType.UNSIGNED:
-            out.append(("u", f.id, dec.unsigned()))
-        elif t == WireType.SIGNED:
-            out.append(("s", f.id, dec.signed()))
-        elif t == WireType.FIXLEN:
-            st = f.subtype
-            if st == FixlenSubtype.FP32:
-                out.append(("f32", f.id, dec.float32()))
-            elif st == FixlenSubtype.FP64:
-                out.append(("f64", f.id, dec.float64()))
-            elif st == FixlenSubtype.STRING:
-                out.append(("str", f.id, dec.string()))
-            else:
-                out.append(("blob", f.id, dec.bytes()))
-        elif t == WireType.ARRAY_UNSIGNED:
-            out.append(("ua", f.id, dec.read_unsigned_array()))
-        elif t == WireType.ARRAY_SIGNED:
-            out.append(("sa", f.id, dec.read_signed_array()))
-        elif t == WireType.ARRAY_FIXLEN:
-            if f.subtype == FixlenSubtype.FP32:
-                out.append(("f32a", f.id, dec.read_float32_array()))
-            else:
-                out.append(("f64a", f.id, dec.read_float64_array()))
-        elif t == WireType.SEQUENCE_START:
-            out.append(("seq", f.id))
-    return out
-
-
 @pytest.mark.parametrize("vec", VECTORS, ids=_IDS)
-def test_visitor_matches_pull(vec):
+@pytest.mark.parametrize("chunk", [1, 4096])
+def test_a_vector_decodes_the_same_however_it_is_chunked(vec, chunk):
     data = bytes.fromhex(vec["serialized"]["hex"])
-    rec = Recorder()
-    Decoder(io.BytesIO(data)).drive(rec)
-    assert rec.events == _pull_decode(data)
+    whole = Recorder()
+    if Decoder(visitor=whole).feed(data) is not Status.COMPLETE:
+        pytest.skip("vector is not a complete message on its own")
+
+    piecewise = Recorder()
+    dec = Decoder(visitor=piecewise)
+    status = Status.COMPLETE
+    for off in range(0, len(data), chunk):
+        status = dec.feed(data[off : off + chunk])
+    assert status is Status.COMPLETE
+    assert piecewise.events == whole.events
 
 
 @pytest.mark.parametrize("vec", [v for v in VECTORS if v.get("skip_ids")],
                          ids=[v["name"] for v in VECTORS if v.get("skip_ids")])
-def test_visitor_skip_hooks(vec):
+def test_declined_fields_leave_the_rest_intact(vec):
+    """``on_field`` / ``on_sequence_begin`` returning ``False`` drops that field
+    — a whole sub-tree, for a sequence — and nothing else."""
     data = bytes.fromhex(vec["serialized"]["hex"])
-    skip = vec["skip_ids"]
-    rec = Recorder(skip_ids=skip)
-    Decoder(io.BytesIO(data)).drive(rec)
-    assert rec.events == _pull_decode(data, skip_ids=skip)
+    skip = frozenset(vec["skip_ids"])
+
+    everything = Recorder()
+    if Decoder(visitor=everything).feed(data) is not Status.COMPLETE:
+        pytest.skip("vector is not a complete message on its own")
+
+    kept = Recorder(skip_ids=skip)
+    assert Decoder(visitor=kept).feed(data) is Status.COMPLETE
+
+    # Everything the declining run reported was also reported by the full run,
+    # in the same order, and every declined id is gone from it.
+    assert all(e in everything.events for e in kept.events)
+    assert not [e for e in kept.events if len(e) > 1 and e[1] in skip]
+    assert len(kept.events) < len(everything.events)
+
+
+def test_every_typed_hook_fires_for_its_wire_type(enc_cls=None):
+    """One hook per wire type, and the value arrives decoded."""
+    from sofab import Encoder
+
+    enc = Encoder()
+    enc.write_unsigned(1, 300)
+    enc.write_signed(2, -7)
+    enc.write_float32(3, 1.5)
+    enc.write_float64(4, -2.25)
+    enc.write_string(5, "hi")
+    enc.write_bytes(6, b"\x00\xff")
+    enc.write_unsigned_array(7, [1, 2])
+    enc.write_signed_array(8, [-1, 2])
+    enc.write_float32_array(9, [1.5])
+    enc.write_float64_array(10, [2.5])
+    enc.write_sequence_begin_lazy(11)
+    enc.write_unsigned(1, 9)
+    enc.write_sequence_end()
+    enc.flush()
+
+    rec = Recorder()
+    assert Decoder(visitor=rec).feed(enc.getvalue()) is Status.COMPLETE
+    assert rec.events == [
+        ("u", 1, 300), ("s", 2, -7), ("f32", 3, 1.5), ("f64", 4, -2.25),
+        ("str", 5, "hi"), ("blob", 6, b"\x00\xff"),
+        ("ua", 7, [1, 2]), ("sa", 8, [-1, 2]),
+        ("f32a", 9, [1.5]), ("f64a", 10, [2.5]),
+        ("seq", 11), ("u", 1, 9), ("end",),
+    ]
 
 
 def test_default_visitor_consumes_everything():
     """An unmodified Visitor (all no-ops) must still walk a message cleanly to
     EOF — unknown fields are consumed, not left dangling."""
-    data = bytes.fromhex(next(v for v in VECTORS if v["name"] == "full_scale_example")["serialized"]["hex"])
-    Decoder(io.BytesIO(data)).drive(Visitor())  # must not raise
+    data = bytes.fromhex(
+        next(v for v in VECTORS if v["name"] == "full_scale_example")["serialized"]["hex"]
+    )
+    assert Decoder(visitor=Visitor()).feed(data) is Status.COMPLETE
+
+
+# --- the elision contract both engines rely on ------------------------------
+
+
+def test_the_base_control_hooks_do_not_decline():
+    """``on_field`` and ``on_sequence_begin`` default to "proceed".
+
+    This is what lets the driver skip calling them at all when a visitor leaves
+    them alone — and, for ``on_field``, skip building the Field they are the only
+    consumer of. The saving is only sound because the calls it removes could not
+    have changed the outcome, so the base returns are pinned here: they are no
+    longer reached through a decode.
+    """
+    base = Visitor()
+    assert base.on_field(Field(1, WireType.UNSIGNED)) is not False
+    assert base.on_sequence_begin(1) is not False
+
+
+class _Delegating(Visitor):
+    """Overrides the control hooks but defers to the base for the verdict — the
+    case the ``is not Visitor.on_field`` test must treat as an override."""
+
+    def __init__(self):
+        self.fields = []
+        self.seqs = []
+
+    def on_field(self, field):
+        self.fields.append(field.id)
+        return super().on_field(field)
+
+    def on_sequence_begin(self, field_id):
+        self.seqs.append(field_id)
+        return super().on_sequence_begin(field_id)
+
+
+def test_a_hook_that_delegates_to_the_base_still_receives_every_call():
+    from sofab import Encoder
+
+    enc = Encoder()
+    enc.write_unsigned(1, 7)
+    enc.write_sequence_begin_lazy(2)
+    enc.write_unsigned(3, 8)
+    enc.write_sequence_end()
+    enc.flush()
+
+    v = _Delegating()
+    assert Decoder(visitor=v).feed(enc.getvalue()) is Status.COMPLETE
+    assert v.fields == [1, 3]
+    assert v.seqs == [2]

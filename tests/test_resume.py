@@ -14,117 +14,51 @@ call, so every chunk boundary in the message becomes a suspension point.
 
 from __future__ import annotations
 
-import struct
-
 import pytest
-from vectors import FULL_SCALE_EXPECTED, VECTORS
+from vectors import FULL_SCALE_EXPECTED, VECTORS, Recorder, Status, values
 
-from sofab import Decoder, Encoder, SofaIncompleteError, WireType
-
-
-class Feeder:
-    """A ``read(n)`` source fed explicitly by the test; empty when starved."""
-
-    def __init__(self) -> None:
-        self.q = bytearray()
-
-    def push(self, data: bytes) -> None:
-        self.q += data
-
-    def read(self, n: int) -> bytes:
-        out = bytes(self.q[:n])
-        del self.q[: len(out)]
-        return out
+from sofab import Decoder, Encoder, WireType
 
 
-class StarvingReader:
-    """Hands out ``chunk`` bytes, then returns ``b""`` once, then the next chunk.
+class Feed:
+    """A decoder plus the bytes handed to it so far.
 
-    Every chunk boundary is therefore an end-of-input as far as the decoder can
-    tell, which is exactly the byte boundary §5.2 says it must be able to
-    suspend and resume at.
+    Push mode makes §5.2's resume contract direct: hand over a prefix, read the
+    outcome, hand over the rest. ``INCOMPLETE`` means "feed me more" and nothing
+    of the half-parsed construct is lost or fabricated — which is exactly what
+    these tests are about.
     """
 
-    def __init__(self, data: bytes, chunk: int = 1) -> None:
-        self._data = bytes(data)
-        self._pos = 0
-        self._chunk = chunk
-        self._starve = False
+    def __init__(self, dec_cls=None, **kw) -> None:
+        self.rec = Recorder()
+        self.dec = (dec_cls or Decoder)(visitor=self.rec, **kw)
+        self.status = Status.COMPLETE
+
+    def push(self, data: bytes) -> Status:
+        self.status = self.dec.feed(data)
+        return self.status
 
     @property
-    def exhausted(self) -> bool:
-        return self._pos >= len(self._data)
+    def events(self) -> list:
+        return self.rec.events
 
-    def read(self, n: int) -> bytes:
-        if self._pos >= len(self._data):
-            return b""
-        if self._starve:
-            self._starve = False
-            return b""
-        end = min(self._pos + min(n, self._chunk), len(self._data))
-        out = self._data[self._pos : end]
-        self._pos = end
-        self._starve = True
-        return out
+    @property
+    def fields(self) -> list:
+        return self.rec.fields
 
 
-def _value(dec: Decoder, f) -> object:
-    if f.type == WireType.UNSIGNED:
-        return dec.unsigned()
-    if f.type == WireType.SIGNED:
-        return dec.signed()
-    if f.type == WireType.FIXLEN:
-        name = f.subtype.name
-        if name == "BLOB":
-            return dec.bytes()
-        if name == "STRING":
-            return dec.string()
-        # Floats compare by bit pattern so NaN payloads stay comparable.
-        return struct.pack("<d", dec.float32() if name == "FP32" else dec.float64())
-    if f.type == WireType.ARRAY_UNSIGNED:
-        return tuple(dec.read_unsigned_array())
-    if f.type == WireType.ARRAY_SIGNED:
-        return tuple(dec.read_signed_array())
-    if f.type == WireType.ARRAY_FIXLEN:
-        read = dec.read_float32_array if f.subtype.name == "FP32" else dec.read_float64_array
-        return tuple(struct.pack("<d", v) for v in read())
-    return None
+def _drip(data: bytes, chunk: int = 1, dec_cls=None) -> list:
+    """Feed ``data`` ``chunk`` bytes at a time, with an empty feed between each.
 
-
-def _walk(dec: Decoder) -> list:
-    """Consume a decoder whose reader never starves."""
-    out = []
-    while (f := dec.next()) is not None:
-        out.append((f.id, f.type, _value(dec, f)))
-    return out
-
-
-def _walk_resuming(dec: Decoder, src: StarvingReader) -> list:
-    """Consume a decoder over a starving reader, retrying every suspension.
-
-    This is the loop §5.2 describes for a streaming caller: ``INCOMPLETE`` means
-    "feed me the next chunk", so the same call is simply issued again. It is
-    only allowed to give up once the source is genuinely exhausted.
+    Every boundary is therefore an end-of-input as far as the decoder can tell,
+    which is the byte boundary §5.2 says it must suspend and resume at.
     """
-    out = []
-    while True:
-        try:
-            f = dec.next()
-        except SofaIncompleteError:
-            if src.exhausted:
-                raise
-            continue
-        if f is None:
-            if src.exhausted:
-                return out
-            continue  # a field boundary that merely has no bytes yet
-        while True:
-            try:
-                out.append((f.id, f.type, _value(dec, f)))
-                break
-            except SofaIncompleteError:
-                if src.exhausted:
-                    raise
+    f = Feed(dec_cls)
+    for off in range(0, len(data), chunk):
+        f.push(b"")  # starved: must report INCOMPLETE or COMPLETE, never drift
+        f.push(data[off : off + chunk])
+    assert f.status is Status.COMPLETE, f.status
+    return f.events
 
 
 # --- the reported repro ------------------------------------------------------
@@ -140,48 +74,33 @@ def _three_field_message() -> bytes:
 
 def test_split_varint_resumes_instead_of_losing_its_head():
     wire = _three_field_message()
-    src = Feeder()
-    dec = Decoder(src)
-    src.push(wire[:2])  # header + the first byte of the 300 varint
+    f = Feed()
+    assert f.push(wire[:2]) is Status.INCOMPLETE  # the 300 varint spans the split
+    assert f.events == []  # nothing of it may be reported yet
 
-    f = dec.next()
-    assert (f.id, f.type) == (1, WireType.UNSIGNED)
-    with pytest.raises(SofaIncompleteError):
-        dec.unsigned()
-
-    src.push(wire[2:])
-    assert dec.unsigned() == 300  # re-read from the varint's first byte
-    f = dec.next()
-    assert (f.id, f.type) == (2, WireType.FIXLEN)
-    assert dec.string() == "hello"
-    f = dec.next()
-    assert (f.id, f.type) == (3, WireType.UNSIGNED)
-    assert dec.unsigned() == 7
-    assert dec.next() is None
+    assert f.push(wire[2:]) is Status.COMPLETE  # re-read from its first byte
+    assert f.events == [("u", 1, 300), ("str", 2, "hello"), ("u", 3, 7)]
 
 
 def test_auto_skip_after_incomplete_does_not_fabricate_fields():
     """The issue's exact shape: a bare ``next()`` loop, so the suspension happens
     inside the implicit skip of the previous field's value."""
     wire = _three_field_message()
-    src = Feeder()
-    dec = Decoder(src)
-    src.push(wire[:2])
+    f = Feed()
+    assert f.push(wire[:2]) is Status.INCOMPLETE
+    # The header is whole, so the field is announced; its value is not, so
+    # nothing is handed over for it yet.
+    assert [(x.id, x.type) for x in f.fields] == [(1, WireType.UNSIGNED)]
+    assert f.events == []
 
-    seen = []
-    with pytest.raises(SofaIncompleteError):
-        while (f := dec.next()) is not None:
-            seen.append((f.id, f.type))
-    assert seen == [(1, WireType.UNSIGNED)]
-
-    src.push(wire[2:])
-    while (f := dec.next()) is not None:
-        seen.append((f.id, f.type))
-    assert seen == [
+    assert f.push(wire[2:]) is Status.COMPLETE
+    # Field 1 is announced once, not again on resume, and no field is invented.
+    assert [(x.id, x.type) for x in f.fields] == [
         (1, WireType.UNSIGNED),
         (2, WireType.FIXLEN),
         (3, WireType.UNSIGNED),
     ]
+    assert f.events == [("u", 1, 300), ("str", 2, "hello"), ("u", 3, 7)]
 
 
 def test_split_field_header_resumes():
@@ -189,15 +108,10 @@ def test_split_field_header_resumes():
     enc = Encoder()
     enc.write_unsigned(1000, 1)  # header 0x1f40 — a two-byte varint
     wire = enc.getvalue()
-    src = Feeder()
-    dec = Decoder(src)
-    src.push(wire[:1])
-    with pytest.raises(SofaIncompleteError):
-        dec.next()
-    src.push(wire[1:])
-    f = dec.next()
-    assert (f.id, f.type) == (1000, WireType.UNSIGNED)
-    assert dec.unsigned() == 1
+    f = Feed()
+    assert f.push(wire[:1]) is Status.INCOMPLETE
+    assert f.push(wire[1:]) is Status.COMPLETE
+    assert f.events == [("u", 1000, 1)]
 
 
 def test_split_fixlen_payload_resumes():
@@ -205,17 +119,10 @@ def test_split_fixlen_payload_resumes():
     enc.write_bytes(4, bytes(range(20)))
     enc.write_unsigned(5, 9)
     wire = enc.getvalue()
-    src = Feeder()
-    dec = Decoder(src)
-    src.push(wire[:8])
-    f = dec.next()
-    assert f.type == WireType.FIXLEN
-    with pytest.raises(SofaIncompleteError):
-        dec.bytes()
-    src.push(wire[8:])
-    assert dec.bytes() == bytes(range(20))
-    assert dec.next().id == 5
-    assert dec.unsigned() == 9
+    f = Feed()
+    assert f.push(wire[:8]) is Status.INCOMPLETE
+    assert f.push(wire[8:]) is Status.COMPLETE
+    assert f.events == [("blob", 4, bytes(range(20))), ("u", 5, 9)]
 
 
 def test_split_array_payload_resumes():
@@ -223,17 +130,10 @@ def test_split_array_payload_resumes():
     enc.write_unsigned_array(6, [1, 300, 70000, 4, 5])
     enc.write_unsigned(7, 3)
     wire = enc.getvalue()
-    src = Feeder()
-    dec = Decoder(src)
-    src.push(wire[:5])
-    f = dec.next()
-    assert f.type == WireType.ARRAY_UNSIGNED
-    with pytest.raises(SofaIncompleteError):
-        dec.read_unsigned_array()
-    src.push(wire[5:])
-    assert dec.read_unsigned_array() == [1, 300, 70000, 4, 5]
-    assert dec.next().id == 7
-    assert dec.unsigned() == 3
+    f = Feed()
+    assert f.push(wire[:5]) is Status.INCOMPLETE
+    assert f.push(wire[5:]) is Status.COMPLETE
+    assert f.events == [("ua", 6, (1, 300, 70000, 4, 5)), ("u", 7, 3)]
 
 
 def test_split_inside_open_sequence_resumes():
@@ -242,18 +142,11 @@ def test_split_inside_open_sequence_resumes():
     enc.write_unsigned(1, 70000)
     enc.write_sequence_end_keep()
     wire = enc.getvalue()
-    src = Feeder()
-    dec = Decoder(src)
-    src.push(wire[:1])
-    assert dec.next().type == WireType.SEQUENCE_START
-    with pytest.raises(SofaIncompleteError):
-        dec.next()  # inside an open sequence: truncated, not clean EOF
-    src.push(wire[1:])
-    f = dec.next()
-    assert (f.id, f.type) == (1, WireType.UNSIGNED)
-    assert dec.unsigned() == 70000
-    assert dec.next().type == WireType.SEQUENCE_END
-    assert dec.next() is None
+    f = Feed()
+    # Inside an open sequence: truncated, not clean EOF.
+    assert f.push(wire[:1]) is Status.INCOMPLETE
+    assert f.push(wire[1:]) is Status.COMPLETE
+    assert f.events == [("seq{", 3), ("u", 1, 70000), ("seq}",)]
 
 
 def _nested_sequence_message() -> bytes:
@@ -273,63 +166,45 @@ def test_skipping_a_truncated_sequence_resumes():
     nothing, and re-issuable once the rest of the sequence arrives."""
     wire = _nested_sequence_message()
     for cut in range(2, len(wire) - 2):
-        src = Feeder()
-        dec = Decoder(src)
-        src.push(wire[:cut])
-        assert dec.next().type == WireType.SEQUENCE_START
-        try:
-            dec.skip()
-        except SofaIncompleteError:
-            src.push(wire[cut:])
-            dec.skip()  # re-issued: replays the sequence from its first byte
-        else:
-            src.push(wire[cut:])
-        f = dec.next()
-        assert (f.id, f.type) == (9, WireType.UNSIGNED), f"cut={cut}"
-        assert dec.unsigned() == 5
-        assert dec.next() is None
+        f = Feed()
+        # A handler that declines the outer sequence: the decoder walks the whole
+        # sub-tree, which spans many fields and so must be all-or-nothing.
+        f.rec = Recorder(decline=lambda fld: fld.id == 3)
+        f.dec = Decoder(visitor=f.rec)
+        f.push(wire[:cut])
+        assert f.push(wire[cut:]) is Status.COMPLETE, f"cut={cut}"
+        assert ("u", 9, 5) in f.events
 
 
 def test_nested_sequence_message_survives_a_starving_reader():
     wire = _nested_sequence_message()
-    expected = _walk(Decoder(io_reader(wire)))
-    src = StarvingReader(wire, chunk=1)
-    assert _walk_resuming(Decoder(src), src) == expected
+    assert _drip(wire) == values(Decoder, wire)
 
 
 def test_repeated_incomplete_is_stable():
     """Retrying while still starved must keep reporting INCOMPLETE, not drift."""
     wire = _three_field_message()
-    src = Feeder()
-    dec = Decoder(src)
-    src.push(wire[:2])
-    assert dec.next().id == 1
+    f = Feed()
+    assert f.push(wire[:2]) is Status.INCOMPLETE
     for _ in range(5):
-        with pytest.raises(SofaIncompleteError):
-            dec.unsigned()
-    src.push(wire[2:])
-    assert dec.unsigned() == 300
+        assert f.push(b"") is Status.INCOMPLETE
+    assert f.push(wire[2:]) is Status.COMPLETE
+    assert f.events == [("u", 1, 300), ("str", 2, "hello"), ("u", 3, 7)]
 
 
 # --- the whole corpus, suspended at every byte boundary ----------------------
 
 
 def test_full_scale_message_survives_a_starving_reader():
-    expected = _walk(Decoder(io_reader(FULL_SCALE_EXPECTED)))
+    expected = values(Decoder, FULL_SCALE_EXPECTED)
     for chunk in (1, 3, 7):
-        src = StarvingReader(FULL_SCALE_EXPECTED, chunk=chunk)
-        assert _walk_resuming(Decoder(src), src) == expected, f"chunk={chunk}"
+        assert _drip(FULL_SCALE_EXPECTED, chunk) == expected, f"chunk={chunk}"
 
 
 @pytest.mark.parametrize("vec", VECTORS, ids=[v["name"] for v in VECTORS])
 def test_every_shared_vector_survives_a_starving_reader(vec):
     wire = bytes.fromhex(vec["serialized"]["hex"])
-    expected = _walk(Decoder(io_reader(wire)))
-    src = StarvingReader(wire, chunk=1)
-    assert _walk_resuming(Decoder(src), src) == expected
+    assert _drip(wire) == values(Decoder, wire)
 
 
-def io_reader(data: bytes):
-    import io
 
-    return io.BytesIO(bytes(data))

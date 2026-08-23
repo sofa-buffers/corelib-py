@@ -26,7 +26,7 @@ import tracemalloc
 from typing import Any, Callable
 
 import pytest
-from vectors import ENGINE_PAIRS, ChunkReader, reader
+from vectors import ENGINE_PAIRS, Binding, Recorder, Status, walk
 
 ENGINES = pytest.mark.parametrize(("Encoder", "Decoder"), ENGINE_PAIRS)
 
@@ -48,12 +48,13 @@ def _peak_bytes(fn: Callable[[], Any]) -> int:
     return peak - base
 
 
-def _measure(Decoder: Any, wire: bytes, consume: Callable[[Any], Any]) -> int:
-    """Peak allocation of ``consume`` alone: the message is pulled into the
-    decoder's buffer by ``next()``, outside the measured region."""
-    dec = Decoder(reader(wire), chunk_size=len(wire) + 16)
-    dec.next()
-    return _peak_bytes(lambda: consume(dec))
+def _measure(Decoder: Any, wire: bytes, *, decline: bool) -> int:
+    """Peak allocation of decoding ``wire`` with the payload field taken or
+    declined. The bytes are handed over in one feed either way, so the two runs
+    differ only in whether the payload is materialised."""
+    rec = Recorder(decline=(lambda f: f.id == 1) if decline else None)
+    dec = Decoder(visitor=rec)
+    return _peak_bytes(lambda: dec.feed(wire))
 
 
 def _blob(Encoder: Any) -> bytes:
@@ -77,56 +78,54 @@ def _f64_array(Encoder: Any) -> bytes:
     return enc.getvalue()
 
 
-def _control(Decoder: Any, wire: bytes, read_it: Callable[[Any], Any]) -> int:
-    """Peak allocation of the typed read of the same field — the payload it
-    returns *must* be allocated, so this both scales the assertion and proves
-    the measurement works at all on this interpreter."""
-    peak = _measure(Decoder, wire, read_it)
+def _control(Decoder: Any, wire: bytes) -> int:
+    """Peak allocation when the payload IS materialised — it must be allocated,
+    so this both scales the assertion and proves the measurement works at all on
+    this interpreter."""
+    peak = _measure(Decoder, wire, decline=False)
     if peak < PAYLOAD // 2:
         pytest.skip("tracemalloc does not account allocations on this interpreter")
     return peak
 
 
 CASES = pytest.mark.parametrize(
-    ("build", "read_it"),
-    [
-        (_blob, lambda d: d.bytes()),
-        (_string, lambda d: d.string()),
-        (_f64_array, lambda d: d.read_float64_array()),
-    ],
-    ids=["blob", "string", "fp64-array"],
+    "build", [_blob, _string, _f64_array], ids=["blob", "string", "fp64-array"]
 )
 
 
 @ENGINES
 @CASES
-def test_skip_does_not_copy_the_payload(
-    Encoder: Any, Decoder: Any, build: Any, read_it: Any
-) -> None:
-    """A buffered payload is skipped by advancing the cursor: the skip allocates
-    a fraction of what reading the same field allocates."""
+def test_a_declined_payload_is_not_copied(Encoder: Any, Decoder: Any, build: Any) -> None:
+    """A buffered payload a handler declines is walked by advancing the cursor:
+    it allocates a fraction of what materialising the same field allocates."""
     wire = build(Encoder)
-    control = _control(Decoder, wire, read_it)
-    skipped = _measure(Decoder, wire, lambda d: d.skip())
-    assert skipped < PAYLOAD // 8, (
-        f"skip allocated {skipped} bytes for a {PAYLOAD}-byte payload "
-        f"(reading it allocates {control}) — the payload is being copied"
+    control = _control(Decoder, wire)
+    skipped = _measure(Decoder, wire, decline=True)
+    # Both runs buffer the message, so the buffer itself is in both numbers.
+    # What separates them is one payload: materialising costs it, declining
+    # does not.
+    assert control - skipped > PAYLOAD // 2, (
+        f"declining allocated {skipped} bytes and materialising {control} for a "
+        f"{PAYLOAD}-byte payload — the declined payload is being copied too"
     )
 
 
 @ENGINES
 @CASES
-def test_auto_skip_does_not_copy_the_payload(
-    Encoder: Any, Decoder: Any, build: Any, read_it: Any
-) -> None:
-    """The implicit skip ``next()`` performs over an unconsumed value takes the
-    same no-copy path as an explicit ``skip()``."""
+def test_an_unbound_payload_is_not_copied(Encoder: Any, Decoder: Any, build: Any) -> None:
+    """A field no binding names and no visitor wants is walked the same way —
+    nothing is built for bytes nobody asked for."""
     wire = build(Encoder)
-    _control(Decoder, wire, read_it)
-    dec = Decoder(reader(wire), chunk_size=len(wire) + 16)
-    dec.next()
-    peak = _peak_bytes(dec.next)
-    assert peak < PAYLOAD // 8, f"auto-skip allocated {peak} bytes for a {PAYLOAD}-byte payload"
+    _control(Decoder, wire)
+    control = _control(Decoder, wire)
+    b = Binding().unsigned(2, at=0, count_at=1)  # field 1, the payload, is unbound
+    words = bytearray(b.tree_words_required * 8)
+    dec = Decoder(binding=b, words=words)
+    peak = _peak_bytes(lambda: dec.feed(wire))
+    assert control - peak > PAYLOAD // 2, (
+        f"an unbound payload allocated {peak} bytes against {control} for "
+        f"materialising a {PAYLOAD}-byte payload"
+    )
 
 
 @ENGINES
@@ -148,11 +147,9 @@ def test_skip_lands_on_the_next_field(
     enc.write_unsigned(2, 7)
     wire = enc.getvalue()
 
-    for src in (reader(wire), ChunkReader(wire, chunk=1)):
-        dec = Decoder(src, chunk_size=64)
-        dec.next()
-        dec.skip()
-        f = dec.next()
-        assert f is not None and f.id == 2
-        assert dec.unsigned() == 7
-        assert dec.next() is None
+    for chunk in (None, 1):
+        status, rec, _dec = walk(
+            Decoder, wire, chunk=chunk, recorder=Recorder(decline=lambda f: f.id == 1)
+        )
+        assert status is Status.COMPLETE
+        assert rec.events == [("u", 2, 7)]

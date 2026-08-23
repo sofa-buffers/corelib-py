@@ -16,10 +16,9 @@ such.
 
 from __future__ import annotations
 
-import io
-
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
+from vectors import Binding, bound, raise_for
 
 from sofab import zigzag_decode, zigzag_encode
 from sofab._varint import encode_varint
@@ -31,15 +30,16 @@ _U_ARRAY = bytes([(1 << 3) | WireType.ARRAY_UNSIGNED, 0x01])
 
 
 def _read_scalar(engine, body: bytes) -> int:
-    dec = engine(io.BytesIO(_U_SCALAR + body))
-    dec.next()
-    return dec.unsigned()
+    st, _dec, slots = bound(engine, _U_SCALAR + body, Binding().unsigned(1, at=0))
+    raise_for(st, _dec)
+    return slots.u[0]
 
 
 def _read_element(engine, body: bytes) -> int:
-    dec = engine(io.BytesIO(_U_ARRAY + body))
-    dec.next()
-    return dec.read_unsigned_array()[0]
+    b = Binding().unsigned_array(1, at=0, cap=4, count_at=8)
+    st, _dec, slots = bound(engine, _U_ARRAY + body, b)
+    raise_for(st, _dec)
+    return slots.u[0]
 
 
 #: The two live decode paths, by the way they reach the codec.

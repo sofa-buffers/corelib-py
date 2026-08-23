@@ -15,12 +15,12 @@ re-check behind it that no input can reach.
 
 from __future__ import annotations
 
-import io
 import struct
 from pathlib import Path
 
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
+from vectors import pairs, values, verdict
 
 import sofab
 from sofab.types import FixlenSubtype, SofaDecodeError, SofaIncompleteError, WireType
@@ -54,17 +54,17 @@ def test_next_settles_the_element_width_for_every_declared_size(
     never merely "too few bytes": the wrong width has to be caught on its own.
     """
     data = _farray(subtype, elem_size, 1, b"\x00" * elem_size)
-    dec = engine(io.BytesIO(data))
     if elem_size != width:
         with pytest.raises(SofaDecodeError) as exc:
-            dec.next()
+            verdict(engine, data)
         # INVALID, not "need more bytes" — the whole payload is present here.
         assert not isinstance(exc.value, SofaIncompleteError)
         return
-    field = dec.next()
-    assert field is not None and field.size == width and field.subtype == subtype
-    read = dec.read_float32_array if width == 4 else dec.read_float64_array
-    assert read() == [0.0]
+    got = pairs(engine, data)
+    assert len(got) == 1
+    field, ev = got[0]
+    assert field.size == width and field.subtype == subtype
+    assert ev[2] == (0.0,)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -76,9 +76,8 @@ def test_a_wrong_width_is_rejected_before_any_payload_arrives(
     """Same verdict with nothing behind the header at all (§5.2 precedence)."""
     if elem_size == width:
         pytest.skip("that width is the legal one for this subtype")
-    dec = engine(io.BytesIO(_farray(subtype, elem_size, 3)))
     with pytest.raises(SofaDecodeError) as exc:
-        dec.next()
+        verdict(engine, _farray(subtype, elem_size, 3))
     assert not isinstance(exc.value, SofaIncompleteError)
 
 
@@ -88,15 +87,12 @@ def test_an_empty_array_still_declares_its_width(engine, subtype, width, fmt):
     """§4.8: a zero-count array carries its ``fixlen_word`` too, so its width is
     decided at the header like any other — and the empty read that follows has
     no payload to disagree with."""
-    dec = engine(io.BytesIO(_farray(subtype, width, 0)))
-    field = dec.next()
-    assert field is not None and field.size == width and field.count == 0
-    read = dec.read_float32_array if width == 4 else dec.read_float64_array
-    assert read() == []
+    field, ev = pairs(engine, _farray(subtype, width, 0))[0]
+    assert field.size == width and field.count == 0
+    assert ev[2] == ()
     # ... and a zero-count array with a wrong width is rejected all the same.
-    dec = engine(io.BytesIO(_farray(subtype, width + 1, 0)))
     with pytest.raises(SofaDecodeError):
-        dec.next()
+        verdict(engine, _farray(subtype, width + 1, 0))
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -104,22 +100,17 @@ def test_an_empty_array_still_declares_its_width(engine, subtype, width, fmt):
 def test_a_correct_width_with_a_short_payload_is_incomplete(engine, subtype, width, fmt):
     """Control: with the width right, a missing payload is INCOMPLETE — the read
     path decides *arrival*, and nothing else."""
-    dec = engine(io.BytesIO(_farray(subtype, width, 2, b"\x00" * (width - 1))))
-    assert dec.next() is not None
-    read = dec.read_float32_array if width == 4 else dec.read_float64_array
     with pytest.raises(SofaIncompleteError):
-        read()
+        verdict(engine, _farray(subtype, width, 2, b"\x00" * (width - 1)))
 
 
 @pytest.mark.parametrize("engine", ENGINES)
 @pytest.mark.parametrize("subtype,width,fmt", SUBTYPES)
 def test_values_survive_the_single_check(engine, subtype, width, fmt):
-    values = [1.0, -2.5, 0.0]
-    payload = b"".join(struct.pack(fmt, v) for v in values)
-    dec = engine(io.BytesIO(_farray(subtype, width, len(values), payload)))
-    assert dec.next() is not None
-    read = dec.read_float32_array if width == 4 else dec.read_float64_array
-    assert read() == values
+    want = [1.0, -2.5, 0.0]
+    payload = b"".join(struct.pack(fmt, v) for v in want)
+    got = values(engine, _farray(subtype, width, len(want), payload))
+    assert got[0][2] == tuple(want)
 
 
 def _sources() -> list[tuple[str, str]]:

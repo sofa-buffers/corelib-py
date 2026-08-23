@@ -1,24 +1,23 @@
-"""Differential fuzz: the push paths must decode what the pull path decodes.
+"""Differential fuzz: the two push paths must agree, at every chunking.
 
-The pull decoder is the one already validated against the shared conformance
-vectors, so the strongest statement available about the push paths is that they
-agree with it — on randomly generated messages, at several chunkings, on both
-engines. CORELIB_PLAN §7.2 item 4 is the rule being enforced: where the chunk
-boundaries fall must never change the outcome.
+A binding writes into raw memory through a compiled table and a visitor hands
+values to Python; they are separate code paths over the same parser, so making
+them agree on randomly generated messages is the strongest statement available
+about either. CORELIB_PLAN §7.2 item 4 is the other rule enforced here: where
+the chunk boundaries fall must never change the outcome.
 
 Seeds are fixed, so a failure is reproducible from its number alone.
 """
 
 from __future__ import annotations
 
-import io
 import random
 
 import pytest
 from test_push_feed import Collect
 from vectors import ENGINE_PAIRS
 
-from sofab import Binding, FixlenSubtype, Status, WireType
+from sofab import Binding, Status, Visitor
 
 #: Kept small enough that the suite stays fast; the same generator with a wider
 #: range is what a longer soak would use.
@@ -79,11 +78,11 @@ def _message(enc_cls, seed: int) -> bytes:
 
 @pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
 @pytest.mark.parametrize("chunk", [1, 5, 4096])
-def test_push_visitor_matches_the_pull_driver(enc_cls, dec_cls, chunk):
+def test_push_visitor_is_chunking_independent(enc_cls, dec_cls, chunk):
     for seed in range(SEEDS):
         msg = _message(enc_cls, seed)
         want = Collect()
-        dec_cls(io.BytesIO(msg)).drive(want)
+        assert dec_cls(visitor=want).feed(msg) is Status.COMPLETE
 
         got = Collect()
         dec = dec_cls(visitor=got)
@@ -135,43 +134,63 @@ def _binding() -> Binding:
     return outer.sequence(SEQ_ID, inner, count_at=99)
 
 
-def _pull_last(dec_cls, msg: bytes) -> dict:
-    """The last value seen per ``(scope, id)`` — which is what a binding holds
-    when a field repeats, so it is what the comparison has to be against."""
-    dec = dec_cls(io.BytesIO(msg))
-    out: dict = {}
-    depth = 0
-    while (f := dec.next()) is not None:
-        t = f.type
-        if t is WireType.SEQUENCE_START:
-            depth += 1
-            continue
-        if t is WireType.SEQUENCE_END:
-            depth -= 1
-            continue
-        key = (min(depth, 1), f.id)
-        if t is WireType.UNSIGNED:
-            out[key] = dec.unsigned()
-        elif t is WireType.SIGNED:
-            out[key] = dec.signed()
-        elif t is WireType.FIXLEN:
-            st = f.subtype
-            out[key] = (
-                dec.float32() if st is FixlenSubtype.FP32
-                else dec.float64() if st is FixlenSubtype.FP64
-                else dec.string() if st is FixlenSubtype.STRING
-                else dec.bytes()
-            )
-        elif t is WireType.ARRAY_UNSIGNED:
-            out[key] = tuple(dec.read_unsigned_array())
-        elif t is WireType.ARRAY_SIGNED:
-            out[key] = tuple(dec.read_signed_array())
-        else:
-            out[key] = tuple(
-                dec.read_float32_array() if f.subtype is FixlenSubtype.FP32
-                else dec.read_float64_array()
-            )
-    return out
+class _LastPerScope(Visitor):
+    """The last value seen per ``(scope, id)``.
+
+    A binding holds the last value when a field repeats, so that is what the
+    comparison has to be against. ``scope`` is 0 at the top level and 1 inside
+    any sequence — the fuzz nests one deep.
+    """
+
+    def __init__(self) -> None:
+        self.out: dict = {}
+        self.depth = 0
+
+    def on_sequence_begin(self, field_id):
+        self.depth += 1
+        return None
+
+    def on_sequence_end(self):
+        self.depth -= 1
+
+    def _put(self, field_id, value):
+        self.out[(min(self.depth, 1), field_id)] = value
+
+    def on_unsigned(self, field_id, value):
+        self._put(field_id, value)
+
+    def on_signed(self, field_id, value):
+        self._put(field_id, value)
+
+    def on_float32(self, field_id, value):
+        self._put(field_id, value)
+
+    def on_float64(self, field_id, value):
+        self._put(field_id, value)
+
+    def on_string(self, field_id, value):
+        self._put(field_id, value)
+
+    def on_bytes(self, field_id, value):
+        self._put(field_id, value)
+
+    def on_unsigned_array(self, field_id, values):
+        self._put(field_id, tuple(values))
+
+    def on_signed_array(self, field_id, values):
+        self._put(field_id, tuple(values))
+
+    def on_float32_array(self, field_id, values):
+        self._put(field_id, tuple(values))
+
+    def on_float64_array(self, field_id, values):
+        self._put(field_id, tuple(values))
+
+
+def _visitor_last(dec_cls, msg: bytes) -> dict:
+    v = _LastPerScope()
+    assert dec_cls(visitor=v).feed(msg) is Status.COMPLETE
+    return v.out
 
 
 def _read_slots(binding: Binding, words: bytearray, objects: list) -> dict:
@@ -200,11 +219,11 @@ def _read_slots(binding: Binding, words: bytearray, objects: list) -> dict:
 
 @pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
 @pytest.mark.parametrize("chunk", [1, 5, 4096])
-def test_bound_destinations_match_the_pull_reads(enc_cls, dec_cls, chunk):
+def test_bound_destinations_match_the_visitor(enc_cls, dec_cls, chunk):
     binding = _binding()
     for seed in range(SEEDS):
         msg = _message(enc_cls, seed)
-        want = _pull_last(dec_cls, msg)
+        want = _visitor_last(dec_cls, msg)
 
         words = bytearray(binding.tree_words_required * 8)
         objects: list = [None] * binding.tree_objects_required

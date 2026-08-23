@@ -17,7 +17,7 @@ from __future__ import annotations
 import io
 
 import pytest
-from vectors import ChunkReader
+from vectors import Binding, Recorder, Status, bound, values, verdict
 
 from sofab.decoder import Decoder
 from sofab.encoder import Encoder
@@ -208,10 +208,13 @@ def test_over_buffer_streams_through_flush_sink():
 
 
 def _decode_all(data: bytes, *, chunk: int | None = None):
-    src = ChunkReader(data, chunk) if chunk is not None else io.BytesIO(data)
-    dec = Decoder(src)
-    while dec.next() is not None:
-        dec.skip()
+    """Walk the whole message, materialising nothing, and surface its verdict."""
+    verdict(Decoder, data, chunk=chunk, recorder=Recorder(decline=lambda f: True))
+
+
+def _read_all(data: bytes, *, chunk: int | None = None):
+    """Same walk, but every value materialised."""
+    verdict(Decoder, data, chunk=chunk)
 
 
 def test_decode_id_out_of_range_raises():
@@ -251,12 +254,11 @@ def test_decode_truncated_unbalanced_sequence_raises():
         _decode_all(data)
 
 
-def test_skip_truncated_sequence_raises():
-    dec = Decoder(io.BytesIO(_hdr(1, WireType.SEQUENCE_START)))
-    f = dec.next()
-    assert f.type == WireType.SEQUENCE_START
+def test_skipping_a_truncated_sequence_is_incomplete():
+    """A declined sequence whose sub-tree never terminates: the walk runs out of
+    bytes, which is INCOMPLETE, not a decode error."""
     with pytest.raises(SofaIncompleteError):
-        dec.skip()  # sub-tree never terminates → truncated sequence
+        _decode_all(_hdr(1, WireType.SEQUENCE_START))
 
 
 def test_decode_truncated_scalar_varint_raises():
@@ -279,19 +281,17 @@ def test_decode_array_element_overflow_raises():
 
 def test_decode_fp32_wrong_payload_length_raises():
     # FIXLEN / FP32 subtype but length 3 (not 4). The wrong width is rejected as
-    # INVALID at header time (see corelib-py#38), so next() itself raises —
-    # before the payload is read — rather than the value reader.
+    # INVALID at header time (see corelib-py#38): the header parse rejects it,
+    # before the payload is read, so declining the field does not save it.
     data = _hdr(1, WireType.FIXLEN) + _varint((3 << 3) | FixlenSubtype.FP32) + b"\x00\x00\x00"
-    dec = Decoder(io.BytesIO(data))
     with pytest.raises(SofaDecodeError):
-        dec.next()
+        _decode_all(data)
 
 
 def test_decode_fp64_wrong_payload_length_raises():
     data = _hdr(1, WireType.FIXLEN) + _varint((4 << 3) | FixlenSubtype.FP64) + b"\x00\x00\x00\x00"
-    dec = Decoder(io.BytesIO(data))
     with pytest.raises(SofaDecodeError):
-        dec.next()
+        _decode_all(data)
 
 
 # ------------- Decoder — wrong-type read → §7.3 skip, not an error -----------
@@ -308,62 +308,30 @@ def test_read_wrong_type_returns_none_and_leaves_the_field():
     enc.write_float32_array(4, [1.0])
     data = enc.getvalue()
 
-    dec = Decoder(io.BytesIO(data))
-    dec.next()  # unsigned field
-    assert dec.float32() is None  # fixlen read on a scalar field
-
-    dec.next()  # string (fixlen) field
-    assert dec.float64() is None  # wrong fixlen subtype
-
-    dec.next()  # unsigned array
-    assert dec.read_signed_array() is None  # wrong varint-array wire type
-
-    dec.next()  # fp32 array
-    assert dec.read_float64_array() is None  # wrong fixlen-array subtype
-
-    # Nothing was consumed by any of the four refusals, so the stream is still
-    # exactly where it was: the last field is skipped by next(), which then
-    # reports clean EOF (the decode stays COMPLETE).
-    assert dec.next() is None
+    # Every one of the four bindings contradicts its field's wire tag, so all
+    # four are skipped like unknown ids and the decode stays COMPLETE.
+    b = (
+        Binding()
+        .float32(1, at=0, count_at=10)       # fixlen binding on a scalar field
+        .float64(2, at=1, count_at=11)       # wrong fixlen subtype
+        .signed_array(3, at=2, cap=4, count_at=12)   # wrong varint-array type
+        .float64_array(4, at=6, cap=4, count_at=13)  # wrong fixlen-array subtype
+    )
+    status, _dec, slots = bound(Decoder, data, b)
+    assert status is Status.COMPLETE
+    assert [slots.u[i] for i in (10, 11, 12, 13)] == [0, 0, 0, 0]
 
 
-def test_scalar_read_without_matching_field_raises():
-    dec = Decoder(io.BytesIO(_hdr(1, WireType.UNSIGNED) + _varint(9)))
-    dec.next()
-    assert dec.unsigned() == 9
-    # no pending value now → a caller mistake, the §6.3 InvalidArgument outcome
-    with pytest.raises(SofaRangeError):
-        dec.unsigned()
-    # and the deprecated alias still catches it
-    with pytest.raises(SofaRangeError):
-        dec.unsigned()
-
-
-def test_field_property_tracks_current():
-    dec = Decoder(io.BytesIO(_hdr(7, WireType.UNSIGNED) + _varint(1)))
-    assert dec.field is None
-    f = dec.next()
-    assert dec.field is f
-    assert dec.field.id == 7
-
-
-def test_read_exact_overshoot_keeps_remainder():
-    """A chunked reader that overshoots a blob payload must keep the surplus for
-    the next field (exercises the _read_exact overshoot branch)."""
+def test_a_chunk_that_overshoots_a_payload_keeps_the_surplus():
+    """A chunk that completes a blob payload and drags in the next field's bytes
+    must keep the surplus for that field."""
     enc = Encoder()
     enc.write_bytes(1, b"abcd")
     enc.write_unsigned(2, 42)
-    data = enc.getvalue()
-
-    # chunk=5 leaves the 4-byte blob partially buffered, and the refill that
-    # completes it also drags in the following field's bytes → overshoot kept.
-    dec = Decoder(ChunkReader(data, chunk=5))
-    f = dec.next()
-    assert f.type == WireType.FIXLEN
-    assert dec.bytes() == b"abcd"
-    dec.next()
-    assert dec.unsigned() == 42
-    assert dec.next() is None
+    assert values(Decoder, enc.getvalue(), chunk=5) == [
+        ("blob", 1, b"abcd"),
+        ("u", 2, 42),
+    ]
 
 
 # --------- Decoder — paths reached only when *reading* (not skipping) --------
@@ -373,27 +341,21 @@ def test_read_array_truncated_element_raises():
     """Truncation inside an array element surfaces while *reading* it (the
     _read_varints refill path, distinct from the skip path)."""
     data = _hdr(1, WireType.ARRAY_UNSIGNED) + _varint(2) + _varint(5) + b"\x80"
-    dec = Decoder(io.BytesIO(data))
-    dec.next()
     with pytest.raises(SofaIncompleteError):
-        dec.read_unsigned_array()
+        _read_all(data)
 
 
 def test_read_array_element_overflow_raises():
     data = _hdr(1, WireType.ARRAY_UNSIGNED) + _varint(1) + b"\xff" * 10 + b"\x01"
-    dec = Decoder(io.BytesIO(data))
-    dec.next()
     with pytest.raises(SofaDecodeError):
-        dec.read_unsigned_array()
+        _read_all(data)
 
 
 def test_read_signed_array_truncated_across_refill_raises():
     """A signed array read fed one byte at a time, truncated mid-element."""
     data = _hdr(1, WireType.ARRAY_SIGNED) + _varint(1) + b"\x80"
-    dec = Decoder(ChunkReader(data, chunk=1))
-    dec.next()
     with pytest.raises(SofaIncompleteError):
-        dec.read_signed_array()
+        _read_all(data, chunk=1)
 
 
 def test_fixlen_length_word_truncated_raises():
@@ -416,17 +378,21 @@ def test_read_array_missing_element_at_boundary_raises():
     """count says 2 but only one element is present; the read runs out exactly
     at an element boundary (the _read_varints outer-loop refill path)."""
     data = _hdr(1, WireType.ARRAY_UNSIGNED) + _varint(2) + _varint(5)
-    dec = Decoder(io.BytesIO(data))
-    dec.next()
     with pytest.raises(SofaIncompleteError):
-        dec.read_unsigned_array()
+        _read_all(data)
 
 
-def test_read_float_array_on_non_fixlen_array_returns_none():
-    dec = Decoder(io.BytesIO(_hdr(1, WireType.UNSIGNED) + _varint(1)))
-    dec.next()
-    assert dec.read_float32_array() is None  # not a fixlen array at all → §7.3
-    assert dec.unsigned() == 1  # still pending: the right read still takes it
+def test_a_float_array_binding_on_a_scalar_field_is_skipped():
+    data = _hdr(1, WireType.UNSIGNED) + _varint(1)
+    b = Binding().float32_array(1, at=0, cap=4, count_at=10)
+    status, _dec, slots = bound(Decoder, data, b)
+    assert status is Status.COMPLETE  # not a fixlen array at all → §7.3
+    assert slots.u[10] == 0
+
+    # ... and the binding that matches still takes it.
+    b2 = Binding().unsigned(1, at=0, count_at=10)
+    status, _dec, slots = bound(Decoder, data, b2)
+    assert status is Status.COMPLETE and slots.u[0] == 1 and slots.u[10] == 1
 
 
 # ------------- Encoder — error propagation through fixlen writers ------------

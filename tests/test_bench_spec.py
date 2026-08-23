@@ -20,12 +20,12 @@ and dataset test, never a performance assertion: no timing figure is checked.
 from __future__ import annotations
 
 import importlib.util
-import io
 import re
 import sys
 from pathlib import Path
 
 import pytest
+from vectors import values
 
 from sofab import Decoder, Encoder, WireType
 
@@ -113,47 +113,53 @@ def test_composite_message_is_956_bytes():
     assert len(pb.encode_composite_msg()) == pb.COMPOSITE_ENCODED == 956
 
 
+def _by_depth(events):
+    """Annotate a flat event list with its sequence depth.
+
+    The composite message reuses ids inside its wrapper array (element id = array
+    index), so an id alone does not identify a field — the depth it sits at does.
+    """
+    out = []
+    depth = 0
+    for e in events:
+        if e[0] == "seq{":
+            out.append((depth, e))
+            depth += 1
+        elif e[0] == "seq}":
+            depth -= 1
+            out.append((depth, e))
+        else:
+            out.append((depth, e))
+    return out
+
+
 def test_composite_carries_what_bench_spec_asks_for():
     """Each composite field is in the suite for a reason; check each is there."""
     msg = pb.encode_composite_msg()
-    dec = Decoder(io.BytesIO(msg))
-    top = []
-    while (f := dec.next()) is not None:
-        top.append(f.id)
-        if f.id == 1:  # wrapper array: one header per element, id = array index
-            elems = []
-            while (g := dec.next()) is not None and g.type != WireType.SEQUENCE_END:
-                elems.append((g.id, dec.string()))
-            assert elems == list(enumerate(pb.COMPOSITE_ITEMS))
-            assert len(elems) == 64  # ids 0..15 one-byte headers, 16..63 two-byte
-        elif f.id == 2:  # non-ASCII string through the UTF-8 validator
-            text = dec.string()
-            assert text == pb.COMPOSITE_TEXT
-            assert len(text.encode("utf-8")) == 320
-        elif f.id == 3:  # nesting at depth 3
-            depth = 0
-            seen = []
-            while (g := dec.next()) is not None:
-                if g.type == WireType.SEQUENCE_START:
-                    depth += 1
-                elif g.type == WireType.SEQUENCE_END:
-                    if depth == 0:
-                        break
-                    depth -= 1
-                elif g.type == WireType.UNSIGNED:
-                    seen.append(dec.unsigned())
-                elif g.type == WireType.SIGNED:
-                    seen.append(dec.signed())
-                else:
-                    dec.skip()
-            assert seen == [7, -1]
-        elif f.id == 130:
-            assert dec.unsigned() == 0xDEADBEEF
-        else:
-            dec.skip()
-    # Field 4 is equal to its declared default, so the encoder must not write it.
-    assert top == [1, 2, 3, 130]
-    # ...and 130 is the one two-byte field header in the suite.
+    ev = _by_depth(values(Decoder, msg))
+    top = [e for d, e in ev if d == 0]
+
+    # Field 4 equals its declared default, so the encoder must not write it.
+    # ``seq}`` carries no id, so it is not a field.
+    assert [e[1] for e in top if e[0] != "seq}"] == [1, 2, 3, 130]
+
+    # The wrapper array: one sequence per element, element id = array index.
+    elems = [(e[1], e[2]) for d, e in ev if d == 1 and e[0] == "str"]
+    assert elems == list(enumerate(pb.COMPOSITE_ITEMS))
+    assert len(elems) == 64  # ids 0..15 one-byte headers, 16..63 two-byte
+
+    # A non-ASCII string through the UTF-8 validator, at the top level.
+    text = next(e[2] for d, e in ev if d == 0 and e[0] == "str" and e[1] == 2)
+    assert text == pb.COMPOSITE_TEXT
+    assert len(text.encode("utf-8")) == 320
+
+    # Nesting at depth 3, and the values buried in it.
+    seen = [e[2] for d, e in ev if d > 0 and e[0] in ("u", "s")]
+    assert seen == [7, -1]
+
+    # Field 130: the one two-byte field header in the suite.
+    assert ("u", 130, 0xDEADBEEF) in [e for d, e in ev if d == 0]
+
     assert msg[-7:-5] == bytes([((130 << 3) | WireType.UNSIGNED) & 0x7F | 0x80,
                                 (130 << 3) >> 7])
 
