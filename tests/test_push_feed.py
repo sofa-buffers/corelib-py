@@ -16,7 +16,7 @@ import io
 import pytest
 from vectors import DECODER_ENGINES, ENGINE_PAIRS, VECTORS
 
-from sofab import Binding, SofaLimitError, SofaRangeError, Status, Visitor
+from sofab import Binding, SofaLimitError, SofaRangeError, Status, Visitor, WireType
 
 
 class Collect(Visitor):
@@ -363,3 +363,63 @@ def test_every_decode_vector_agrees_with_the_pull_path(dec_cls, chunk):
             st = dec.feed(data[off : off + chunk])
         assert st is Status.COMPLETE, vec.get("name")
         assert got.events == want.events, vec.get("name")
+
+
+# --- state the field walk leaves behind -------------------------------------
+#
+# Both of these guard invariants an optimisation can quietly break: the decode
+# stays correct while the *bookkeeping* around it drifts, so nothing else in the
+# suite notices. Both did break while the bound path was being made faster.
+
+
+@pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
+def test_skipping_a_sequence_leaves_the_walk_finished(enc_cls, dec_cls):
+    """After ``skip()`` over a sequence the decoder must be positioned *past*
+    it — a second ``skip()`` is then a no-op on a field with nothing pending,
+    not a second walk of bytes that belong to the next field."""
+    enc = enc_cls()
+    enc.write_sequence_begin_lazy(1)
+    enc.write_unsigned(2, 5)
+    enc.write_sequence_end()
+    enc.write_unsigned(9, 7)
+    enc.flush()
+
+    dec = dec_cls(io.BytesIO(enc.getvalue()))
+    assert dec.next() is not None
+    dec.skip()
+    dec.skip()  # must not re-walk
+    nxt = dec.next()
+    assert nxt is not None and nxt.id == 9
+    assert dec.unsigned() == 7
+
+
+@pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
+def test_field_still_reports_the_last_field_at_eof(enc_cls, dec_cls):
+    """``field`` is "the most recently returned Field", and reaching EOF does not
+    retract it. Both engines, because §5.3 wants the accelerator invisible."""
+    enc = enc_cls()
+    enc.write_unsigned(1, 3)
+    enc.flush()
+    dec = dec_cls(io.BytesIO(enc.getvalue()))
+    f = dec.next()
+    assert f is not None
+    dec.unsigned()
+    assert dec.next() is None
+    assert dec.field is not None
+    assert dec.field.id == 1
+
+
+@pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
+def test_field_after_a_sequence_skip_is_the_end_marker(enc_cls, dec_cls):
+    """The walk consumed the sequence's end, so that is what ``field`` reports —
+    and both engines have to agree, since the walk builds no Field of its own."""
+    enc = enc_cls()
+    enc.write_sequence_begin_lazy(1)
+    enc.write_unsigned(2, 5)
+    enc.write_sequence_end()
+    enc.flush()
+    dec = dec_cls(io.BytesIO(enc.getvalue()))
+    dec.next()
+    dec.skip()
+    assert dec.field is not None
+    assert dec.field.type is WireType.SEQUENCE_END
