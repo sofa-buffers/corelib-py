@@ -19,7 +19,7 @@ import enum
 import inspect
 
 import pytest
-from vectors import pairs, values, verdict
+from vectors import Visitor, pairs, values, verdict
 
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
@@ -265,14 +265,14 @@ def test_rejection_is_a_sofa_error_so_sticky_mode_latches_it(enc_cls):
 
 @pytest.mark.parametrize("enc_cls", ENCODERS)
 def test_array_element_domain_rejected(enc_cls):
-    for values in ([1, 1 << 64], [1, -1]):
+    for elems in ([1, 1 << 64], [1, -1]):
         enc = enc_cls()
         with pytest.raises(SofaRangeError):
-            enc.write_unsigned_array(1, values)
-    for values in ([1, 1 << 63], [1, SIGNED_MIN - 1]):
+            enc.write_unsigned_array(1, elems)
+    for elems in ([1, 1 << 63], [1, SIGNED_MIN - 1]):
         enc = enc_cls()
         with pytest.raises(SofaRangeError):
-            enc.write_signed_array(1, values)
+            enc.write_signed_array(1, elems)
 
 
 @pytest.mark.parametrize("enc_cls", ENCODERS)
@@ -429,7 +429,7 @@ def test_call_shapes_match_the_pure_engine():
     everywhere the extension is missing and fail where it is present."""
     for pure_cls, native_cls, make in (
         (PyEncoder, NativeEncoder, lambda cls: cls()),
-        (PyDecoder, NativeDecoder, lambda cls: cls(visitor=_V())),
+        (PyDecoder, NativeDecoder, lambda cls: cls(visitor=Visitor())),
     ):
         public = {n for n in dir(pure_cls) if not n.startswith("_")}
         assert public == {n for n in dir(native_cls) if not n.startswith("_")}

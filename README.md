@@ -94,7 +94,7 @@ it changes only speed, never the wire format or the public API.
 | Goal | How |
 |------|-----|
 | Streaming **out** | `Encoder` writes into a **fixed** buffer and drains it to any binary stream (file, socket, `BytesIO`) as the message is written — never after it — so a message can exceed RAM. |
-| Streaming **in** | `Decoder` is a pull parser over any `read(n)` reader; `next()` returns one field header at a time, never materializing the whole message. A call that runs out of bytes reports `SofaIncompleteError` **without consuming anything**, so it can be re-issued when more arrive. |
+| Streaming **in** | `Decoder` is a push decoder: `feed(chunk)` takes bytes of any size and hands each field to your handler, never materializing the whole message. Every `feed` returns `COMPLETE` / `INCOMPLETE` / `INVALID` for the bytes so far; a construct split across a boundary is retained and finished by the next chunk. |
 | Native speed, zero runtime deps | The hot path ships as an optional Cython accelerator (`sofab._speedups`); when it can't be built it falls back to pure Python. No runtime third-party deps either way. |
 | Runs everywhere | With no compiler or wheel, `pip` still installs a working pure-Python build (`py3-none-any`). Native and pure paths are byte-for-byte identical; falling back changes only speed. |
 | Sticky errors | `Encoder(sticky=True)` records the first failure and turns later writes into no-ops, so generated `serialize` code can check `enc.error` once. |
@@ -169,77 +169,12 @@ wire = memoryview(buf)[: enc.bytes_used()]   # no copy
 
 ### Deserialize
 
-`Decoder` is a pull parser: `next()` returns one field header at a time; read the
-value with a typed accessor, or `skip()` an unknown field:
+`Decoder` is a **push** decoder (CORELIB_PLAN §5.2): you hand it bytes, it hands
+your handler fields. There is no reader and no caller-driven loop — the decoder
+owns the walk, which is what lets it resolve a field to its destination without
+crossing into Python at all.
 
-```python
-import io
-from sofab import Decoder
-
-dec = Decoder(io.BytesIO(data))
-while (field := dec.next()) is not None:   # None == clean EOF
-    if   field.id == 1: v = dec.unsigned()
-    elif field.id == 2: v = dec.signed()
-    elif field.id == 3: s = dec.string()
-    else:               dec.skip()         # unknown field
-```
-
-**A read whose type contradicts the field on the wire is not an error**
-(MESSAGE_SPEC §7.3): it returns `None` and consumes nothing, so the following
-`next()` skips the field exactly like one with an unknown id — `dec.float64()` on
-a `string` field yields `None`, not an exception. Test `field.type` /
-`field.subtype` before reading, or treat `None` as "not my field"; since nothing
-was consumed, re-reading the same field with the type the wire carries still
-works. A read issued when there is **no** pending value at all — before the first
-`next()`, twice for one field, or on a sequence start/end — raises
-`SofaRangeError`.
-
-### Deserialize stream
-
-Hand `Decoder` any object with `read(n)` (a socket, `sys.stdin.buffer`,
-`gzip.GzipFile`, …) and pull fields with `next()` as they arrive. It refills on
-demand, so the same loop decodes correctly even when fed one byte at a time:
-
-```python
-from sofab import Decoder
-
-dec = Decoder(reader)                # any read(n) source: file, socket, pipe
-while (field := dec.next()) is not None:
-    ...                              # pull each field, or dec.skip()
-```
-
-**When the bytes have not all arrived yet.** A reader that can return `b""`
-before end-of-message — a non-blocking socket, a queue fed by another task —
-means "feed me more", not an error and not the end of the message. Two shapes
-signal it, and both are **resumable: the suspended call consumed nothing**, so
-obtain more bytes and issue the *same* call again:
-
-* `next()` returns `None` — the bytes stopped exactly *between* fields, where a
-  message may end and more fields may also still follow;
-* `SofaIncompleteError` is raised — the bytes stopped *inside* a field header or
-  payload, or inside a sequence that is still open.
-
-```python
-while True:
-    try:
-        field = dec.next()
-    except SofaIncompleteError:
-        feed_more(); continue        # partial field retained; re-issue next()
-    if field is None:
-        if stream_ended: break       # your framing decides; the decoder never does
-        feed_more(); continue
-    value = read_the_value(dec, field)   # same retry rule for the typed reads
-```
-
-Whether an incomplete message is acceptable is the **caller's** decision: only
-your framing (a length prefix, a datagram boundary, EOF) knows whether more bytes
-can still come.
-
-### Deserialize push (`feed`)
-
-The other half of the push-feed / pull-read model: instead of a source the
-decoder pulls from, hand it a *field handler* and push chunks in. Every `feed`
-returns the three-valued decode outcome for the bytes consumed **so far**:
+Give it a handler and feed it:
 
 ```python
 from sofab import Decoder, Status, Visitor
@@ -250,10 +185,12 @@ class Handler(Visitor):
 
 dec = Decoder(visitor=Handler())
 for chunk in socket_chunks():
-    st = dec.feed(chunk)               # COMPLETE / INCOMPLETE / INVALID
+    st = dec.feed(chunk)
     if st is Status.INVALID:
-        raise ValueError(dec.error)    # terminal; the reason is on .error
+        raise ValueError(dec.error)
 ```
+
+Every `feed` returns the outcome for the bytes consumed **so far**:
 
 | outcome | meaning |
 |---|---|
@@ -335,9 +272,8 @@ methods (CORELIB_PLAN §6.1.1 fixes the names) — the streaming pair `serialize
 `encode` / `decode`, thin wrappers over it. A hand-written stand-in:
 
 ```python
-import io
 from dataclasses import dataclass
-from sofab import Decoder, Encoder
+from sofab import Binding, Decoder, Encoder, Status
 
 # generated by: sofabgen --lang python
 @dataclass
@@ -345,15 +281,25 @@ class Point:
     x: int = 0
     y: int = 0
 
+    #: Field id -> slot, built once from the schema.
+    BINDING = Binding().signed(1, at=0, count_at=2).signed(2, at=1, count_at=3)
+
     def serialize(self, e: Encoder) -> None:    # streaming out: write into any encoder
         e.write_signed(1, self.x)
         e.write_signed(2, self.y)
 
-    def deserialize(self, d: Decoder) -> None:  # streaming in: pull from any decoder
-        while (f := d.next()) is not None:
-            if   f.id == 1: self.x = d.signed()
-            elif f.id == 2: self.y = d.signed()
-            else:           d.skip()            # tolerate unknown fields
+    def deserialize(self, words) -> None:       # streaming in: read your slots back
+        q = memoryview(words).cast("q")
+        u = memoryview(words).cast("Q")
+        if u[2]:
+            self.x = q[0]
+        if u[3]:
+            self.y = q[1]
+
+    @classmethod
+    def decoder(cls):                           # §6.1.1: the streaming reader
+        words = bytearray(cls.BINDING.tree_words_required * 8)
+        return Decoder(binding=cls.BINDING, words=words), words
 
     def encode(self) -> bytes:                  # one-shot wrapper over serialize()
         e = Encoder()
@@ -362,8 +308,11 @@ class Point:
 
     @classmethod
     def decode(cls, data: bytes) -> "Point":    # one-shot wrapper over deserialize()
+        dec, words = cls.decoder()
+        if dec.feed(data) is not Status.COMPLETE:
+            raise ValueError(dec.error or "incomplete message")
         o = cls()
-        o.deserialize(Decoder(io.BytesIO(data)))
+        o.deserialize(words)
         return o
 
 wire = Point(x=3, y=4).encode()
@@ -371,10 +320,9 @@ got = Point.decode(wire)             # got.x == 3, got.y == 4
 ```
 
 The one-shot pair holds the whole message in memory; `serialize` / `deserialize`
-are the same code without that requirement. `serialize` writes into an encoder
-over a buffer **you** sized, draining to a sink as it fills; `deserialize` pulls
-from a `Decoder` over any `read(n)` source — the corelib `Decoder` *is* this
-port's `decoder()`, so there is no second handle to obtain:
+are the same code without that requirement. Out, `serialize` writes into an
+encoder over a buffer **you** sized, draining to a sink as it fills; in, the
+decoder from `decoder()` takes chunks of any size:
 
 ```python
 # streaming out: a 2-byte buffer, drained to the sink as the message is written
@@ -384,21 +332,18 @@ Point(x=3, y=4).serialize(enc)
 enc.flush()                                  # push the tail
 streamed = bytes(packets)                    # == wire, out of a buffer half its size
 
-class ChunkReader:                           # stand-in for a socket / pipe
-    def __init__(self, data): self.data, self.pos = data, 0
-    def read(self, n):                       # hands over one byte per call
-        chunk = self.data[self.pos : self.pos + 1]
-        self.pos += len(chunk)
-        return chunk
-
 # streaming in: the same object, fed one byte at a time
+dec, words = Point.decoder()
+for i in range(len(streamed)):
+    st = dec.feed(streamed[i : i + 1])       # COMPLETE / INCOMPLETE / INVALID
 got_streamed = Point()
-got_streamed.deserialize(Decoder(ChunkReader(streamed)))
+got_streamed.deserialize(words)
 ```
 
-A reader that can run dry *before* the message ends adds one obligation to the
-generated loop: retry a `SofaIncompleteError` after obtaining more bytes, as
-[Deserialize stream](#deserialize-stream) describes.
+Every `feed` returns the outcome for the bytes so far, so a source that runs dry
+before the message ends adds no obligation to the generated code beyond looking
+at it: `INCOMPLETE` means "feed me the next chunk", and only your framing knows
+whether more can still come.
 
 ### Decode limits
 
@@ -408,7 +353,8 @@ decoder allocates whatever a message declares. `Decoder` takes optional
 alone — *before* any allocation or payload buffering:
 
 ```python
-dec = Decoder(reader, max_array_count=65536, max_string_len=1 << 20, max_blob_len=1 << 20)
+dec = Decoder(binding=b, words=words,
+              max_array_count=65536, max_string_len=1 << 20, max_blob_len=1 << 20)
 ```
 
 A field whose declared count/length exceeds its cap raises `SofaLimitError`: a
@@ -419,46 +365,43 @@ values are supplied by generated code, which knows the schema. Independent of an
 limit, the decoder never pre-allocates from an untrusted array count — a
 truncated oversize claim fails promptly as `SofaIncompleteError`.
 
-The verdict is reached on the count/length word alone, inside `next()`, before a
-single payload byte is read or buffered (CORELIB_PLAN §6.2.1). It is *raised* by
-the call that would consume the field: a typed read, `skip()`, or the auto-skip
-the following `next()` performs. Nothing is read or allocated in between; what
-the gap buys is the window in which the caller can declare the field
-schema-bounded.
+The verdict is reached on the count/length word alone, before a single payload
+byte is read or buffered — the point CORELIB_PLAN §6.2.1 requires it to be
+decided.
 
-#### A schema-bounded field is exempt: `schema_bounded()`
+#### A schema-bounded field is exempt
 
 A cap is *capacity* the deployment commits where the **sender** chooses the size.
 Where the **schema** already states a `count:`/`maxlen:`, that bound governs
-instead, an over-bound value is malformed input rather than policy, and the cap
-must not apply. Only the schema knows which fields those are, so the caller
-declares them per field:
+instead and an over-bound value is malformed input, so §6.2.1 forbids the cap
+there ("MUST NOT be applied to a field the schema already bounds") and §6.3
+forbids `SofaLimitError` on such a field.
+
+Only the schema knows which fields those are, and the binding is where it says
+so — `cap` on an array and `maxlen` on a string or blob **are** the schema's
+bound:
 
 ```python
-f = dec.next()
-if f.id == 1:                 # `name: { type: string, maxlen: 4194304 }`
-    dec.schema_bounded()      # the cap does not bind this field
-    if dec.fixlen_len() > 4194304:
-        raise SofaDecodeError("name: string byte length above schema maxlen")
-    o.name = dec.string()
+b = Binding().string(1, at=0, maxlen=4194304)   # `name: { string, maxlen: 4194304 }`
 ```
 
-The declaration covers the current field only — the next `next()` starts an
-undeclared, and therefore capped, field again — and it is a no-op on a field no
-cap has rejected, so generated code emits it unconditionally on the fields its
-schema bounds. Declaring is a **promise to enforce**: the caller must itself
-reject an over-bound count/length, as `SofaDecodeError`. `fixlen_len()` is the
-peek for that — it consumes nothing, and answers whether or not a cap has spoken
-on the field. A `Visitor` driven by `drive()` can call `schema_bounded()` from
-`on_field`, which is reached before the typed read.
+Declaring it does two things at once: the receiver-side cap stops applying to
+that field, and the decoder enforces the declared bound itself — an over-bound
+length is `INVALID` (`SofaDecodeError`, MESSAGE_SPEC §7.1), never
+`SofaLimitError`. A field with no declared bound — one the table names without a
+`maxlen`, or does not name at all — stays under the cap, including when it is
+only walked past.
 
-The integer-array reads carry a declared element width the same way —
-`read_unsigned_array(255)` for a `u8` array, `read_signed_array(-128, 127)` for
-an `i8` one (either half may be given alone; the other side stays open). An
+A **schema** bound is the opposite kind of thing from a cap: it is part of the
+message definition, so breaching it is malformed input, not policy. The
+array bindings take the declared element width for exactly that reason —
+`unsigned_array(..., elem_max=255)` for a `u8` array,
+`signed_array(..., elem_min=-128, elem_max=127)` for an `i8` one (either half may
+be given alone; the other side stays open). An
 element outside the declared width raises `SofaDecodeError` the moment its own
-bytes are decoded, whatever follows it in the array and whichever engine read it.
-Omit the argument for `u64`/`i64`, whose range is the value domain, or for an
-unbounded consumer.
+bytes are decoded, so the verdict never depends on how much of the array
+followed it or on which engine read it (MESSAGE_SPEC §7.1). Omit them for
+`u64`/`i64`, whose range is the value domain, or for an unbounded consumer.
 
 ## Memory handling
 
@@ -469,34 +412,33 @@ allocates only for `string` and `blob`, which have no fixed-width machine form.
 Encoding never allocates an output buffer at all (§5.1).
 
 * **Decode: the library owns the input buffer.** `Decoder` keeps a single
-  internal buffer, refilled from the `read(n)` source or from `feed` and never
-  handed out, so there is **no zero-copy aliasing**: `string()` returns a fresh
-  `str`, `bytes()` independent `bytes`, scalars a fresh `int`/`float`, and arrays
-  a new `list` — every result stays valid after the decoder advances.
-* **Decode: a suspended call keeps its bytes, and only its bytes.** Everything
-  the reader hands over is retained, so a field split across chunks is never
-  half-consumed; the buffer's consumed prefix is dropped on the next refill,
-  down to the first byte of the call in flight — that byte is the one a resumed
-  call re-reads from. The window held is therefore one field (for a `skip()`
-  over a sequence, one sequence), not one message.
+  internal buffer, extended by `feed` and never handed out, so there is **no
+  zero-copy aliasing**: a handler receives a fresh `str`, independent `bytes`, a
+  fresh `int`/`float` or a new `list`, and every one of them stays valid after
+  the decoder advances.
+* **Decode: a suspended construct keeps its bytes, and only its bytes.**
+  Everything fed is retained until it is consumed, so a field split across chunks
+  is never half-decoded; the consumed prefix is dropped on the next `feed`, down
+  to the first byte of the construct in flight — that byte is the one the retry
+  re-reads from. The window held is therefore one field (for a declined sequence,
+  one sequence), not one message.
 * **Decode: a fed chunk is borrowed for the call and no longer** (§6). Anything
   the decoder still needs when `feed` returns — the tail of a construct split
   across the boundary, a decoded string or blob — has been copied out, so the
   same calling code is correct whatever the chunk boundaries are.
 * **Decode into your own slots.** With a `Binding` the numeric fields never
-  become Python objects: they land in the `words` buffer you passed, sized from
-  the schema. The decoder allocates no destination and grows nothing, and a wire
-  count past your capacity is rejected rather than honoured (§6.6).
-* **Decode: measuring a payload costs nothing.** `fixlen_len()` peeks the current
-  string/blob field's exact wire byte length **without** consuming it, so a
-  caller can bound the field against a schema `maxlen` before reading — no
-  re-encoding a decoded `str` just to measure it.
-* **Decode: a value you don't want costs nothing to get rid of.** `skip()` — and
-  the auto-skip `next()` performs over an unconsumed value — walks a string,
+  become Python objects at all: they land in the `words` buffer you passed, sized
+  from the schema. The decoder allocates no destination and grows nothing, and a
+  wire count past your capacity is rejected rather than honoured (§6.6).
+* **Decode: measuring a payload costs nothing.** A string or blob is bounded
+  against its schema `maxlen` by the binding, on the length the *sender*
+  declared — no re-encoding a decoded `str` just to measure it.
+* **Decode: a value you don't want costs nothing to get rid of.** A field no
+  binding names and no visitor wants — or one a visitor declines — walks a string,
   blob or fixlen-array payload by advancing the cursor, so nothing is allocated
   for bytes that are being discarded: skipping a 1 MiB blob already in the
   buffer is a pointer bump. The bytes are still **buffered** when the payload
-  straddles a refill, so what a skip saves is the copy, not the window.
+  straddles a chunk boundary, so what a skip saves is the copy, not the window.
 * **Encode: one ownership model — the output buffer is fixed, and never grows.**
   CORELIB_PLAN §5.1 forbids a corelib to allocate an output buffer or to grow
   one, so there is a single mechanism here with three ways to reach it:
@@ -632,8 +574,8 @@ The native accelerator is worth roughly an order of magnitude over the pure
 engine on the message-shaped rows and two on the array-heavy ones, and it beats
 protobuf everywhere except the smallest decode, where the two are level. That
 last workload is where the streaming **pull** API costs the most: it crosses the
-Python↔C boundary twice per field (`next()` then a typed read), whereas protobuf
-parses the whole message in one C call. `bench/compare_protobuf.py` runs that
+Python↔C boundary once per field when a visitor handles it — and not at all when
+a `Binding` does — whereas protobuf parses the whole message in one C call. `bench/compare_protobuf.py` runs that
 comparison.
 
 Measured figures are not reproduced here — they belong to the cross-language

@@ -19,7 +19,6 @@ the full scenario matrix the harness mandates:
 
 from __future__ import annotations
 
-import io
 import math
 import struct
 
