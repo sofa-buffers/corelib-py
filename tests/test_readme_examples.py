@@ -128,13 +128,13 @@ def test_binding_example_runs_and_decodes(readme: str) -> None:
 
 
 def test_feed_example_matches_the_api(readme: str) -> None:
-    """The ``feed`` example is written against a socket, so it is checked for
-    shape rather than executed: the names it uses must exist and mean what the
-    surrounding table says."""
+    """The ``Deserialize`` example is written against a socket, so it is checked
+    for shape rather than executed: the names it uses must exist and mean what
+    the surrounding table says."""
     from sofab import Decoder, Status
 
-    body = _sections(readme).get("### Deserialize push (`feed`)")
-    assert body is not None, "README lost its `### Deserialize push (`feed`)` section"
+    body = _sections(readme).get("### Deserialize")
+    assert body is not None, "README lost its `### Deserialize` section"
     src = "\n".join(_python_blocks(body))
     assert "Decoder(visitor=" in src and "dec.feed(" in src
     assert "dec.error" in src
