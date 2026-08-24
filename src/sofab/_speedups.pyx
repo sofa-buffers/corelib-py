@@ -1921,7 +1921,8 @@ cdef class Decoder:
             if type(reassembly) is not bytearray:
                 raise SofaRangeError("reassembly must be a bytearray")
             self._rbuf = reassembly
-        self._vstack = []
+        # Built on the first descent -- see the pure engine.
+        self._vstack = None
         self._binding = binding
         self._visitor = visitor
         self._wants_field = False
@@ -2950,7 +2951,7 @@ cdef class Decoder:
             # A descent left mid-message: the handler the caller gave us is the
             # one at the bottom of the stack.
             self._bind_visitor(self._vstack[0])
-            self._vstack = []
+            self._vstack = None
         self._resume_kind = _R_NONE
         self._resume_entry = -1
         self._tsp = 0
@@ -3048,6 +3049,8 @@ cdef class Decoder:
                         self._push_table(-1)
                         if isinstance(answer, _Visitor):
                             # The handler named someone else for this sub-tree.
+                            if self._vstack is None:
+                                self._vstack = []
                             self._vstack.append(visitor)
                             visitor = answer
                             self._bind_visitor(answer)
