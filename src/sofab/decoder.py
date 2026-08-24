@@ -352,8 +352,10 @@ class Decoder:
         # that receives one, and the typed hooks take an id.
         # Visitors suspended by a descent: a handler may answer
         # on_sequence_begin with another Visitor, and the sub-tree's events go
-        # there until its end marker. Empty for the common flat handler.
-        self._vstack: list[Visitor] = []
+        # there until its end marker. Built on the first descent, not here -- a
+        # decoder is constructed per message on the one-shot path and the flat
+        # handler, which is most of them, never descends.
+        self._vstack: list[Visitor] | None = None
         self._wants_field = False
         self._wants_seq_begin = False
         self._wants_array_begin = False
@@ -1299,6 +1301,8 @@ class Decoder:
                         self._bmap = None
                         if isinstance(answer, Visitor):
                             # The handler named someone else for this sub-tree.
+                            if self._vstack is None:
+                                self._vstack = []
                             self._vstack.append(visitor)
                             visitor = self._visitor = answer
                             self._bind_visitor(answer)
