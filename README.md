@@ -313,6 +313,49 @@ the moment it does — overwrite it in place if you like.
 Nothing else changes: same verdicts, same values, same chunking-independence. A
 message that arrives in one piece never touches the buffer at all.
 
+#### Arrays of strings, blobs or structs: `sofab.collectors`
+
+An array whose elements are not packed scalars — strings, blobs, structs — is a
+**sequence whose child ids are the array indices** (MESSAGE_SPEC §5.1). Turning
+that event stream back into a list is the same code for every schema, so it ships
+here rather than being emitted into every generated package:
+
+```python
+from sofab import Decoder, NestedSeq, StringSeq, Visitor
+
+class Doc(Visitor):
+    def __init__(self):
+        self.tags: list[str] = []
+        self.rows: list[Row] = []
+
+    def on_sequence_begin(self, field_id):
+        if field_id == 3:
+            return StringSeq(self.tags, cap=64, elem_max=128)
+        if field_id == 4:
+            return NestedSeq(self.rows, factory=Row, cap=16)
+        return None                      # decode it flat, into me
+```
+
+Returning a `Visitor` from `on_sequence_begin` **descends**: the sub-tree's
+fields go to the visitor returned, its `on_sequence_end` fires when the scope
+closes, and the parent resumes afterwards. Returning `False` still skips the
+sub-tree; anything else still decodes it flat.
+
+A collector places each element at the id it names and fills the gap an omitted
+interior element left — appending would shorten the array by every gap, and would
+take a reopened id as a second element. `StringSeq`, `BytesSeq`, `UnsignedSeq`,
+`SignedSeq`, `Float32Seq`, `Float64Seq` and `NestedSeq` are the set.
+
+Which bound applies is the schema's choice. `cap` is the schema's declared
+element count and an id past it is `INVALID`; `max_dyn_array_count` is the
+receiver limit and applies only where the schema declares none, because §6.2.1
+forbids a receiver limit on a field the schema already bounds. Either way the id
+is judged **before** the list grows, so an index near 2³¹ costs a comparison and
+not an allocation.
+
+These are the **static helper layer** of CORELIB_PLAN §6.6.1 — beside the codec,
+not part of it. They allocate; the codec does not.
+
 ### Decode into your own storage (`Binding`)
 
 A `Visitor` costs one Python call per field. A **`Binding`** costs none: declare

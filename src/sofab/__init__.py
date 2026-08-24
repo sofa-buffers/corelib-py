@@ -16,6 +16,16 @@ from typing import TYPE_CHECKING
 
 from ._varint import zigzag_decode, zigzag_encode
 from .binding import Binding
+from .collectors import (
+    BytesSeq,
+    Float32Seq,
+    Float64Seq,
+    NestedSeq,
+    SequenceCollector,
+    SignedSeq,
+    StringSeq,
+    UnsignedSeq,
+)
 from .types import (
     API_VERSION,
     ARRAY_MAX,
@@ -90,6 +100,14 @@ __all__ = [
     "Decoder",
     "Visitor",
     "Binding",
+    "BytesSeq",
+    "Float32Seq",
+    "Float64Seq",
+    "NestedSeq",
+    "SequenceCollector",
+    "SignedSeq",
+    "StringSeq",
+    "UnsignedSeq",
     "Field",
     "WireType",
     "Status",

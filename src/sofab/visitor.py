@@ -45,9 +45,27 @@ class Visitor:
         to decode it and dispatch to the typed hook below."""
         return None
 
-    def on_sequence_begin(self, field_id: int) -> bool | None:
-        """A nested sequence is opening. Return ``False`` to skip the whole
-        sub-tree (its end is consumed, ``on_sequence_end`` is not called)."""
+    def on_sequence_begin(self, field_id: int) -> bool | Visitor | None:
+        """A nested sequence is opening; nothing inside it has been decoded.
+
+        Three answers:
+
+        ``False``
+            skip the whole sub-tree — its end marker is consumed and
+            :meth:`on_sequence_end` is not called.
+        another :class:`Visitor`
+            **descend into it**: every field of that sub-tree goes to the visitor
+            returned, its :meth:`on_sequence_end` fires when the scope closes,
+            and this visitor resumes afterwards. That is how a wrapper array's
+            elements each get a handler of their own (see
+            :mod:`sofab.collectors`), and how a generated object hands a nested
+            message to the object that models it.
+        anything else
+            decode the sub-tree into this same visitor, as a flat event stream.
+
+        A sub-tree opens a fresh id scope (§4.9), so the ids inside it mean what
+        the nested schema says, not what the enclosing one does.
+        """
         return None
 
     def on_sequence_end(self) -> None:

@@ -1863,6 +1863,8 @@ cdef class Decoder:
     # --- push mode (§5.2) ---------------------------------------------------
     cdef object _binding             # the Binding this table was compiled from
     cdef object _visitor
+    # Visitors suspended by a descent -- see the pure engine.
+    cdef list _vstack
     # Whether the visitor overrides the two control hooks. Both default to a
     # no-op on the base class, and calling one that was never overridden costs a
     # Python call per field for nothing. ``_wants_field`` also decides whether a
@@ -1919,6 +1921,7 @@ cdef class Decoder:
             if type(reassembly) is not bytearray:
                 raise SofaRangeError("reassembly must be a bytearray")
             self._rbuf = reassembly
+        self._vstack = []
         self._binding = binding
         self._visitor = visitor
         self._wants_field = False
@@ -1926,13 +1929,7 @@ cdef class Decoder:
         self._wants_array_begin = False
         self._wants_blob_begin = False
         if visitor is not None:
-            self._wants_field = type(visitor).on_field is not _BASE_ON_FIELD
-            self._wants_seq_begin = (
-                type(visitor).on_sequence_begin is not _BASE_ON_SEQUENCE_BEGIN)
-            self._wants_array_begin = (
-                type(visitor).on_array_begin is not _BASE_ON_ARRAY_BEGIN)
-            self._wants_blob_begin = (
-                type(visitor).on_blob_begin is not _BASE_ON_BLOB_BEGIN)
+            self._bind_visitor(visitor)
         self._objects = objects
         if binding is None and visitor is None:
             raise SofaRangeError("a decoder needs a field handler (binding / visitor)")
@@ -1993,6 +1990,19 @@ cdef class Decoder:
             raise SofaRangeError("%s has no unset state (§6.2.1)" % name)
         if value < 0 or value > ceiling:
             raise SofaRangeError("%s=%s is outside 0..%s" % (name, value, ceiling))
+        return 0
+
+    cdef int _bind_visitor(self, object visitor) except -1:
+        # Take the hook flags off `visitor`'s type. Computed once per handler;
+        # a descent into a child is the only thing that changes the answer.
+        self._visitor = visitor
+        self._wants_field = type(visitor).on_field is not _BASE_ON_FIELD
+        self._wants_seq_begin = (
+            type(visitor).on_sequence_begin is not _BASE_ON_SEQUENCE_BEGIN)
+        self._wants_array_begin = (
+            type(visitor).on_array_begin is not _BASE_ON_ARRAY_BEGIN)
+        self._wants_blob_begin = (
+            type(visitor).on_blob_begin is not _BASE_ON_BLOB_BEGIN)
         return 0
 
     cdef inline void _rebind(self, object newbuf):
@@ -2936,6 +2946,11 @@ cdef class Decoder:
         self._status = <int>Status.COMPLETE
         self._err = None
         self._limit = None
+        if self._vstack:
+            # A descent left mid-message: the handler the caller gave us is the
+            # one at the bottom of the stack.
+            self._bind_visitor(self._vstack[0])
+            self._vstack = []
         self._resume_kind = _R_NONE
         self._resume_entry = -1
         self._tsp = 0
@@ -2966,6 +2981,7 @@ cdef class Decoder:
         cdef _BEntry* e
         cdef object visitor = self._visitor
         cdef bint want_field = self._wants_field
+        cdef object answer
 
         rk = self._resume_kind
         if rk != _R_NONE:
@@ -2995,7 +3011,13 @@ cdef class Decoder:
                     self._tsp -= 1
                     self._tab = self._tstack[self._tsp]
                 if visitor is not None:
+                    # The end belongs to whoever was handling the scope, so a
+                    # child hears its own scope close before it is popped.
                     visitor.on_sequence_end()
+                    if self._vstack:
+                        visitor = self._vstack.pop()
+                        self._bind_visitor(visitor)
+                        want_field = self._wants_field
                 continue
 
             ei = self._lookup(self._cur_id) if self._tab >= 0 else -1
@@ -3015,15 +3037,22 @@ cdef class Decoder:
                     if e.count_at >= 0:
                         self._words[e.count_at] += 1
                     continue
-                if visitor is not None and (
-                    not self._wants_seq_begin
-                    or visitor.on_sequence_begin(
-                        PyLong_FromUnsignedLongLong(self._cur_id)) is not False
-                ):
-                    # §4.9 opens a fresh id scope, so the enclosing table must
-                    # not match inside it.
-                    self._push_table(-1)
-                    continue
+                if visitor is not None:
+                    answer = None
+                    if self._wants_seq_begin:
+                        answer = visitor.on_sequence_begin(
+                            PyLong_FromUnsignedLongLong(self._cur_id))
+                    if answer is not False:
+                        # §4.9 opens a fresh id scope, so the enclosing table
+                        # must not match inside it.
+                        self._push_table(-1)
+                        if isinstance(answer, _Visitor):
+                            # The handler named someone else for this sub-tree.
+                            self._vstack.append(visitor)
+                            visitor = answer
+                            self._bind_visitor(answer)
+                            want_field = self._wants_field
+                        continue
                 try:
                     self._skip()
                 except SofaIncompleteError:
