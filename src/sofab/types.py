@@ -167,10 +167,17 @@ class SofaLimitError(SofaError):
     """
 
 
-class SofaRangeError(SofaError):
+class SofaArgumentError(SofaError):
     """The caller's own request is invalid — the ``InvalidArgument`` outcome of
     CORELIB_PLAN §6.3, which is the *only* code that taxonomy has for a caller
     mistake (every remaining malformed input is :class:`SofaDecodeError`).
+
+    Named after the code it carries. §6.3 lets a port "adapt casing and idiom",
+    and this class used to take that as far as ``SofaRangeError`` — which read
+    narrower than the code is: a destination too short for what a hook was told
+    is a caller mistake, not a value out of range. Every other port keeps the
+    word (``Error::Argument`` in Rust, ``Error::InvalidArgument`` in C++), so
+    this one does too. ``SofaRangeError`` remains as an alias.
 
     On encode, a value (or id/count) is not writable: either it is outside the
     permitted range, or it is not an integer at all: integer fields accept
@@ -182,12 +189,33 @@ class SofaRangeError(SofaError):
     :meth:`~sofab.Encoder.getvalue` on a caller-owned fixed buffer, and a
     sequence end without a matching begin.
 
-    On decode it means the decoder has **no value pending at all** — a typed read
-    issued before :meth:`~sofab.Decoder.next`, twice for one field, or on a
-    sequence start/end. It is *not* raised when a pending value's wire type
-    merely contradicts the read: that is MESSAGE_SPEC §7.3, which the typed reads
-    answer with ``None`` instead (see :class:`sofab.Decoder`).
+    On decode it covers two caller mistakes. One is having **no value pending at
+    all** — a typed read issued before :meth:`~sofab.Decoder.next`, twice for one
+    field, or on a sequence start/end. The other is a **destination that cannot
+    hold what was announced**: a buffer handed back from
+    :meth:`sofab.Visitor.on_blob_begin` or :meth:`sofab.Visitor.on_array_begin`
+    shorter than the size those hooks were told, or a ``reassembly=`` buffer too
+    small for a construct spanning a chunk. The handler was given the count or
+    length first and answered with storage that does not fit it, so the mistake
+    is the caller's; §6.6.3 has the codec refuse such a destination "rather than
+    growing it", and §6.2.1 forbids clamping into it.
+
+    That second case is the *only* ceiling left on a destination the caller
+    supplies. A receiver's configured ``max_dyn_*`` limit does not also apply to
+    it: the limit exists to stop the sender dictating the receiver's allocation,
+    and a handler that returns a buffer has sized that buffer itself
+    (:class:`SofaLimitError`).
+
+    It is *not* raised when a pending value's wire type merely contradicts the
+    read: that is MESSAGE_SPEC §7.3, which the typed reads answer with ``None``
+    instead (see :class:`sofab.Decoder`).
     """
+
+
+#: Deprecated alias for :class:`SofaArgumentError`, kept so existing
+#: ``except SofaRangeError`` and ``isinstance`` checks keep working. It is the
+#: same class, not a subclass, so either name catches what the other raises.
+SofaRangeError = SofaArgumentError
 
 
 class SofaBufferError(SofaError):

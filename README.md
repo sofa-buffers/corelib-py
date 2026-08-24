@@ -62,7 +62,7 @@ print(sofab.__version__)   # release of this runtime
 `Encoder` / `Decoder` / `Field` are re-exported from the compiled
 `sofab._speedups` extension when present, and from the pure-Python
 `encoder.py` / `decoder.py` otherwise. Both engines import wire constants, enums
-and exception classes from the shared `types.py`, so a `SofaRangeError` is the
+and exception classes from the shared `types.py`, so a `SofaArgumentError` is the
 *same class* from either, and the two produce byte-for-byte identical output
 (`tests/test_native_parity.py`).
 
@@ -98,8 +98,8 @@ it changes only speed, never the wire format or the public API.
 | Native speed, zero runtime deps | The hot path ships as an optional Cython accelerator (`sofab._speedups`); when it can't be built it falls back to pure Python. No runtime third-party deps either way. |
 | Runs everywhere | With no compiler or wheel, `pip` still installs a working pure-Python build (`py3-none-any`). Native and pure paths are byte-for-byte identical; falling back changes only speed. |
 | Sticky errors | `Encoder(sticky=True)` records the first failure and turns later writes into no-ops, so generated `serialize` code can check `enc.error` once. |
-| No silent truncation | An integer field accepts what Python accepts wherever an integer is required — anything with `__index__` (`int`, `bool`, `IntEnum`, NumPy integers). A `float` is refused with `SofaRangeError`, `3.0` included. |
-| No unreadable message | The format-wide ceilings (CORELIB_PLAN §6.2) bind the encoder too: a field id above `ID_MAX`, an array count above `ARRAY_MAX`, nesting past `MAX_DEPTH`, and a string/blob payload above `FIXLEN_MAX` (2 GiB − 1) are each refused with `SofaRangeError` **before** the field header is written. An oversized blob is refused on its length, before it is copied. |
+| No silent truncation | An integer field accepts what Python accepts wherever an integer is required — anything with `__index__` (`int`, `bool`, `IntEnum`, NumPy integers). A `float` is refused with `SofaArgumentError`, `3.0` included. |
+| No unreadable message | The format-wide ceilings (CORELIB_PLAN §6.2) bind the encoder too: a field id above `ID_MAX`, an array count above `ARRAY_MAX`, nesting past `MAX_DEPTH`, and a string/blob payload above `FIXLEN_MAX` (2 GiB − 1) are each refused with `SofaArgumentError` **before** the field header is written. An oversized blob is refused on its length, before it is copied. |
 | Floats narrow by IEEE rules | A Python `float` is a C double, so `write_float32` (scalar and array) narrows on the way out: round-to-nearest, and a magnitude past `FLT_MAX` overflows to `±inf` — the same bytes a native-`fp32` corelib writes, and identical in both engines. NaN payloads, signaling ones included, keep their exact bits. |
 | Reserve-offset | `Encoder.over_buffer(buf, offset=…)` leaves room at the front of the buffer for a lower-layer protocol header; a sink calling `buffer_set(buf, offset)` re-arms that room for **every** flushed packet. |
 | Sparse sequences | `write_sequence_begin_lazy` holds a sequence header back until the sequence receives content, so a sequence-typed field equal to its declared default is **omitted** rather than framed empty (MESSAGE_SPEC §2) — decided in one forward pass, without buffering the sub-message. `write_sequence_end` drops a contentless sequence; `write_sequence_end_keep` forces the frame out where presence itself carries meaning, such as a wrapper-array **element**, which is always framed even when all-default. |
@@ -244,7 +244,7 @@ Return `None` and nothing changes. Return `(dst, elem_min, elem_max)` and:
 * **`dst`** is a writable, contiguous buffer of at least `count` slots — an
   `array` of the right typecode, or a `memoryview` over one. The decoder fills it
   and does **not** call the typed hook; on the native engine no element is ever
-  boxed. A buffer too short is `SofaRangeError`: the decoder never grows one, and
+  boxed. A buffer too short is `SofaArgumentError`: the decoder never grows one, and
   the refusal comes at the header, before anything is written. `dst=None` states
   the width and keeps the list.
 
@@ -279,7 +279,7 @@ class Handler(Visitor):
         return None                         # anything else: a bytes as before
 ```
 
-A buffer too short is `SofaRangeError` — refused at the length word, before a
+A buffer too short is `SofaArgumentError` — refused at the length word, before a
 byte is written, and never grown. Strings are not offered: a string you read must
 be validated (§6.7.2), and this port validates by decoding, which builds the
 `str` a destination would exist to avoid.
@@ -301,7 +301,7 @@ dec = Decoder(visitor=handler, reassembly=bytearray(64 * 1024))
 ```
 
 The pieces are copied into your buffer as they arrive, and a construct that does
-not fit is `SofaRangeError` — **refused, never accommodated**. That is what lets
+not fit is `SofaArgumentError` — **refused, never accommodated**. That is what lets
 you bound a decode's memory by construction instead of by measurement: whatever
 the sender claims, this decoder holds your 64 KiB and nothing more.
 
@@ -514,7 +514,16 @@ dec = Decoder(binding=b, words=words,
 A field whose declared count/length exceeds its limit raises `SofaLimitError`: a
 *policy* rejection, distinct from malformed input, and a sibling of
 `SofaDecodeError` under `SofaError` rather than a subclass, so `except
-SofaDecodeError` does not catch it.
+SofaDecodeError` does not catch it. It governs what **this decoder** would
+allocate; the two sections below say which fields those are.
+
+The five exceptions carry CORELIB_PLAN §6.3's five codes: `SofaBufferError` is
+`BufferFull`, `SofaArgumentError` is `InvalidArgument`, `SofaDecodeError` is
+`InvalidMessage`, `SofaLimitError` is `LimitExceeded`, and `SofaIncompleteError`
+is the `INCOMPLETE` outcome, which §6.3 is explicit is not an error at all.
+§6.3 lets a port "adapt casing and idiom"; `SofaArgumentError` was once
+`SofaRangeError`, which read narrower than its code, and the old name is kept as
+an alias.
 
 **There is no unset state and no unlimited mode.** `None` is refused rather than
 read as "no limit". Each defaults to the format-wide ceiling — `ARRAY_MAX` for
@@ -549,9 +558,36 @@ b = Binding().string(1, at=0, maxlen=4194304)   # `name: { string, maxlen: 41943
 Declaring it does two things at once: the receiver-side cap stops applying to
 that field, and the decoder enforces the declared bound itself — an over-bound
 length is `INVALID` (`SofaDecodeError`, MESSAGE_SPEC §7.1), never
-`SofaLimitError`. A field with no declared bound — one the table names without a
-`maxlen`, or does not name at all — stays under the cap, including when it is
-only walked past.
+`SofaLimitError`.
+
+#### So is a field nobody materializes
+
+A cap prevents an allocation, so it applies where there is one to prevent. Three
+routes make none, and none of them is capped:
+
+* a field the binding does not name, or names with a contradicting wire tag
+  (§7.3) — the decoder walks past the payload without building anything from it;
+* a field the visitor declines from `on_field`;
+* a field the visitor *wants*, having handed back its own buffer from
+  `on_blob_begin` or `on_array_begin`. The hook is told the announced length or
+  count first, and a receiver that does not want that many bytes says so there —
+  the decision is the handler's, and a limit the decoder applied on its behalf
+  would only take it away.
+
+What is left is the default route, and it is the one §6.2.1 is about: with no
+destination back, the decoder itself has to build a `str`, a `bytes` or a list,
+and the only size it could build one from is the wire's. That allocation is
+refused on the count/length word, before a payload byte is read.
+
+The ceiling on a buffer you supply is that buffer's own size. Too short for what
+the hook was told, and the decoder refuses it — `SofaArgumentError`
+(`InvalidArgument`), never a silent truncation and never a resize. That is a fact
+about your storage rather than a verdict on the message, which is why it is not
+`SofaLimitError`.
+
+The same goes for `reassembly=`: a skipped payload spanning a chunk boundary is
+still joined in the buffer you supplied, so what a skip can cost is bounded by
+that buffer, and one that does not fit is refused the same way.
 
 A **schema** bound is the opposite kind of thing from a cap: it is part of the
 message definition, so breaching it is malformed input, not policy. The
@@ -636,7 +672,7 @@ literal zero is not reachable in this language whatever the API looks like.
   * `Encoder(writer)` installs a **1 KiB scratch buffer with a sink** that
     forwards each bufferful to `writer.write`. A 100 MB message costs 1 KiB of
     encoder memory, and the bytes leave *while* the message is written, not at
-    `flush()`. Nothing is retained, so `getvalue()` raises `SofaRangeError`.
+    `flush()`. Nothing is retained, so `getvalue()` raises `SofaArgumentError`.
   * `Encoder()` is the same scratch buffer with the sink appending into the
     *result* — the message `getvalue()` hands back, joined from the drained
     chunks (a message that fits in the scratch is never chunked at all, and a
@@ -653,7 +689,7 @@ literal zero is not reachable in this language whatever the API looks like.
   unit — a header varint, a `fixlen_word`, an element count, a scalar, one
   float — at any byte boundary. `Encoder.over_buffer(buf, offset, flush)` and every
   mid-stream `buffer_set(buf, offset)` that carries a flush sink require
-  `len(buf) - offset >= MIN_OUTPUT_BUFFER` and raise `SofaRangeError` right
+  `len(buf) - offset >= MIN_OUTPUT_BUFFER` and raise `SofaArgumentError` right
   there — where the buffer is handed over, never partway through a message.
   A buffer installed **without** a sink is subject to no minimum: no flush can
   occur, so the buffer simply holds the message or reports `SofaBufferError`, and

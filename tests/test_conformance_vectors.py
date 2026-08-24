@@ -31,8 +31,8 @@ from sofab import (
     Decoder,
     Encoder,
     FixlenSubtype,
+    SofaArgumentError,
     SofaDecodeError,
-    SofaRangeError,
     WireType,
 )
 
@@ -351,7 +351,7 @@ def test_vector_chunked_skip_ids(vec):
 #     for the payload-internal truncation cases (the wire frame is complete; the
 #     UTF-8 sequence inside it is not).
 #   * encode: writing the entry's raw `string_hex` bytes as a string field must
-#     be refused with InvalidArgument (SofaRangeError). Python `str` cannot hold
+#     be refused with InvalidArgument (SofaArgumentError). Python `str` cannot hold
 #     non-UTF-8 bytes, so we reconstruct the offending value with
 #     `surrogateescape` (each bad byte → a lone surrogate); the strict encoder
 #     (`str.encode("utf-8")`, no errors=) then rejects it — exactly the value a
@@ -396,7 +396,7 @@ def test_invalid_utf8_decode_is_invalid_chunked(vec):
 def test_invalid_utf8_encode_is_invalid_argument(vec):
     bad = bytes.fromhex(vec["string_hex"]).decode("utf-8", "surrogateescape")
     enc = Encoder()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_string(0, bad)
 
 

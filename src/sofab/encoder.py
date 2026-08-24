@@ -62,9 +62,9 @@ from .types import (
     SIGNED_MIN,
     UNSIGNED_MAX,
     FixlenSubtype,
+    SofaArgumentError,
     SofaBufferError,
     SofaError,
-    SofaRangeError,
     WireType,
 )
 
@@ -113,7 +113,7 @@ def _as_int(value: object, what: str) -> int:
     draws wherever an integer is required (``seq[i]``, ``range(x)``,
     ``bytes(n)``), and the same values both engines already agreed on.
 
-    Anything else is refused with :class:`SofaRangeError` (§6.3
+    Anything else is refused with :class:`SofaArgumentError` (§6.3
     ``InvalidArgument``) rather than truncated: writing ``3`` for a caller's
     ``3.7`` would be a value change the receiver has no way to detect.
     """
@@ -122,7 +122,7 @@ def _as_int(value: object, what: str) -> int:
         # is an integer is cheaper and more accurate than any isinstance test.
         return _index(value)  # type: ignore[arg-type]
     except TypeError:
-        raise SofaRangeError(
+        raise SofaArgumentError(
             f"{what} must be an integer, not {type(value).__name__}"
         ) from None
 
@@ -256,10 +256,10 @@ class Encoder:
         generated ``MAX_SIZE`` exact, down to a zero-byte remainder.
         """
         if not 0 <= offset <= len(buffer):
-            raise SofaRangeError("offset must be within the buffer")
+            raise SofaArgumentError("offset must be within the buffer")
         usable = len(buffer) - offset
         if usable < MIN_OUTPUT_BUFFER and self._has_sink():
-            raise SofaRangeError(
+            raise SofaArgumentError(
                 f"a buffer installed with a flush sink needs at least "
                 f"MIN_OUTPUT_BUFFER={MIN_OUTPUT_BUFFER} usable byte(s), got {usable}"
             )
@@ -419,10 +419,10 @@ class Encoder:
         been handed over, and with :meth:`over_buffer` they are in the caller's
         buffer — returning the undrained tail of either would be partial output
         dressed up as a whole message (CORELIB_PLAN §5.1), so both raise
-        :class:`SofaRangeError`.
+        :class:`SofaArgumentError`.
         """
         if not self._in_memory:
-            raise SofaRangeError("getvalue() is only valid for the in-memory model")
+            raise SofaArgumentError("getvalue() is only valid for the in-memory model")
         chunks = self._result
         if chunks is None:  # never drained: the message is the buffer prefix
             return bytes(self._fixed[0 : self._cursor])
@@ -484,7 +484,7 @@ class Encoder:
         if not isinstance(field_id, int):
             field_id = _as_int(field_id, "id")
         if field_id < 0 or field_id > ID_MAX:
-            raise SofaRangeError(f"id {field_id} out of range 0..{ID_MAX}")
+            raise SofaArgumentError(f"id {field_id} out of range 0..{ID_MAX}")
         if self._pending:
             self._commit_pending()
         self._emit_varint((field_id << 3) | wtype)
@@ -518,7 +518,7 @@ class Encoder:
         """Write an unsigned integer field as a base-128 varint.
 
         ``value`` must be an integer in ``0..UNSIGNED_MAX`` (64-bit), else
-        :class:`SofaRangeError`. "Integer" is Python's own rule — anything with
+        :class:`SofaArgumentError`. "Integer" is Python's own rule — anything with
         ``__index__`` (``int``, ``bool``, ``IntEnum``, NumPy integers). A
         ``float`` is refused rather than truncated, ``3.0`` included; write
         ``int(x)`` if that is what you mean.
@@ -529,7 +529,7 @@ class Encoder:
             if not isinstance(value, int):
                 value = _as_int(value, "unsigned value")
             if value < 0 or value > UNSIGNED_MAX:
-                raise SofaRangeError(f"unsigned value {value} out of range")
+                raise SofaArgumentError(f"unsigned value {value} out of range")
             self._header(field_id, _WT_UNSIGNED)
             self._emit_varint(value)
         except SofaError as exc:
@@ -539,7 +539,7 @@ class Encoder:
         """Write a signed integer field, ZigZag-encoded into a varint.
 
         ``value`` must be an integer in ``SIGNED_MIN..SIGNED_MAX`` (64-bit),
-        else :class:`SofaRangeError` — see :meth:`write_unsigned` for what counts
+        else :class:`SofaArgumentError` — see :meth:`write_unsigned` for what counts
         as an integer.
         """
         if not self._begin():
@@ -548,7 +548,7 @@ class Encoder:
             if not isinstance(value, int):
                 value = _as_int(value, "signed value")
             if value < SIGNED_MIN or value > SIGNED_MAX:
-                raise SofaRangeError(f"signed value {value} out of range")
+                raise SofaArgumentError(f"signed value {value} out of range")
             self._header(field_id, _WT_SIGNED)
             self._emit_varint(zigzag_encode(value))
         except SofaError as exc:
@@ -574,7 +574,7 @@ class Encoder:
         **always strict**: ``SOFAB_STRICT_UTF8`` is a no-op for it and is
         omitted entirely (documented as always-ON). A ``str`` that cannot be
         encoded as valid UTF-8 — a lone/unpaired surrogate such as ``'\ud800'``
-        — is refused with :class:`SofaRangeError` (the encode-side
+        — is refused with :class:`SofaArgumentError` (the encode-side
         ``InvalidArgument`` outcome, MESSAGE_SPEC §8 producer-side MUST NOT),
         never silently replaced. Embedded ``U+0000`` is valid UTF-8 and
         round-trips unchanged.
@@ -584,7 +584,7 @@ class Encoder:
         try:
             data = text.encode("utf-8")
         except UnicodeEncodeError as exc:
-            self._fail(SofaRangeError(f"string field is not valid UTF-8: {exc}"))
+            self._fail(SofaArgumentError(f"string field is not valid UTF-8: {exc}"))
             return
         self._write_fixlen(field_id, data, _ST_STRING)
 
@@ -593,7 +593,7 @@ class Encoder:
         """Write a raw byte blob as a fixlen field (BLOB subtype).
 
         A blob longer than :data:`sofab.FIXLEN_MAX` is refused with
-        :class:`SofaRangeError` (see :meth:`_write_fixlen`) — on the *declared*
+        :class:`SofaArgumentError` (see :meth:`_write_fixlen`) — on the *declared*
         length, before the copy, so an oversized payload is never duplicated
         just to be rejected.
         """
@@ -601,7 +601,7 @@ class Encoder:
             return
         n = len(data)
         if n > FIXLEN_MAX:
-            self._fail(SofaRangeError(
+            self._fail(SofaArgumentError(
                 f"fixlen payload of {n} bytes exceeds FIXLEN_MAX={FIXLEN_MAX}"))
             return
         self._write_fixlen(field_id, bytes(data), _ST_BLOB)
@@ -621,7 +621,7 @@ class Encoder:
             # precedes the field header, so a refused field leaves nothing
             # behind on the wire.
             if n > FIXLEN_MAX:
-                raise SofaRangeError(
+                raise SofaArgumentError(
                     f"fixlen payload of {n} bytes exceeds FIXLEN_MAX={FIXLEN_MAX}")
             self._header(field_id, _WT_FIXLEN)
             self._emit_varint((n << 3) | subtype)
@@ -636,7 +636,7 @@ class Encoder:
         """Write an array of unsigned integers, each as a varint.
 
         The element count must be ``0..ARRAY_MAX`` and every element an integer
-        in ``0..UNSIGNED_MAX``, else :class:`SofaRangeError` (see
+        in ``0..UNSIGNED_MAX``, else :class:`SofaArgumentError` (see
         :meth:`write_unsigned` for what counts as an integer). A zero-count array
         is a valid, fully-specified empty array on the wire
         (``[header][count=0]``).
@@ -659,7 +659,7 @@ class Encoder:
                     if not isinstance(v, int):
                         v = _as_int(v, "unsigned array value")
                     if v < 0 or v > UNSIGNED_MAX:
-                        raise SofaRangeError(f"unsigned array value {v} out of range")
+                        raise SofaArgumentError(f"unsigned array value {v} out of range")
                     if cursor > limit:
                         # Too close to the end for the inline path: _put splits
                         # the element across the drain and may land in a fresh
@@ -715,7 +715,7 @@ class Encoder:
         """Write an array of signed integers, each ZigZag-encoded into a varint.
 
         The element count must be ``0..ARRAY_MAX`` and every element an integer
-        in ``SIGNED_MIN..SIGNED_MAX``, else :class:`SofaRangeError` (see
+        in ``SIGNED_MIN..SIGNED_MAX``, else :class:`SofaArgumentError` (see
         :meth:`write_unsigned` for what counts as an integer). A zero-count array
         is a valid, fully-specified empty array (``[header][count=0]``).
         """
@@ -732,7 +732,7 @@ class Encoder:
                     if not isinstance(v, int):
                         v = _as_int(v, "signed array value")
                     if v < SIGNED_MIN or v > SIGNED_MAX:
-                        raise SofaRangeError(f"signed array value {v} out of range")
+                        raise SofaArgumentError(f"signed array value {v} out of range")
                     u = (v << 1) ^ (v >> 63)
                     if cursor > limit:
                         self._cursor = cursor
@@ -770,7 +770,7 @@ class Encoder:
     def write_float32_array(self, field_id: SupportsIndex, values: Iterable[float]) -> None:
         """Write an array of 32-bit floats as a packed little-endian fixlen array.
 
-        The element count must be ``0..ARRAY_MAX``, else :class:`SofaRangeError`.
+        The element count must be ``0..ARRAY_MAX``, else :class:`SofaArgumentError`.
         A zero-count array emits ``[header][count=0][fixlen_word]`` — the
         ``fixlen_word`` is always present (so empty fp32/fp64 arrays stay
         distinguishable) but there is no payload (§4.8).
@@ -780,7 +780,7 @@ class Encoder:
     def write_float64_array(self, field_id: SupportsIndex, values: Iterable[float]) -> None:
         """Write an array of 64-bit floats as a packed little-endian fixlen array.
 
-        The element count must be ``0..ARRAY_MAX``, else :class:`SofaRangeError`.
+        The element count must be ``0..ARRAY_MAX``, else :class:`SofaArgumentError`.
         A zero-count array emits ``[header][count=0][fixlen_word]`` — the
         ``fixlen_word`` is always present (so empty fp32/fp64 arrays stay
         distinguishable) but there is no payload (§4.8).
@@ -813,7 +813,7 @@ class Encoder:
         # Defensive: count is always len() of a materialized list, so it is
         # non-negative and can't exceed ARRAY_MAX without exhausting memory first.
         if count < 0 or count > ARRAY_MAX:  # pragma: no cover
-            raise SofaRangeError(f"array count {count} out of range 0..{ARRAY_MAX}")
+            raise SofaArgumentError(f"array count {count} out of range 0..{ARRAY_MAX}")
         self._header(field_id, wtype)
         self._emit_varint(count)
 
@@ -838,19 +838,19 @@ class Encoder:
 
         Must be balanced by a later :meth:`write_sequence_end` /
         :meth:`write_sequence_end_keep`. Refuses to open a sequence nested deeper
-        than :data:`sofab.MAX_DEPTH` (255), raising :class:`SofaRangeError`.
+        than :data:`sofab.MAX_DEPTH` (255), raising :class:`SofaArgumentError`.
         """
         if not self._begin():
             return
         try:
             if self._depth >= MAX_DEPTH:
-                raise SofaRangeError(f"nesting exceeds MAX_DEPTH={MAX_DEPTH}")
+                raise SofaArgumentError(f"nesting exceeds MAX_DEPTH={MAX_DEPTH}")
             # This is the one write that does not go through _header — the id is
             # held back rather than emitted — so it applies the same rule itself.
             if not isinstance(field_id, int):
                 field_id = _as_int(field_id, "id")
             if field_id < 0 or field_id > ID_MAX:
-                raise SofaRangeError(f"id {field_id} out of range 0..{ID_MAX}")
+                raise SofaArgumentError(f"id {field_id} out of range 0..{ID_MAX}")
             # No hold-back window to exhaust: the pending run is a Python list
             # that grows on demand, so it reaches the full MAX_DEPTH (CORELIB_PLAN
             # §6: only a heap-free profile may bound the run and frame eagerly
@@ -876,13 +876,13 @@ class Encoder:
         is the empty collection (MESSAGE_SPEC §2). Where the frame must be
         visible, close with :meth:`write_sequence_end_keep` instead.
 
-        Raises :class:`SofaRangeError` if no sequence is currently open.
+        Raises :class:`SofaArgumentError` if no sequence is currently open.
         """
         if not self._begin():
             return
         try:
             if self._depth <= 0:
-                raise SofaRangeError("sequence_end without matching begin")
+                raise SofaArgumentError("sequence_end without matching begin")
             if self._pending:
                 # The innermost open sequence is the last held-back one (the
                 # pending run is a suffix), so dropping it is a plain pop: no
@@ -918,13 +918,13 @@ class Encoder:
         do costs one non-canonical empty frame that every decoder normalizes away,
         while the reverse silently changes an array's length.
 
-        Raises :class:`SofaRangeError` if no sequence is currently open.
+        Raises :class:`SofaArgumentError` if no sequence is currently open.
         """
         if not self._begin():
             return
         try:
             if self._depth <= 0:
-                raise SofaRangeError("sequence_end without matching begin")
+                raise SofaArgumentError("sequence_end without matching begin")
             if self._pending:
                 self._commit_pending()
             self._emit_varint(_WT_SEQUENCE_END)

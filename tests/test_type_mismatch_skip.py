@@ -9,7 +9,7 @@ following ``next()`` (or an explicit ``skip()``) discards it.
 
 The other half of what the removed ``SofaStateError`` used to cover is a genuine
 caller mistake — a read with **no** pending value at all — for which §6.3 has one
-code, ``InvalidArgument`` → :class:`SofaRangeError`.
+code, ``InvalidArgument`` → :class:`SofaArgumentError`.
 
 Both engines carry independent copies of these checks, so every test runs on the
 pure-Python classes *and* on the compiled accelerator when it is present: a split
@@ -25,7 +25,7 @@ import sofab
 from sofab import Binding
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
-from sofab.types import SofaError, SofaLimitError, SofaRangeError
+from sofab.types import SofaArgumentError, SofaError, SofaLimitError
 
 _ENGINES = [(PyEncoder, PyDecoder)]
 try:  # the native accelerator, when compiled in, must behave identically
@@ -53,9 +53,9 @@ def _feed(Decoder, build, binding, **kw):
 def test_no_invalid_usage_class_exists():
     """§6.3 fixes the taxonomy at five codes and has none for "invalid usage".
     The old class is gone and so is the alias that briefly stood in for it, so a
-    caller mistake is a :class:`SofaRangeError` (§6.3 ``InvalidArgument``) and
+    caller mistake is a :class:`SofaArgumentError` (§6.3 ``InvalidArgument``) and
     nothing else names the removed category."""
-    assert issubclass(SofaRangeError, SofaError)
+    assert issubclass(SofaArgumentError, SofaError)
     assert not hasattr(sofab, "SofaStateError")
 
 
@@ -196,9 +196,9 @@ def test_a_contradicting_binding_inside_a_sequence(Encoder, Decoder):
 
 @engine
 def test_sequence_end_without_begin_is_invalid_argument(Encoder, Decoder):
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_sequence_end()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_sequence_end_keep()
 
 
@@ -206,7 +206,7 @@ def test_sequence_end_without_begin_is_invalid_argument(Encoder, Decoder):
 def test_getvalue_on_a_caller_owned_buffer_is_invalid_argument(Encoder, Decoder):
     enc = Encoder.over_buffer(bytearray(16), offset=0)
     enc.write_unsigned(1, 7)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.getvalue()
 
 
@@ -214,7 +214,7 @@ def test_getvalue_on_a_caller_owned_buffer_is_invalid_argument(Encoder, Decoder)
 def test_sticky_mode_latches_the_invalid_argument(Encoder, Decoder):
     enc = Encoder(sticky=True)
     enc.write_sequence_end()  # no matching begin → latched, not raised
-    assert isinstance(enc.error, SofaRangeError)
+    assert isinstance(enc.error, SofaArgumentError)
 
 
 def test_array_shrank_mid_encode_is_invalid_argument():
@@ -231,7 +231,7 @@ def test_array_shrank_mid_encode_is_invalid_argument():
             return 1
 
     values.extend([Evil(), 2, 3])
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         sp.Encoder().write_unsigned_array(1, values)
 
 
@@ -256,23 +256,37 @@ def test_a_refused_read_does_not_disturb_a_chunk_fed_decode(Encoder, Decoder):
 
 
 @engine
-def test_a_capped_field_reports_the_cap_rather_than_the_mismatch(Encoder, Decoder):
-    """§6.2.1 wins over §7.3: the skip §7.3 asks for still has to walk the
-    payload the cap exists to refuse, and a cap rejection is terminal for the
-    message rather than an answer about one field. Declaring the bound in the
-    binding is what takes the cap off — and then §7.3 applies again."""
+def test_a_capped_field_is_still_only_a_mismatch(Encoder, Decoder):
+    """§7.3 settles it first, and a configured cap does not change that (#128).
+
+    A payload the binding contradicts "was never this field's value" (§4.8), so
+    it is skipped exactly as an unknown id is — and a skip materializes nothing,
+    which is what §6.2.1's limit exists to prevent. The cap never gets a field to
+    speak about, and the decode stays COMPLETE with the destination untouched.
+
+    Naming the field's actual kind is what makes the value arrive; with no
+    declared bound the cap governs it again, and now there *is* an allocation to
+    refuse.
+    """
     enc = PyEncoder()
     enc.write_string(1, "x" * 64)
     wire = enc.getvalue()
 
-    # Bound as an array — the wrong type *and* over the configured cap.
+    # Bound as an array — the wrong type, and past the configured cap besides.
     capped = Binding().unsigned_array(1, at=_AT, cap=8, count_at=_COUNT_AT)
-    with pytest.raises(SofaLimitError):
-        bound(Decoder, wire, capped, max_dyn_string_len=8)
+    status, _dec, slots = bound(Decoder, wire, capped, max_dyn_string_len=8)
+    assert status is Status.COMPLETE
+    assert slots.u[_COUNT_AT] == 0, "a skipped field did not arrive"
+    assert slots.u[_AT] == 0, "and nothing was written for it"
 
-    # Lifting the cap means declaring the field's own bound — which is only
-    # possible by naming its actual kind, so the two can never be combined:
-    # §6.2.1 is settled before §7.3 is ever asked.
+    # Named as the string it is, with no declared bound: the decoder is the one
+    # that would build the ``str``, sized by the wire, so the cap speaks.
+    wanted = Binding().string(1, at=_OBJ, count_at=_COUNT_AT)
+    with pytest.raises(SofaLimitError):
+        bound(Decoder, wire, wanted, max_dyn_string_len=8)
+
+    # Declaring the field's own bound takes the cap off (§6.2.1): the schema
+    # governs, and 64 is within it.
     declared = Binding().string(1, at=_OBJ, maxlen=64, count_at=_COUNT_AT)
     status, _dec, slots = bound(Decoder, wire, declared, max_dyn_string_len=8)
     assert status is Status.COMPLETE

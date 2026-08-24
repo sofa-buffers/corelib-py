@@ -15,7 +15,7 @@ Python ``str`` is a Unicode string type, so it is **always strict** — the
 * **decode** — an invalid-UTF-8 ``string`` payload **that is read** is the
   INVALID outcome (``SofaDecodeError``). Skipped fields are never validated.
 * **encode** — a ``str`` that cannot be encoded as valid UTF-8 (a lone/unpaired
-  surrogate) is refused with InvalidArgument (``SofaRangeError``); never
+  surrogate) is refused with InvalidArgument (``SofaArgumentError``); never
   silently replaced with U+FFFD or dropped.
 
 Embedded U+0000 is valid UTF-8 and round-trips unchanged in both directions.
@@ -30,8 +30,8 @@ from sofab import (
     Decoder,
     Encoder,
     FixlenSubtype,
+    SofaArgumentError,
     SofaDecodeError,
-    SofaRangeError,
     WireType,
 )
 
@@ -114,7 +114,7 @@ def test_skipped_invalid_string_is_not_validated(payload):
 )
 def test_encode_lone_surrogate_is_invalid_argument(text):
     enc = Encoder()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_string(0, text)
 
 
@@ -123,7 +123,7 @@ def test_encode_does_not_replace_or_drop():
     # would turn the surrogate into U+FFFD; "surrogatepass" would emit raw
     # ED A0 80). Prove neither happened: no bytes were produced at all.
     enc = Encoder()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_string(3, "ok\ud800")
     # Nothing was committed for the rejected field.
     assert enc.getvalue() == b""
@@ -142,7 +142,7 @@ def test_encode_refusal_is_latched_in_sticky_mode():
     enc.write_string(2, "x\ud800")  # refused — recorded, not raised
     enc.write_unsigned(3, 6)  # a no-op behind the latched error
 
-    assert isinstance(enc.error, SofaRangeError)
+    assert isinstance(enc.error, SofaArgumentError)
     reference = Encoder()
     reference.write_unsigned(1, 5)
     assert enc.getvalue() == reference.getvalue()  # only the pre-failure field
@@ -155,7 +155,7 @@ def test_encode_surrogate_reconstructed_from_wire_bytes():
     for payload in _INVALID_PAYLOADS.values():
         text = payload.decode("utf-8", "surrogateescape")
         enc = Encoder()
-        with pytest.raises(SofaRangeError):
+        with pytest.raises(SofaArgumentError):
             enc.write_string(0, text)
 
 

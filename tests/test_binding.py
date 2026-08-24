@@ -17,7 +17,7 @@ import struct
 import pytest
 from vectors import DECODER_ENGINES, ENGINE_PAIRS
 
-from sofab import Binding, SofaRangeError, Status
+from sofab import Binding, SofaArgumentError, Status
 
 
 def storage(b: Binding):
@@ -169,15 +169,15 @@ def test_a_declared_element_width_is_checked_at_the_element(enc_cls, dec_cls):
 @pytest.mark.parametrize("dec_cls", DECODER_ENGINES)
 def test_storage_must_be_big_enough_and_writable(dec_cls):
     b = Binding().unsigned_array(1, at=0, cap=4).string(2, at=0)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         dec_cls(binding=b, words=bytearray(8), objects=[None])
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         dec_cls(binding=b, words=bytearray(b.tree_words_required * 8), objects=[])
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         dec_cls(binding=b, words=bytes(b.tree_words_required * 8), objects=[None])
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         dec_cls(binding=b, words=bytearray(b.tree_words_required * 8 + 3), objects=[None])
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         dec_cls(binding=b, objects=[None])
 
 
@@ -333,24 +333,24 @@ def test_a_binding_freezes_when_a_decoder_takes_it():
     child = Binding().unsigned(1, at=1)
     b = Binding().sequence(2, child)
     assert b.tree_words_required == 2
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         b.unsigned(3, at=0)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         child.unsigned(4, at=9), "freezing the root must close the whole tree"
 
 
 def test_binding_rejects_nonsense_at_bind_time():
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Binding().unsigned(-1, at=0)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Binding().unsigned(1 << 40, at=0)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Binding().unsigned(1, at=-1)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Binding().unsigned(1, at=0).signed(1, at=1)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Binding().sequence(1, "not a binding")  # type: ignore[arg-type]
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Binding().unsigned("one", at=0)  # type: ignore[arg-type]
 
 
@@ -441,21 +441,53 @@ def test_a_declared_maxlen_lifts_the_receiver_cap(enc_cls, dec_cls):
 
 @pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
 def test_a_limit_rejection_stays_rejected(enc_cls, dec_cls):
-    """§6.3: terminal. The decoder must not shrug it off and carry on."""
+    """§6.3: terminal. The decoder must not shrug it off and carry on.
+
+    Field 1 is bound and declares no ``maxlen``, so the configured cap governs
+    it and the ``str`` the decoder would build -- sized by the wire -- is the
+    allocation §6.2.1 refuses.
+    """
     from sofab import SofaLimitError
 
     enc = enc_cls()
-    enc.write_unsigned_array(1, [1, 2, 3, 4, 5])
+    enc.write_string(1, "x" * 64)
     enc.write_unsigned(2, 7)
     enc.flush()
-    b = Binding().unsigned(2, at=0, count_at=1)
+    b = Binding().string(1, at=0).unsigned(2, at=0, count_at=1)
     words, objects, u, _q, _f = storage(b)
-    dec = dec_cls(binding=b, words=words, max_dyn_array_count=2)
+    dec = dec_cls(binding=b, words=words, objects=objects, max_dyn_string_len=2)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
     with pytest.raises(SofaLimitError):
         dec.feed(b"")
     assert u[1] == 0, "nothing past the rejection may be decoded"
+
+
+@pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
+def test_a_field_the_table_does_not_name_is_skipped_uncapped(enc_cls, dec_cls):
+    """#128: a cap does not apply to a field the handler never materializes.
+
+    Field 1 is not in the table, so it is skipped -- and §6.2.1 puts the limit
+    "before the allocation it is meant to prevent", of which a skip makes none.
+    The message is well formed, so it decodes; the port that rejected it here
+    was the only one in the family that did.
+    """
+    enc = enc_cls()
+    enc.write_unsigned_array(1, [1, 2, 3, 4, 5])
+    enc.write_bytes(3, b"z" * 64)
+    enc.write_unsigned(2, 7)
+    enc.flush()
+    b = Binding().unsigned(2, at=0, count_at=1)
+    words, objects, u, _q, _f = storage(b)
+    dec = dec_cls(
+        binding=b,
+        words=words,
+        max_dyn_array_count=2,
+        max_dyn_blob_len=2,
+    )
+    assert dec.feed(enc.getvalue()) is Status.COMPLETE
+    assert dec.error is None
+    assert u[0] == 7 and u[1] == 1
 
 
 # --- the table's own surface -------------------------------------------------
@@ -488,25 +520,25 @@ def test_a_frozen_child_cannot_be_bound_into_a_new_tree():
     back door."""
     child = Binding().unsigned(1, at=0)
     Binding().sequence(2, child).freeze()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Binding().sequence(3, child)
 
 
 def test_binding_rejects_out_of_range_sizes():
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Binding().unsigned_array(1, at=0, cap=1 << 40)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Binding().string(1, at=0, maxlen=1 << 40)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Binding().unsigned(1, at=0, count_at=-1)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Binding().unsigned_array(1, at=0, cap=4, elem_max=1 << 70)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Binding().signed_array(1, at=0, cap=4, elem_min=-(1 << 70))
 
 
 @pytest.mark.parametrize("dec_cls", DECODER_ENGINES)
 def test_a_binding_with_object_fields_needs_an_objects_list(dec_cls):
     b = Binding().string(1, at=0)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         dec_cls(binding=b, words=bytearray(b.tree_words_required * 8 or 8))

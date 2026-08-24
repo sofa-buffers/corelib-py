@@ -167,16 +167,24 @@ def test_an_unbound_array_is_still_rejected_on_every_array_kind(engine, write):
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_an_undeclared_field_is_rejected_even_when_declined(engine):
-    """Declining a field is a consume too: the walk still passes over the
-    payload the cap exists to refuse."""
+def test_a_declined_field_is_not_capped(engine):
+    """#128: declining a field is not a consume. The walk passes over the
+    payload without materializing it, so there is no allocation for the cap to
+    prevent (§6.2.1) and the well-formed message decodes -- as it does on every
+    other port in the family.
+
+    The cap has not gone anywhere: the same field, *not* declined, is still
+    refused (see the test above)."""
     enc = Encoder()
     enc.write_string(1, BIG)
-    with pytest.raises(SofaLimitError):
-        walk(
-            engine, enc.getvalue(), max_dyn_string_len=1024,
-            recorder=Recorder(decline=lambda f: True),
-        )
+    enc.write_unsigned(2, 7)
+    status, rec, dec = walk(
+        engine, enc.getvalue(), max_dyn_string_len=1024,
+        recorder=Recorder(decline=lambda f: f.id == 1),
+    )
+    assert status is Status.COMPLETE
+    assert dec.error is None
+    assert rec.events == [("u", 2, 7)]
 
 
 # --- the verdict is reached before any payload ------------------------------
@@ -270,11 +278,24 @@ def test_a_declared_field_can_still_be_invalid_utf8(engine):
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_a_capped_field_reports_the_cap_rather_than_the_mismatch(engine):
-    """§6.2.1 outranks §7.3: the skip §7.3 asks for still walks the payload the
-    cap exists to refuse, so the cap is what the message is rejected with."""
+def test_a_mismatched_field_is_skipped_and_never_reaches_the_cap(engine):
+    """§7.3 settles it before §6.2.1 is ever asked (#128).
+
+    A payload whose wire tag contradicts the binding "was never this field's
+    value", so it cannot be measured against a bound meant for one -- and the
+    skip §7.3 asks for materializes nothing for the cap to prevent. The decode
+    stays COMPLETE, the destination untouched, and ``count_at`` reports the
+    field as absent."""
     enc = Encoder()
     enc.write_string(1, BIG)
-    b = Binding().unsigned_array(1, at=0, cap=8, count_at=200)  # wrong type
-    with pytest.raises(SofaLimitError):
-        bound(engine, enc.getvalue(), b, max_dyn_string_len=1024)
+    enc.write_unsigned(2, 7)
+    b = (
+        Binding()
+        .unsigned_array(1, at=0, cap=8, count_at=200)  # wrong type
+        .unsigned(2, at=201)
+    )
+    status, dec, slots = bound(engine, enc.getvalue(), b, max_dyn_string_len=1024)
+    assert status is Status.COMPLETE
+    assert dec.error is None
+    assert slots.u[200] == 0 and slots.u[0] == 0
+    assert slots.u[201] == 7, "the field behind the skip is still delivered"

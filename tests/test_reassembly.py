@@ -22,7 +22,7 @@ import pytest
 from vectors import DECODER_ENGINES as ENGINES
 from vectors import Recorder, Status
 
-from sofab import Encoder, SofaRangeError
+from sofab import Encoder, SofaArgumentError
 
 BIG = "a" * 300
 
@@ -79,7 +79,7 @@ def test_the_same_message_decodes_the_same_without_one(engine):
 def test_a_buffer_too_small_is_refused_not_grown(engine):
     """The point of the parameter: a construct larger than the caller allowed
     for is an error, not a bigger buffer."""
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         _feed(engine, _msg(), 8, reassembly=bytearray(32))
 
 
@@ -132,7 +132,7 @@ def test_only_a_bytearray_is_accepted(engine):
     """Both engines index it directly, so there is one accepted type rather than
     two buffer protocols with one of them slower (§5.3)."""
     for bad in (b"\x00" * 64, memoryview(bytearray(64)), 64):
-        with pytest.raises(SofaRangeError):
+        with pytest.raises(SofaArgumentError):
             engine(visitor=Recorder(), reassembly=bad)
 
 
@@ -162,5 +162,5 @@ def test_a_carry_larger_than_the_buffer_is_refused_on_the_way_out(engine):
     wire = _msg()
     rec = Recorder()
     dec = engine(visitor=rec, reassembly=bytearray(8))
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         dec.feed(wire[:60])  # stops deep inside the 300-byte string

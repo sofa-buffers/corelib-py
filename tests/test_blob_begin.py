@@ -18,7 +18,7 @@ import pytest
 from vectors import DECODER_ENGINES as ENGINES
 from vectors import Recorder, Status, walk
 
-from sofab import Encoder, SofaRangeError
+from sofab import Encoder, SofaArgumentError
 
 PAYLOAD = bytes(range(256)) * 4
 
@@ -95,20 +95,20 @@ def test_an_empty_blob_fills_nothing(engine):
 @pytest.mark.parametrize("engine", ENGINES)
 def test_a_short_destination_is_refused_not_grown(engine):
     dst = bytearray(16)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         walk(engine, _msg(), recorder=Sink(dst))
     assert dst == bytearray(16)  # refused before a byte was written
 
 
 @pytest.mark.parametrize("engine", ENGINES)
 def test_a_destination_that_is_not_a_buffer_is_refused(engine):
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         walk(engine, _msg(), recorder=Sink([0] * 2048))
 
 
 @pytest.mark.parametrize("engine", ENGINES)
 def test_a_read_only_destination_is_refused(engine):
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         walk(engine, _msg(), recorder=Sink(b"\x00" * 2048))
 
 
@@ -116,7 +116,7 @@ def test_a_read_only_destination_is_refused(engine):
 def test_a_wide_item_destination_is_refused(engine):
     from array import array
 
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         walk(engine, _msg(), recorder=Sink(array("Q", [0] * 256)))
 
 

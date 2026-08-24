@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 from vectors import DECODER_ENGINES, ENGINE_PAIRS, VECTORS
 
-from sofab import Binding, SofaLimitError, SofaRangeError, Status, Visitor
+from sofab import Binding, SofaArgumentError, SofaLimitError, Status, Visitor
 
 
 class Collect(Visitor):
@@ -251,7 +251,7 @@ def test_feed_accepts_any_buffer(dec_cls):
 
 @pytest.mark.parametrize("dec_cls", DECODER_ENGINES)
 def test_a_decoder_needs_a_source_or_a_handler(dec_cls):
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         dec_cls()
 
 
@@ -262,7 +262,7 @@ def test_feed_is_not_re_entrant(dec_cls):
             dec.feed(b"\x08\x01")
 
     dec = dec_cls(visitor=Reentrant())
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         dec.feed(b"\x08\x01")
 
 

@@ -27,7 +27,7 @@ import pytest
 from vectors import DECODER_ENGINES as ENGINES
 from vectors import Recorder, Status, walk
 
-from sofab import Encoder, SofaDecodeError, SofaRangeError, WireType
+from sofab import Encoder, SofaArgumentError, SofaDecodeError, WireType
 
 U16_MAX = 0xFFFF
 
@@ -228,7 +228,7 @@ def test_a_stated_width_still_binds_a_destination(engine):
 def test_a_short_destination_is_refused_not_grown(engine):
     dst = array("Q", [0] * 2)
     spec = Spec((dst, None, None))
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         walk(engine, _msg([1, 2, 3]), recorder=spec)
 
 
@@ -236,7 +236,7 @@ def test_a_short_destination_is_refused_not_grown(engine):
 def test_the_refusal_comes_before_a_single_element_is_written(engine):
     dst = array("Q", [0] * 2)
     spec = Spec((dst, None, None))
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         walk(engine, _msg([1, 2, 3]), recorder=spec)
     assert list(dst) == [0, 0]
 
@@ -244,14 +244,14 @@ def test_the_refusal_comes_before_a_single_element_is_written(engine):
 @pytest.mark.parametrize("engine", ENGINES)
 def test_a_destination_that_is_not_a_buffer_is_refused(engine):
     spec = Spec(([0, 0, 0], None, None))  # a list has no buffer to write into
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         walk(engine, _msg([1, 2, 3]), recorder=spec)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
 def test_a_read_only_destination_is_refused(engine):
     spec = Spec((b"\x00" * 32, None, None))
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         walk(engine, _msg([1, 2, 3]), recorder=spec)
 
 
@@ -265,7 +265,7 @@ def test_an_unsupported_item_size_is_refused(engine):
         _fields_ = [("a", ctypes.c_uint8 * 3)]
 
     spec = Spec((memoryview((Three * 4)()), None, None))
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         walk(engine, _msg([1, 2, 3]), recorder=spec)
 
 
@@ -274,7 +274,7 @@ def test_a_narrow_destination_with_no_stated_width_is_refused(engine):
     """Nothing says the elements fit, so filling it could truncate silently."""
     dst = array("H", [0] * 4)
     spec = Spec((dst, None, None))
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         walk(engine, _msg([1, 2]), recorder=spec)
 
 
@@ -282,7 +282,7 @@ def test_a_narrow_destination_with_no_stated_width_is_refused(engine):
 def test_a_narrow_destination_with_too_wide_a_width_is_refused(engine):
     dst = array("H", [0] * 4)
     spec = Spec((dst, None, 1 << 20))
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         walk(engine, _msg([1, 2]), recorder=spec)
 
 
@@ -290,7 +290,7 @@ def test_a_narrow_destination_with_too_wide_a_width_is_refused(engine):
 def test_a_narrow_signed_destination_needs_both_halves_to_fit(engine):
     dst = array("h", [0] * 4)
     spec = Spec((dst, -(1 << 20), 1 << 20))
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         walk(engine, _msg([1, 2], signed=True), recorder=spec)
 
 
