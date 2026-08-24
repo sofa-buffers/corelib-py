@@ -354,12 +354,20 @@ is judged **before** the list grows, so an index near 2³¹ costs a comparison a
 not an allocation.
 
 These are the **static helper layer** of CORELIB_PLAN §6.6.1 — beside the codec,
-not part of it. They allocate; the codec does not.
+not part of it. They allocate on the generated layer's behalf; the codec does not
+allocate a container of its own. What the codec does allocate is listed under
+[Memory handling](#memory-handling).
 
 ### Decode into your own storage (`Binding`)
 
 A `Visitor` costs one Python call per field. A **`Binding`** costs none: declare
 once where every field id belongs, and the decoder writes there itself.
+
+Both drive the same `feed`, the same header walk and the same verdicts — a
+`Binding` is not a second decoder but a second way to say where a field goes.
+CORELIB_PLAN §5.3.1 allows one decode surface and this port ships two; the second
+is kept for what it costs, since a bound decode crosses into Python zero times
+per field.
 
 ```python
 from sofab import Binding, Decoder
@@ -559,10 +567,22 @@ followed it or on which engine read it (MESSAGE_SPEC §7.1). Omit them for
 ## Memory handling
 
 The key point for Python: **decoding allocates results for you unless you ask it
-not to.** The pull and visitor paths hand back fresh `int`/`str`/`bytes`/`list`
-objects; a `Binding` writes into storage you supplied and sized instead, and
-allocates only for `string` and `blob`, which have no fixed-width machine form.
-Encoding never allocates an output buffer at all (§5.1).
+not to.** The visitor's typed hooks hand back fresh `int`/`str`/`bytes`/`list`
+objects; a `Binding`, `on_array_begin` or `on_blob_begin` writes into storage you
+supplied and sized instead. Encoding never allocates an output buffer at all
+(§5.1).
+
+**Where this port stands against CORELIB_PLAN §6.6, stated plainly.** The codec
+allocates nothing a wire number sizes on three paths — encode, a `Binding`
+decode, and a visitor decode that takes the destination routes — and
+`tests/test_allocation.py` measures exactly that: a payload a thousand times
+larger costs the same. It does not hold on the fourth: `on_string`, `on_bytes`,
+`on_unsigned_array` and the float-array hooks each hand back a whole value, and
+the only size available to build one from is the wire's, which is what §6.6.3
+says such a callback obliges. Those hooks are kept because they are the
+convenient way to read a message, and the routes that avoid them are documented
+above. Beneath both, CPython allocates for every object a handler is given, so a
+literal zero is not reachable in this language whatever the API looks like.
 
 * **Decode: the library owns the input buffer.** `Decoder` keeps a single
   internal buffer, extended by `feed` and never handed out, so there is **no
@@ -725,8 +745,8 @@ workloads, on the same data, measured the same way and printed in the same
 grammar as every other port, so the numbers are comparable across languages.
 `bench/compare_protobuf.py` is extra and language-native: it compares the native
 accelerator, the pure-Python fallback, and `protobuf`'s Python runtime (upb C
-backend), materializing fully on both sides so it is apples-to-apples with the
-SofaBuffers pull API:
+backend), materializing fully on both sides so it is apples-to-apples with a
+SofaBuffers visitor that takes its values:
 
 ```bash
 python bench/perfbench.py bench           # throughput on this machine, MB/s (MB = 1e6)
@@ -769,10 +789,10 @@ less work. Every other row is `Ir/op`'s to tell.
 The native accelerator is worth roughly an order of magnitude over the pure
 engine on the message-shaped rows and two on the array-heavy ones, and it beats
 protobuf everywhere except the smallest decode, where the two are level. That
-last workload is where the streaming **pull** API costs the most: it crosses the
+last workload is where the streaming decode costs the most: it crosses the
 Python↔C boundary once per field when a visitor handles it — and not at all when
-a `Binding` does — whereas protobuf parses the whole message in one C call. `bench/compare_protobuf.py` runs that
-comparison.
+a `Binding` does — whereas protobuf parses the whole message in one C call.
+`bench/compare_protobuf.py` runs that comparison.
 
 Measured figures are not reproduced here — they belong to the cross-language
 benchmark arena, which runs every port on one host under one methodology. This
