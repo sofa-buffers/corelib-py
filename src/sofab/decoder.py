@@ -201,6 +201,7 @@ class Decoder:
         "_objects",
         "_pending",
         "_pos",
+        "_limit",
         "_rbuf",
         "_rend",
         "_rstart",
@@ -298,6 +299,13 @@ class Decoder:
         # construct that spans a chunk boundary. Optional: without one the
         # decoder joins the pieces in a bytearray of its own, which is
         # convenient and is NOT what §6.6 asks for -- see the parameter's note.
+        # A receiver-limit rejection, latched. §6.3 calls LimitExceeded "a
+        # terminal, receiver-local policy rejection", so once one is reached the
+        # decode is over: every later feed re-raises it and consumes nothing.
+        # It is not INVALID -- the bytes are well formed and decode under a
+        # looser limit -- so it rides the error channel rather than the status,
+        # which §6.3 names as one of the two permitted ways to surface it.
+        self._limit: SofaLimitError | None = None
         self._rbuf: Any = None
         self._rstart = 0
         self._rend = 0
@@ -1029,6 +1037,8 @@ class Decoder:
         """
         if self._running:
             raise SofaRangeError("feed() is not re-entrant")
+        if self._limit is not None:
+            raise self._limit
         if self._status is Status.INVALID:
             return Status.INVALID
         # Two shapes, because they want opposite things.
@@ -1071,6 +1081,12 @@ class Decoder:
         except SofaIncompleteError:
             self._status = Status.INCOMPLETE
             return Status.INCOMPLETE
+        except SofaLimitError as exc:
+            # Raised by this decoder's own check, or by a handler deciding on an
+            # index the codec surfaced (§6.2.1). Either way the decode is over.
+            self._limit = exc
+            self._error = exc
+            raise
         except SofaDecodeError as exc:
             self._error = exc
             self._status = Status.INVALID
@@ -1170,6 +1186,7 @@ class Decoder:
         self._keep = 0
         self._status = Status.COMPLETE
         self._error = None
+        self._limit = None
         self._resume_kind = _R_NONE
         self._resume_entry = None
         self._bmap = self._binding._by_id if self._binding is not None else None
