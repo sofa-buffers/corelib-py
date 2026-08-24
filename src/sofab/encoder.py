@@ -130,6 +130,8 @@ def _as_int(value: object, what: str) -> int:
 class Encoder:
     """Encodes SofaBuffers fields to a byte stream."""
 
+    _flush_view: memoryview | None
+
     def __init__(self, writer: Writer | None = None, *, sticky: bool = False) -> None:
         """Create an encoder over a scratch buffer the library installs for you.
 
@@ -174,6 +176,7 @@ class Encoder:
         # :meth:`buffer_set` would (the checks it makes are constants here: a
         # zero offset into a buffer of _SCRATCH_SIZE >= MIN_OUTPUT_BUFFER).
         scratch = bytearray(_SCRATCH_SIZE)
+        self._flush_view = None
         self._fixed = memoryview(scratch)
         self._fixed_ba = scratch
         self._cap = _SCRATCH_SIZE
@@ -213,6 +216,7 @@ class Encoder:
         is no minimum. See :meth:`buffer_set`, which enforces both.
         """
         self = cls.__new__(cls)
+        self._flush_view = None
         self._writer = None
         self._in_memory = False
         self._result = None
@@ -259,6 +263,7 @@ class Encoder:
                 f"a buffer installed with a flush sink needs at least "
                 f"MIN_OUTPUT_BUFFER={MIN_OUTPUT_BUFFER} usable byte(s), got {usable}"
             )
+        self._drop_flush_view()
         self._fixed = memoryview(buffer)
         # The same storage under both views: the memoryview for slice writes
         # (twice as fast as a bytearray's, and it cannot resize the caller's
@@ -318,6 +323,16 @@ class Encoder:
             self._cursor += take
             pos += take
 
+    def _drop_flush_view(self) -> None:
+        """Let go of the kept flush slice: its buffer stops being ours here.
+
+        Dropped, not released. A sink that *took* the buffer is holding this very
+        view (§5.1.5), and releasing it would pull the memory out from under a
+        transport that owns it. The reference simply goes, exactly as ``_fixed``'s
+        export of the same buffer does when it is rebound.
+        """
+        self._flush_view = None
+
     def _drain(self) -> None:
         if self._in_memory:
             # The sink is the result the encoder hands back: the drained bytes are
@@ -347,18 +362,38 @@ class Encoder:
         # given. The view is over the caller's bytearray, so a sink that keeps
         # it has taken the buffer and must install a replacement before it
         # returns; one that copies simply lets the view go.
-        view = memoryview(self._fixed)[0 : self._cursor]
+        # A streaming encode drains a full buffer over and over -- 977 times for
+        # a megabyte through a kibibyte -- and every one of those flushes wants
+        # the same slice. §6.6.2 settles whether that slice may be kept: "whether
+        # it allocates one per call or keeps one and reuses it, is an
+        # optimization it makes for its language -- not a conformance question."
+        # So the full-buffer slice is made once per installation and handed out
+        # again; only a short final flush builds one.
+        full = self._cursor == self._cap
+        if full:
+            view = self._flush_view
+            if view is None:
+                view = self._flush_view = memoryview(self._fixed)[0 : self._cursor]
+        else:
+            view = memoryview(self._fixed)[0 : self._cursor]
         if self._writer is not None:
             self._writer.write(view)  # type: ignore[attr-defined]
         else:
             self._flush_sink(view)  # type: ignore[misc, arg-type]
         if self._installs == installs:
-            # The sink copied, so the buffer is ours again and the view must go
-            # with it -- a lingering export would block the next buffer_set from
-            # replacing the buffer. A sink that *took* it installed a
-            # replacement, and its view stays valid over memory it now owns.
-            view.release()
+            # The sink copied, so the buffer is ours again. The short slice goes;
+            # the kept one stays for the next flush and is released when the
+            # installation ends. Either way the caller's bytearray was already
+            # pinned for the whole installation by ``_fixed``, so nothing here
+            # decides whether it can be resized.
+            if not full:
+                view.release()
             self._cursor = 0
+        else:
+            # The sink took the buffer, so the view it is holding is its own now.
+            # buffer_set already let go of ours; this is only the reminder that
+            # the kept slice must not be handed out over someone else's memory.
+            self._flush_view = None
 
     def bytes_used(self) -> int:
         """Bytes standing in the output buffer, i.e. written since it was

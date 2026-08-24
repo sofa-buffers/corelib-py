@@ -948,6 +948,10 @@ cdef class Encoder:
     # One memoryview per installation, so a flush costs a slice of it rather than
     # a fresh view plus a slice. The blob-streaming row flushes ~977 times.
     cdef object _fixed_view
+    # The full-buffer flush slice, kept for the installation -- see the pure
+    # engine and §6.6.2 ("keeps one and reuses it ... not a conformance
+    # question"). A streaming encode drains a full buffer over and over.
+    cdef object _flush_view
     # The convenience constructors' scratch: one fixed block, allocated at
     # construction and never resized (S5.1 -- an output buffer is never grown).
     # Raw C memory rather than a bytearray because nothing outside the encoder
@@ -990,6 +994,7 @@ cdef class Encoder:
     def __cinit__(self):
         self._fixed_obj = None
         self._fixed_view = None
+        self._flush_view = None
         self._scratch = NULL
         self._fixed_ptr = NULL
         self._fixed_cap = 0
@@ -1072,6 +1077,9 @@ cdef class Encoder:
                 "MIN_OUTPUT_BUFFER=%d usable byte(s), got %d"
                 % (_MIN_OUTPUT_BUFFER, size - <Py_ssize_t>offset))
         self._fixed_obj = buffer
+        # Dropped, not released: a sink that took the previous buffer holds this
+        # very view (§5.1.5). See the pure engine.
+        self._flush_view = None
         self._fixed_view = memoryview(buffer)
         self._fixed_ptr = <unsigned char*>PyByteArray_AS_STRING(buffer)
         self._fixed_cap = <size_t>size
@@ -1152,19 +1160,37 @@ cdef class Encoder:
         # does. The scratch shape has no such object -- one memoryview straight
         # over the memory then, which is also the cheaper of the two and the one
         # the streaming rows take.
+        cdef bint full = used == <Py_ssize_t>self._fixed_cap
+        cdef bint kept = False
         if self._fixed_view is not None:
-            view = self._fixed_view[0:used]
+            if full:
+                # The full-buffer slice is made once per installation and handed
+                # out again -- see the pure engine.
+                if self._flush_view is None:
+                    self._flush_view = self._fixed_view[0:used]
+                view = self._flush_view
+                kept = True
+            else:
+                view = self._fixed_view[0:used]
         else:
+            # The scratch shape has no object behind its memory, so its view is
+            # built each time and is never the kept one.
             view = PyMemoryView_FromMemory(<char*>self._fixed_ptr, used, PyBUF_READ)
         if self._writer is not None:
             self._writer.write(view)
         else:
             self._flush_sink(view)
         if self._installs == installs:
-            # The sink copied, so the buffer is ours again and the export has to
-            # go -- it would otherwise block the next buffer_set.
-            view.release()
+            # The sink copied, so the buffer is ours again. The short slice goes;
+            # the kept one stays for the next flush. Either way _fixed_view
+            # already pinned the caller's bytearray for the whole installation,
+            # so nothing here decides whether it can be resized.
+            if not kept:
+                view.release()
             self._cursor = 0
+        else:
+            # The sink took the buffer, so the view it holds is its own now.
+            self._flush_view = None
         return 0
 
     cdef inline int _emit_varint(self, uint64_t value) except -1:
