@@ -528,13 +528,25 @@ def test_max_array_count_applies_to_all_array_kinds():
     ):
         enc = Encoder()
         write(enc)
-        # A declined field is a consume too — the payload the walk would buffer
-        # is exactly what the cap protects, so it is rejected all the same.
         with pytest.raises(SofaLimitError):
-            verdict(
-                Decoder, enc.getvalue(), max_dyn_array_count=5,
-                recorder=Recorder(decline=lambda f: True),
-            )
+            verdict(Decoder, enc.getvalue(), max_dyn_array_count=5)
+
+
+def test_a_declined_array_is_not_capped():
+    # #128: the same three arrays, declined instead of read. Nothing is
+    # materialized, so there is no allocation for the cap to prevent (§6.2.1)
+    # and the message — which is well formed — decodes.
+    for write in (
+        lambda e: e.write_signed_array(1, list(range(6))),
+        lambda e: e.write_float32_array(1, [1.0] * 6),
+        lambda e: e.write_float64_array(1, [1.0] * 6),
+    ):
+        enc = Encoder()
+        write(enc)
+        verdict(
+            Decoder, enc.getvalue(), max_dyn_array_count=5,
+            recorder=Recorder(decline=lambda f: True),
+        )
 
 
 def test_max_string_len_fires_before_payload():

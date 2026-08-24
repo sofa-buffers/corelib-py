@@ -256,23 +256,37 @@ def test_a_refused_read_does_not_disturb_a_chunk_fed_decode(Encoder, Decoder):
 
 
 @engine
-def test_a_capped_field_reports_the_cap_rather_than_the_mismatch(Encoder, Decoder):
-    """§6.2.1 wins over §7.3: the skip §7.3 asks for still has to walk the
-    payload the cap exists to refuse, and a cap rejection is terminal for the
-    message rather than an answer about one field. Declaring the bound in the
-    binding is what takes the cap off — and then §7.3 applies again."""
+def test_a_capped_field_is_still_only_a_mismatch(Encoder, Decoder):
+    """§7.3 settles it first, and a configured cap does not change that (#128).
+
+    A payload the binding contradicts "was never this field's value" (§4.8), so
+    it is skipped exactly as an unknown id is — and a skip materializes nothing,
+    which is what §6.2.1's limit exists to prevent. The cap never gets a field to
+    speak about, and the decode stays COMPLETE with the destination untouched.
+
+    Naming the field's actual kind is what makes the value arrive; with no
+    declared bound the cap governs it again, and now there *is* an allocation to
+    refuse.
+    """
     enc = PyEncoder()
     enc.write_string(1, "x" * 64)
     wire = enc.getvalue()
 
-    # Bound as an array — the wrong type *and* over the configured cap.
+    # Bound as an array — the wrong type, and past the configured cap besides.
     capped = Binding().unsigned_array(1, at=_AT, cap=8, count_at=_COUNT_AT)
-    with pytest.raises(SofaLimitError):
-        bound(Decoder, wire, capped, max_dyn_string_len=8)
+    status, _dec, slots = bound(Decoder, wire, capped, max_dyn_string_len=8)
+    assert status is Status.COMPLETE
+    assert slots.u[_COUNT_AT] == 0, "a skipped field did not arrive"
+    assert slots.u[_AT] == 0, "and nothing was written for it"
 
-    # Lifting the cap means declaring the field's own bound — which is only
-    # possible by naming its actual kind, so the two can never be combined:
-    # §6.2.1 is settled before §7.3 is ever asked.
+    # Named as the string it is, with no declared bound: the decoder is the one
+    # that would build the ``str``, sized by the wire, so the cap speaks.
+    wanted = Binding().string(1, at=_OBJ, count_at=_COUNT_AT)
+    with pytest.raises(SofaLimitError):
+        bound(Decoder, wire, wanted, max_dyn_string_len=8)
+
+    # Declaring the field's own bound takes the cap off (§6.2.1): the schema
+    # governs, and 64 is within it.
     declared = Binding().string(1, at=_OBJ, maxlen=64, count_at=_COUNT_AT)
     status, _dec, slots = bound(Decoder, wire, declared, max_dyn_string_len=8)
     assert status is Status.COMPLETE

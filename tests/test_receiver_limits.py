@@ -91,7 +91,7 @@ def test_the_defaults_admit_everything_the_format_admits(engine):
     assert [e[0] for e in rec.events] == ["str", "blob", "ua"]
 
 
-# --- the limit is reached before anything is committed (§6.2.1) -------------
+# --- whose allocation is it? (§6.2.1, #128) --------------------------------
 
 
 def _uvarint(x):
@@ -105,43 +105,115 @@ def _uvarint(x):
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_the_limit_precedes_the_handlers_destination_for_an_array(engine):
-    """§6.2.1 enforces at the count header, "before the allocation it is meant
-    to prevent". The handler must therefore never be asked for storage for an
-    array the decoder has already refused -- and what it sees must be the
-    LimitExceeded the message earned, not a complaint about the size of a buffer
-    it should not have been asked for (§6.3)."""
+def test_the_limit_still_governs_the_list_the_decoder_would_build(engine):
+    """The default route is the one §6.2.1 is about.
+
+    With no destination back from the handler, the only storage the array can go
+    into is a list of the decoder's own, and the only size it could build one
+    from is the wire's. That is precisely "the allocation it is meant to
+    prevent", so the cap fires -- at the count header, before an element is
+    read."""
+
+    class Handler(Recorder):
+        def on_array_begin(self, field_id, wtype, count):
+            return None  # asked, and declined to name a destination
+
+    wire = bytes([0x0B]) + _uvarint(0x7FFFFFFF) + b"\x01"
+    dec = engine(visitor=Handler(), max_dyn_array_count=4)
+    with pytest.raises(SofaLimitError):
+        dec.feed(wire)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_handlers_own_destination_is_not_the_senders_to_dictate(engine):
+    """§6.2.1 exists because an unbounded field "would let the **sender**
+    dictate the **receiver's** allocation". A handler that hands back a buffer
+    has sized that buffer itself, so the sender dictates nothing and there is no
+    allocation of the decoder's for the cap to prevent.
+
+    The handler is therefore asked, and told the announced count first -- which
+    is the point at which a receiver that does not want 2**31-1 elements gets to
+    say so. Refusing on its behalf, before it has been asked, is what #128 was
+    filed about: every other port in the family reads this field.
+    """
     from array import array
 
     asked = []
+    dst = array("Q", [0] * 4)
 
     class Handler(Recorder):
         def on_array_begin(self, field_id, wtype, count):
             asked.append(count)
+            return (dst, None, None)
+
+    enc = Encoder()
+    enc.write_unsigned_array(1, [7, 8, 9])
+    enc.flush()
+    dec = engine(visitor=Handler(), max_dyn_array_count=1)
+    dec.feed(enc.getvalue())
+    assert asked == [3]
+    assert list(dst) == [7, 8, 9, 0]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_destination_too_short_is_a_range_error_not_a_limit(engine):
+    """With the cap out of the way, the only ceiling left on the caller's own
+    buffer is that buffer's size -- and a count it cannot hold is
+    :class:`SofaRangeError`, never a policy rejection. The decoder is protecting
+    itself from an overrun, not judging the message: the bytes are fine, and the
+    same message fills a longer destination.
+    """
+    from array import array
+
+    class Handler(Recorder):
+        def on_array_begin(self, field_id, wtype, count):
             return (array("Q", [0] * 4), None, None)
 
     # id 1, unsigned array, count 2**31-1, then one lone element byte.
     wire = bytes([0x0B]) + _uvarint(0x7FFFFFFF) + b"\x01"
     dec = engine(visitor=Handler(), max_dyn_array_count=4)
-    with pytest.raises(SofaLimitError):
+    with pytest.raises(SofaRangeError):
         dec.feed(wire)
-    assert asked == [], "the handler was asked for storage anyway"
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_the_limit_precedes_the_handlers_destination_for_a_blob(engine):
+def test_the_same_two_answers_for_a_blob(engine):
+    """The blob half of the pair above: `on_blob_begin` is asked, and its
+    buffer -- not the cap -- is what the payload has to fit."""
+    enc = Encoder()
+    enc.write_bytes(1, b"x" * 100)
+    enc.flush()
+    wire = enc.getvalue()
+
     asked = []
 
     class Handler(Recorder):
+        def __init__(self, dst):
+            super().__init__()
+            self._dst = dst
+
         def on_blob_begin(self, field_id, size):
             asked.append(size)
-            return bytearray(size)
+            return self._dst
 
-    wire = bytes([0x0A]) + _uvarint((1_000_000 << 3) | 0x3)
-    dec = engine(visitor=Handler(), max_dyn_blob_len=16)
+    # Its own buffer, big enough: read, cap or no cap.
+    dec = engine(visitor=Handler(bytearray(4096)), max_dyn_blob_len=10)
+    dec.feed(wire)
+    assert asked == [100]
+
+    # Its own buffer, too short: the buffer's size is the only ceiling left,
+    # and overrunning it is a range error rather than a policy rejection.
+    asked.clear()
+    dec = engine(visitor=Handler(bytearray(8)), max_dyn_blob_len=10)
+    with pytest.raises(SofaRangeError):
+        dec.feed(wire)
+    assert asked == [100]
+
+    # No buffer back: the decoder would build the ``bytes`` itself, sized by the
+    # wire, and that is the allocation the cap exists to prevent.
+    dec = engine(visitor=Handler(None), max_dyn_blob_len=10)
     with pytest.raises(SofaLimitError):
         dec.feed(wire)
-    assert asked == []
 
 
 @pytest.mark.parametrize("engine", ENGINES)

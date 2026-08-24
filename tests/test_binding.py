@@ -441,21 +441,53 @@ def test_a_declared_maxlen_lifts_the_receiver_cap(enc_cls, dec_cls):
 
 @pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
 def test_a_limit_rejection_stays_rejected(enc_cls, dec_cls):
-    """§6.3: terminal. The decoder must not shrug it off and carry on."""
+    """§6.3: terminal. The decoder must not shrug it off and carry on.
+
+    Field 1 is bound and declares no ``maxlen``, so the configured cap governs
+    it and the ``str`` the decoder would build -- sized by the wire -- is the
+    allocation §6.2.1 refuses.
+    """
     from sofab import SofaLimitError
 
     enc = enc_cls()
-    enc.write_unsigned_array(1, [1, 2, 3, 4, 5])
+    enc.write_string(1, "x" * 64)
     enc.write_unsigned(2, 7)
     enc.flush()
-    b = Binding().unsigned(2, at=0, count_at=1)
+    b = Binding().string(1, at=0).unsigned(2, at=0, count_at=1)
     words, objects, u, _q, _f = storage(b)
-    dec = dec_cls(binding=b, words=words, max_dyn_array_count=2)
+    dec = dec_cls(binding=b, words=words, objects=objects, max_dyn_string_len=2)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
     with pytest.raises(SofaLimitError):
         dec.feed(b"")
     assert u[1] == 0, "nothing past the rejection may be decoded"
+
+
+@pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
+def test_a_field_the_table_does_not_name_is_skipped_uncapped(enc_cls, dec_cls):
+    """#128: a cap does not apply to a field the handler never materializes.
+
+    Field 1 is not in the table, so it is skipped -- and §6.2.1 puts the limit
+    "before the allocation it is meant to prevent", of which a skip makes none.
+    The message is well formed, so it decodes; the port that rejected it here
+    was the only one in the family that did.
+    """
+    enc = enc_cls()
+    enc.write_unsigned_array(1, [1, 2, 3, 4, 5])
+    enc.write_bytes(3, b"z" * 64)
+    enc.write_unsigned(2, 7)
+    enc.flush()
+    b = Binding().unsigned(2, at=0, count_at=1)
+    words, objects, u, _q, _f = storage(b)
+    dec = dec_cls(
+        binding=b,
+        words=words,
+        max_dyn_array_count=2,
+        max_dyn_blob_len=2,
+    )
+    assert dec.feed(enc.getvalue()) is Status.COMPLETE
+    assert dec.error is None
+    assert u[0] == 7 and u[1] == 1
 
 
 # --- the table's own surface -------------------------------------------------

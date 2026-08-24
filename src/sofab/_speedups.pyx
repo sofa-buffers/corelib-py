@@ -655,7 +655,14 @@ cdef int _PEND_FARRAY = 4
 # A pending value a receiver-side cap has rejected (§6.2.1). The kind it stands
 # in for is kept in _pk_real and the rejection's message in _limit_msg, so the
 # rejection can still be waived by schema_bounded() and a peek can read through
-# it. Mirrors the pure decoder's _LIMIT wrapper tuple.
+# it.
+#
+# Parked rather than raised because the verdict is not final at the header: it
+# depends on where the value is headed, which only the field's route knows
+# (#128). A path that would put the value in storage of the DECODER's own —
+# sized by the wire — raises it; a path that skips the field, or that fills a
+# destination the handler supplied, unparks it and walks on. Mirrors the pure
+# decoder's _LIMIT wrapper tuple.
 cdef int _PEND_LIMIT = 5
 
 
@@ -2329,7 +2336,8 @@ cdef class Decoder:
             # before its payload is read or buffered — and PARKED on the pending
             # value rather than raised, so the caller keeps the §6.2.1 window in
             # which it can declare the field schema-bounded and take the cap off
-            # it. Every consume path raises it; see _park_limit / _mismatch.
+            # it. A consume into the decoder's own storage raises it; a skip or a
+            # handler-supplied destination unparks it (#128). See _park_limit.
             cap = _NONE
             if self._capped:
                 if subtype == _ST_STRING:
@@ -2456,11 +2464,12 @@ cdef class Decoder:
         # exactly like an unknown id, nothing is written to the caller, and the
         # decode stays COMPLETE. Two conditions reach here that are not that:
         # no pending value at all is a caller mistake (§6.3 InvalidArgument),
-        # and a parked receiver cap (§6.2.1) stands in the way of the skip as
-        # much as of the read — skipping still buffers the payload — and is a
-        # terminal rejection of the message. Both raise. Reached only once a
-        # read has found the kind wrong, so the ordinary path never pays for
-        # it. Mirrors Decoder._mismatch in the pure engine.
+        # and a parked receiver cap (§6.2.1) is the field this decoder is about
+        # to materialize into storage of its own — the allocation the cap
+        # exists to refuse. Both raise. A §7.3 skip never arrives here: the
+        # driver settles the tag itself and leaves the value pending for
+        # _skip_pending, which drops the cap (#128). Reached only once a read
+        # has found the kind wrong, so the ordinary path never pays for it.
         if self._pk == _PEND_NONE:
             raise SofaRangeError("no value pending for the current field")
         if self._pk == _PEND_LIMIT:
@@ -2486,16 +2495,30 @@ cdef class Decoder:
 
     cdef int _skip_pending(self) except -1:
         cdef int kind = self._pk
+        if kind == _PEND_LIMIT:
+            # A skipped field is not capped (#128). §6.2.1 enforces a receiver
+            # limit "at the count/length header — before the allocation it is
+            # meant to prevent", and a skip makes no allocation for it to
+            # prevent: the payload is walked, never materialized, which is what
+            # §6.7.2's skip row means by "neither materializes nor validates".
+            # So the parked verdict is dropped and the real value walked like
+            # any other — including a §7.3 tag mismatch, whose payload "was
+            # never this field's value" and cannot be measured against a bound
+            # meant for one.
+            #
+            # Unparked before the walk rather than after it: should the payload
+            # run out mid-skip the field stays pending, and the retry then
+            # re-enters with the cap already gone instead of clearing it twice.
+            kind = self._pk = self._pk_real
+            self._limit_msg = None
         if kind == _PEND_SCALAR:
             self._varint()
         elif kind == _PEND_FIXLEN:
             self._skip_exact(<Py_ssize_t>self._pend_size)
         elif kind == _PEND_VARRAY:
             self._skip_varints(<Py_ssize_t>self._pend_count)
-        elif kind == _PEND_FARRAY:
+        else:  # _PEND_FARRAY
             self._skip_exact(self._farray_nbytes(self._pend_count, self._pend_size))
-        else:  # _PEND_LIMIT — a skip still buffers the payload, so the cap binds it
-            raise SofaLimitError(self._limit_msg)
         # Cleared only now: had the value run out mid-skip, the field has to stay
         # pending so the retry skips it again from its first byte (§5.2).
         self._pk = _PEND_NONE
@@ -3334,10 +3357,12 @@ cdef class Decoder:
         cdef bint bounded
         cdef int64_t clo = INT64_MIN
         cdef uint64_t chi = <uint64_t>0xFFFFFFFFFFFFFFFF
-        # The receiver limit first (§6.2.1) — see the pure engine for why.
-        if self._pk == _PEND_LIMIT:
-            raise SofaLimitError(self._limit_msg)
+        cdef bint capped = self._pk == _PEND_LIMIT
         if self._wants_array_begin:
+            # Asked before a parked receiver cap is answered (#128) — see the
+            # pure engine for why. In short: §6.2.1's limit stops the sender
+            # dictating the receiver's allocation, and a handler that hands back
+            # a buffer has chosen the size itself.
             spec = visitor.on_array_begin(fid, _WT[wtype], count)
             if spec is not None:
                 dst, lo, hi = spec
@@ -3349,11 +3374,23 @@ cdef class Decoder:
         if hi is not None and hi > _INT64_MAX_OBJ:
             hi = None
         if dst is None:
+            # Nowhere to put them but a list of this decoder's own, sized by the
+            # wire. That is the allocation §6.2.1 exists to prevent, and the
+            # count header — here, before an element is read — is where it says
+            # so. The list reads below reach the same verdict through _mismatch;
+            # raised here so the message names the count rather than the kind.
+            if capped:
+                raise SofaLimitError(self._limit_msg)
             if zigzag:
                 visitor.on_signed_array(fid, self._read_signed_array(lo, hi))
             else:
                 visitor.on_unsigned_array(fid, self._read_unsigned_array(hi))
             return 0
+        if capped:
+            # Spent: unpark, or the fill below would find the wrapper kind where
+            # it looks for the array.
+            self._pk = self._pk_real
+            self._limit_msg = None
         bounded = lo is not None or hi is not None
         if lo is not None:
             clo = lo
@@ -3414,14 +3451,23 @@ cdef class Decoder:
             elif st == _ST_STRING:
                 visitor.on_string(fid, self._string())
             else:
-                # The receiver limit first (§6.2.1): a parked rejection means the
-                # decoder has already refused this blob, so the handler must not
-                # be asked for storage for it. The list route reaches the same
-                # verdict inside _bytes(); this path bypasses that, so it asks
-                # here.
-                if self._wants_blob_begin and self._pk != _PEND_LIMIT:
+                # Offered before a parked receiver cap is answered (#128).
+                # §6.2.1's limit is there to stop the sender dictating the
+                # receiver's allocation, and a handler that hands back a buffer
+                # has already chosen the size itself — there is no allocation of
+                # this decoder's left for the cap to prevent. It is told the
+                # announced length and may refuse it; that call is the
+                # handler's. With no destination back, the ``bytes`` this
+                # decoder would build is the allocation §6.2.1 is about, and
+                # _bytes() reaches the parked verdict through _mismatch.
+                if self._wants_blob_begin:
                     dst = visitor.on_blob_begin(fid, self._pend_size)
                     if dst is not None:
+                        if self._pk == _PEND_LIMIT:
+                            # Spent: unpark, or the copy below would find the
+                            # wrapper kind where it looks for the payload.
+                            self._pk = self._pk_real
+                            self._limit_msg = None
                         self._take_blob_into(dst, <Py_ssize_t>self._pend_size)
                         return 0
                 visitor.on_bytes(fid, self._bytes())

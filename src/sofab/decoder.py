@@ -81,7 +81,13 @@ _FARRAY = 3
 # A pending value a receiver-side cap has rejected (§6.2.1). The real pending
 # tuple is parked inside it — ``(_LIMIT, message, pending)`` — so the rejection
 # can still be waived by :meth:`Decoder.schema_bounded` and so a peek can read
-# through it. Every path that would consume the field raises it instead.
+# through it.
+#
+# Parked rather than raised because the verdict is not final at the header: it
+# depends on where the value is headed, which only the field's route knows
+# (#128). A path that would put the value in storage of the DECODER's own —
+# sized by the wire — raises it; a path that skips the field, or that fills a
+# destination the handler supplied, unwraps it and walks on.
 _LIMIT = 4
 
 # Wire-type members indexed by their integer value, so the per-field hot path
@@ -255,6 +261,18 @@ class Decoder:
         rejected with :class:`SofaLimitError`. The verdict is reached at the
         count/length header — before any allocation or payload buffering, so a
         hostile claim fails even if the payload never arrives.
+
+        What they bound is what **this decoder** allocates, which §6.2.1 states
+        as their whole purpose: an unbounded field "would let the *sender*
+        dictate the *receiver's* allocation". So they govern the default route,
+        where the decoder has to build a ``str``, a ``bytes`` or a list and the
+        wire is the only size it could build one from. A field that is skipped
+        allocates nothing and is not capped; neither is one read into a buffer
+        the handler returned from :meth:`sofab.Visitor.on_blob_begin` or
+        :meth:`sofab.Visitor.on_array_begin`, which those hooks size themselves
+        after being told the announced length or count. There the destination's
+        own size is the ceiling, and a short one is
+        :class:`SofaRangeError` rather than a policy rejection.
 
         **There is no unset state and no unlimited mode** (§6.2.1): "unbounded by
         the schema" is still bounded by the receiver. ``None`` is refused rather
@@ -934,16 +952,31 @@ class Decoder:
         pending = self._pending
         assert pending is not None
         kind = pending[0]
+        if kind == _LIMIT:
+            # A skipped field is not capped (#128). §6.2.1 enforces a receiver
+            # limit "at the count/length header — before the allocation it is
+            # meant to prevent", and a skip makes no allocation for it to
+            # prevent: the payload is walked, never materialized, which is
+            # exactly what §6.7.2's skip row means by "neither materializes nor
+            # validates". So the parked verdict is dropped here and the real
+            # value walked like any other — including a §7.3 tag mismatch, whose
+            # payload "was never this field's value" and so cannot be measured
+            # against a bound meant for one.
+            #
+            # Unwrapped before the walk rather than after it: should the payload
+            # run out mid-skip the field stays pending, and the retry then
+            # re-enters with the cap already gone instead of unwrapping twice.
+            pending = pending[2]
+            self._pending = pending
+            kind = pending[0]
         if kind == _SCALAR:
             self._varint()
         elif kind == _FIXLEN:
             self._skip_exact(pending[2])
         elif kind == _VARRAY:
             self._skip_varints(pending[2])
-        elif kind == _FARRAY:
+        else:  # _FARRAY
             self._skip_exact(self._farray_nbytes(pending[2], pending[3]))
-        else:  # _LIMIT — a skip still buffers the payload, so the cap binds it
-            raise SofaLimitError(pending[1])
         # Cleared only now: had the value run out mid-skip, the field has to
         # stay pending so the retry skips it again from its first byte (§5.2).
         self._pending = None
@@ -1491,15 +1524,33 @@ class Decoder:
             # three of which only chose the next one. Everything they did is
             # here: the parked-cap check, the resume transaction, the bounds
             # test, and the one copy out of the buffer.
-            if pending[0] == _LIMIT:
-                # A parked receiver cap (§6.2.1): the field is being refused, and
-                # the walk over its payload is what the cap exists to prevent.
-                raise SofaLimitError(pending[1])
-            if self._wants_blob_begin and pending[1] == _ST_BLOB:
-                dst = visitor.on_blob_begin(fid, pending[2])
+            capped = pending[0] == _LIMIT
+            # Read through a parked cap rather than raising on sight (#128): the
+            # subtype and the length below are facts about the field, and the
+            # handler needs both before anyone can say whether the cap applies.
+            real = pending[2] if capped else pending
+            if self._wants_blob_begin and real[1] == _ST_BLOB:
+                # Offered before the cap is answered, and on purpose. §6.2.1's
+                # limit exists to stop the *sender* dictating the *receiver's*
+                # allocation; a handler that hands back a buffer has chosen the
+                # size itself, so there is no allocation of this decoder's left
+                # for the cap to prevent. The handler is told the announced
+                # length and is free to refuse it — that call is its own, and
+                # this is where it gets to make it.
+                dst = visitor.on_blob_begin(fid, real[2])
                 if dst is not None:
-                    self._take_blob_into(dst, pending[2])
+                    # The cap is spent: unwrap, or the copy below and the resume
+                    # behind it would look for the length in the wrapper.
+                    pending = real
+                    self._pending = real
+                    self._take_blob_into(dst, real[2])
                     return
+            if capped:
+                # No destination came back, so this decoder is the one that
+                # would build the ``bytes``/``str`` — and the only size it could
+                # build one from is the wire's. That is the allocation §6.2.1 is
+                # about, so the cap speaks.
+                raise SofaLimitError(pending[1])
             self._keep = pos = self._pos
             end = pos + pending[2]
             if end > self._n:
@@ -1525,14 +1576,21 @@ class Decoder:
                 visitor.on_float32(fid, _core.unpack_f32(data))
             else:
                 visitor.on_float64(fid, _core.unpack_f64(data))
-        elif t == _WT_ARRAY_UNSIGNED:
-            self._visit_varints(visitor, fid, t, pending[2], False)
-        elif t == _WT_ARRAY_SIGNED:
-            self._visit_varints(visitor, fid, t, pending[2], True)
-        elif pending[1] == _ST_FP32:
-            visitor.on_float32_array(fid, self._take_farray_values(pending, 4))
         else:
-            visitor.on_float64_array(fid, self._take_farray_values(pending, 8))
+            # An array kind. Read through a parked cap for the count and the
+            # subtype below — they are facts about the field, and both the
+            # handler and the verdict need them (#128); _visit_varints and
+            # _take_farray_values each answer the cap themselves, once they know
+            # whose storage the elements are headed for.
+            real = pending[2] if pending[0] == _LIMIT else pending
+            if t == _WT_ARRAY_UNSIGNED:
+                self._visit_varints(visitor, fid, t, real[2], False)
+            elif t == _WT_ARRAY_SIGNED:
+                self._visit_varints(visitor, fid, t, real[2], True)
+            elif real[1] == _ST_FP32:
+                visitor.on_float32_array(fid, self._take_farray_values(pending, 4))
+            else:
+                visitor.on_float64_array(fid, self._take_farray_values(pending, 8))
 
     def _take_blob_into(self, dst: Any, size: int) -> None:
         """Copy a blob's payload into the caller's buffer (§6.6.3).
@@ -1583,20 +1641,32 @@ class Decoder:
         reject an array that never arrived (§7.1), and a destination offered
         there is a destination the values have already been built without.
         """
-        # The receiver limit first (§6.2.1): it is enforced at the count header,
-        # *before* the allocation it exists to prevent — so the handler is never
-        # asked for storage for an array this decoder has already refused, and
-        # what it sees is the LimitExceeded the message earned rather than a
-        # complaint about the size of a buffer it should not have been asked for.
-        if self._pending is not None and self._pending[0] == _LIMIT:
-            raise SofaLimitError(self._pending[1])
+        pending = self._pending
+        capped = pending is not None and pending[0] == _LIMIT
         dst: Any = None
         lo: int | None = None
         hi: int | None = None
         if self._wants_array_begin:
+            # Asked before a parked receiver cap is answered (#128). §6.2.1's
+            # limit is there to stop the *sender* dictating the *receiver's*
+            # allocation, and a handler that hands back a buffer has already
+            # chosen the size itself — there is no allocation of this decoder's
+            # left for the cap to prevent. It was told the announced count and
+            # may refuse it; that call belongs to the handler, not here.
             spec = visitor.on_array_begin(fid, _WT[wtype], count)
             if spec is not None:
                 dst, lo, hi = spec
+        if capped and dst is None:
+            # Nowhere to put them but a list of this decoder's own, sized by the
+            # wire. That is the allocation §6.2.1 exists to prevent, and this —
+            # the count header, before an element is read — is where it says so.
+            assert pending is not None
+            raise SofaLimitError(pending[1])
+        if capped:
+            # Spent: unwrap so the resume transaction and the reads below see
+            # the real pending value rather than the wrapper around it.
+            assert pending is not None
+            self._pending = pending[2]
         self._keep = self._pos
         if dst is None:
             out = self._read_varints(count, lo, hi, zigzag)

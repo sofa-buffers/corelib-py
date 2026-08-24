@@ -105,6 +105,12 @@ class Visitor:
 
         Not called for float arrays, which carry no declared width to state and
         are already moved into a destination in one piece.
+
+        **A configured** ``max_dyn_array_count`` **does not gate this hook**, on
+        the same reasoning as :meth:`on_blob_begin`: it is asked first and told
+        ``count``, and a ``dst`` it hands back is storage it sized itself. The
+        cap governs the list the decoder would otherwise build — the ``None``
+        answer — not a destination of the handler's own.
         """
         return None
 
@@ -131,6 +137,16 @@ class Visitor:
         Not offered for strings. A string the handler reads must be validated
         (§6.7.2), and this port validates by decoding, which builds the ``str``
         a destination exists to avoid — so there would be nothing to save.
+
+        **A configured** ``max_dyn_blob_len`` **does not gate this hook.** It is
+        asked first, and asked whatever the announced size is. The limit is
+        there to stop the *sender* dictating the *receiver's* allocation
+        (§6.2.1), and a handler that hands back a buffer has sized that buffer
+        itself — there is no allocation of the decoder's left to prevent. It is
+        told ``size`` before a byte is copied precisely so that a receiver
+        unwilling to take that many can refuse it here, which is its call to
+        make. Return ``None`` and the cap applies again, because then the
+        ``bytes`` is the decoder's to build and the wire is its only size.
         """
         return None
 

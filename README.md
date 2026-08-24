@@ -514,7 +514,8 @@ dec = Decoder(binding=b, words=words,
 A field whose declared count/length exceeds its limit raises `SofaLimitError`: a
 *policy* rejection, distinct from malformed input, and a sibling of
 `SofaDecodeError` under `SofaError` rather than a subclass, so `except
-SofaDecodeError` does not catch it.
+SofaDecodeError` does not catch it. It governs what **this decoder** would
+allocate; the two sections below say which fields those are.
 
 **There is no unset state and no unlimited mode.** `None` is refused rather than
 read as "no limit". Each defaults to the format-wide ceiling — `ARRAY_MAX` for
@@ -549,9 +550,36 @@ b = Binding().string(1, at=0, maxlen=4194304)   # `name: { string, maxlen: 41943
 Declaring it does two things at once: the receiver-side cap stops applying to
 that field, and the decoder enforces the declared bound itself — an over-bound
 length is `INVALID` (`SofaDecodeError`, MESSAGE_SPEC §7.1), never
-`SofaLimitError`. A field with no declared bound — one the table names without a
-`maxlen`, or does not name at all — stays under the cap, including when it is
-only walked past.
+`SofaLimitError`.
+
+#### So is a field nobody materializes
+
+A cap prevents an allocation, so it applies where there is one to prevent. Three
+routes make none, and none of them is capped:
+
+* a field the binding does not name, or names with a contradicting wire tag
+  (§7.3) — the decoder walks past the payload without building anything from it;
+* a field the visitor declines from `on_field`;
+* a field the visitor *wants*, having handed back its own buffer from
+  `on_blob_begin` or `on_array_begin`. The hook is told the announced length or
+  count first, and a receiver that does not want that many bytes says so there —
+  the decision is the handler's, and a limit the decoder applied on its behalf
+  would only take it away.
+
+What is left is the default route, and it is the one §6.2.1 is about: with no
+destination back, the decoder itself has to build a `str`, a `bytes` or a list,
+and the only size it could build one from is the wire's. That allocation is
+refused on the count/length word, before a payload byte is read.
+
+The ceiling on a buffer you supply is that buffer's own size. Too short for what
+the hook was told, and the decoder refuses it — `SofaRangeError`
+(`InvalidArgument`), never a silent truncation and never a resize. That is a fact
+about your storage rather than a verdict on the message, which is why it is not
+`SofaLimitError`.
+
+The same goes for `reassembly=`: a skipped payload spanning a chunk boundary is
+still joined in the buffer you supplied, so what a skip can cost is bounded by
+that buffer, and one that does not fit is refused the same way.
 
 A **schema** bound is the opposite kind of thing from a cap: it is part of the
 message definition, so breaching it is malformed input, not policy. The
