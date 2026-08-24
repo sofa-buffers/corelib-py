@@ -210,6 +210,7 @@ class Decoder:
         "_running",
         "_status",
         "_visitor",
+        "_vstack",
         "_wants_array_begin",
         "_wants_blob_begin",
         "_wants_field",
@@ -349,21 +350,16 @@ class Decoder:
         # costs a Python call per field for nothing. ``_wants_field`` also
         # decides whether a Field object is built at all: it is the only thing
         # that receives one, and the typed hooks take an id.
-        self._wants_field = (
-            visitor is not None and type(visitor).on_field is not Visitor.on_field
-        )
-        self._wants_seq_begin = (
-            visitor is not None
-            and type(visitor).on_sequence_begin is not Visitor.on_sequence_begin
-        )
-        self._wants_array_begin = (
-            visitor is not None
-            and type(visitor).on_array_begin is not Visitor.on_array_begin
-        )
-        self._wants_blob_begin = (
-            visitor is not None
-            and type(visitor).on_blob_begin is not Visitor.on_blob_begin
-        )
+        # Visitors suspended by a descent: a handler may answer
+        # on_sequence_begin with another Visitor, and the sub-tree's events go
+        # there until its end marker. Empty for the common flat handler.
+        self._vstack: list[Visitor] = []
+        self._wants_field = False
+        self._wants_seq_begin = False
+        self._wants_array_begin = False
+        self._wants_blob_begin = False
+        if visitor is not None:
+            self._bind_visitor(visitor)
         # The active table and the stack of enclosing ones. A sequence opens a
         # fresh id scope (§4.9), so descending *replaces* the table rather than
         # layering onto it — an id bound in the parent must not match inside.
@@ -1187,6 +1183,12 @@ class Decoder:
         self._status = Status.COMPLETE
         self._error = None
         self._limit = None
+        if self._vstack:
+            # A descent left mid-message: the handler the caller gave us is the
+            # one at the bottom of the stack.
+            self._visitor = self._vstack[0]
+            self._vstack.clear()
+            self._bind_visitor(self._visitor)
         self._resume_kind = _R_NONE
         self._resume_entry = None
         self._bmap = self._binding._by_id if self._binding is not None else None
@@ -1254,7 +1256,12 @@ class Decoder:
                 if self._bstack:
                     self._bmap = self._bstack.pop()
                 if visitor is not None:
+                    # The end belongs to whoever was handling the scope, so a
+                    # child hears its own scope close before it is popped.
                     visitor.on_sequence_end()
+                    if self._vstack:
+                        visitor = self._visitor = self._vstack.pop()
+                        self._bind_visitor(visitor)
                 continue
 
             bmap = self._bmap
@@ -1279,15 +1286,23 @@ class Decoder:
                     if c >= 0:
                         self._wu[c] = self._wu[c] + 1
                     continue
-                if visitor is not None and (
-                    not self._wants_seq_begin
-                    or visitor.on_sequence_begin(self._cur_id) is not False
-                ):
-                    # §4.9 opens a fresh id scope, so the enclosing table must
-                    # not match inside it.
-                    self._bstack.append(self._bmap)
-                    self._bmap = None
-                    continue
+                if visitor is not None:
+                    answer = (
+                        visitor.on_sequence_begin(self._cur_id)
+                        if self._wants_seq_begin
+                        else None
+                    )
+                    if answer is not False:
+                        # §4.9 opens a fresh id scope, so the enclosing table
+                        # must not match inside it.
+                        self._bstack.append(self._bmap)
+                        self._bmap = None
+                        if isinstance(answer, Visitor):
+                            # The handler named someone else for this sub-tree.
+                            self._vstack.append(visitor)
+                            visitor = self._visitor = answer
+                            self._bind_visitor(answer)
+                        continue
                 try:
                     self._skip_sequence()
                 except SofaIncompleteError:
@@ -1538,6 +1553,19 @@ class Decoder:
         view[:size] = memoryview(self._buf)[pos:end]
         self._pos = end
         self._pending = None  # committed once the payload is in hand (§5.2)
+
+    def _bind_visitor(self, visitor: Visitor) -> None:
+        """Take the hook flags off ``visitor``'s type.
+
+        Computed once per handler rather than per field: which hooks are
+        overridden cannot change between fields, and a descent into a child
+        handler is the only thing that changes the answer.
+        """
+        cls = type(visitor)
+        self._wants_field = cls.on_field is not Visitor.on_field
+        self._wants_seq_begin = cls.on_sequence_begin is not Visitor.on_sequence_begin
+        self._wants_array_begin = cls.on_array_begin is not Visitor.on_array_begin
+        self._wants_blob_begin = cls.on_blob_begin is not Visitor.on_blob_begin
 
     def _visit_varints(
         self, visitor: Visitor, fid: int, wtype: int, count: int, zigzag: bool

@@ -32,7 +32,7 @@ import pytest
 from vectors import DECODER_ENGINES as ENGINES
 from vectors import ENCODER_ENGINES as ENCODERS
 
-from sofab import SofaLimitError, Status, Visitor
+from sofab import NestedSeq, SofaLimitError, Status, StringSeq, Visitor
 
 _VECTORS = json.loads(
     (Path(__file__).resolve().parent.parent / "assets" / "test_vectors.json").read_text()
@@ -45,51 +45,50 @@ IDS = [c["name"] for c in CASES]
 CAP = 8
 
 
-class Collector(Visitor):
-    """The wrapper array's container — the generated layer's job, not the codec's.
+class Element(Visitor):
+    """One struct element: an ``unsigned`` at id 0, per the block's note."""
 
-    It extends to ``id + 1`` as elements arrive, fills a gap with the element
-    default, and refuses an index at or past the cap. The refusal is §6.2.1's:
-    the codec surfaced the index, and this is the visitor deciding on it, before
-    the container is extended.
-    """
-
-    def __init__(self, cap: int = CAP) -> None:
-        self.cap = cap
-        self.items: list = []
-        self._depth = 0
-        self._element = None
-
-    # --- the container ---
-    def _place(self, index: int, value) -> None:
-        if index >= self.cap:
-            raise SofaLimitError(
-                f"element index {index} exceeds max_dyn_array_count {self.cap}"
-            )
-        while len(self.items) <= index:
-            self.items.append(None)  # the element default
-        self.items[index] = value
-
-    # --- the wire ---
-    def on_sequence_begin(self, field_id):
-        self._depth += 1
-        if self._depth == 2:  # a framed (struct) element of the wrapper
-            self._place(field_id, {})
-            self._element = field_id
-        return None
-
-    def on_sequence_end(self):
-        if self._depth == 2:
-            self._element = None
-        self._depth -= 1
-
-    def on_string(self, field_id, value):
-        if self._depth == 1:  # a leaf element of the wrapper
-            self._place(field_id, value)
+    def __init__(self) -> None:
+        self.fields: dict[int, int] = {}
 
     def on_unsigned(self, field_id, value):
-        if self._depth == 2 and self._element is not None:
-            self.items[self._element][field_id] = value
+        self.fields[field_id] = value
+
+
+class Root(Visitor):
+    """The object that holds the array field, handing its scope to a collector.
+
+    This is the shape generated code takes: a wrapper array's scope is delegated
+    to the collector for that field, so the ids the collector sees are that
+    array's indices.
+    """
+
+    def __init__(self, case: dict, out: list) -> None:
+        self._case = case
+        self._out = out
+
+    def on_sequence_begin(self, field_id):
+        if field_id != self._case["field_id"]:
+            return None
+        if self._case.get("element_type") == "struct":
+            return NestedSeq(self._out, factory=Element, max_dyn_array_count=CAP)
+        return StringSeq(self._out, max_dyn_array_count=CAP)
+
+
+def collector_for(case: dict, out: list):
+    """The library's own collector for this case's element type.
+
+    This is the point of the block for a codec-only port: the container is
+    ``sofab.collectors``' — the static helper layer §6.6.1 puts beside the codec
+    for exactly this — driven through the public visitor API the generated layer
+    uses. Nothing here is written for the test.
+    """
+    return Root(case, out)
+
+
+def _element_default(case: dict):
+    """What an omitted interior element leaves behind (MESSAGE_SPEC §2)."""
+    return None if case.get("element_type") == "struct" else ""
 
 
 def _resolve(entry: dict, key: str) -> int:
@@ -123,14 +122,14 @@ def _build(enc_cls, case: dict) -> bytes:
 def test_sequence_growth_case(case, enc_cls, dec_cls):
     assert "dynamic_arrays" in case["requires"], case["name"]
     wire = _build(enc_cls, case)
-    coll = Collector()
-    dec = dec_cls(visitor=coll)
+    out: list = []
+    dec = dec_cls(visitor=collector_for(case, out))
     expect = case["expect"]
 
     if expect["outcome"] == "limit_exceeded":
         with pytest.raises(SofaLimitError):
             dec.feed(wire)
-        assert len(coll.items) <= expect["max_length"], (
+        assert len(out) <= expect["max_length"], (
             "the container was extended past the rejected index"
         )
         if expect.get("terminal"):
@@ -139,13 +138,15 @@ def test_sequence_growth_case(case, enc_cls, dec_cls):
             # from landing behind the one that was refused.
             with pytest.raises(SofaLimitError):
                 dec.feed(b"")
-            assert len(coll.items) <= expect["max_length"]
+            assert len(out) <= expect["max_length"]
         return
 
     assert dec.feed(wire) is Status.COMPLETE
-    assert len(coll.items) == _resolve(expect, "length")
+    assert len(out) == _resolve(expect, "length")
     for gap in expect.get("default_ids", []):
-        assert coll.items[gap] is None, f"id {gap} should have kept the default"
+        assert out[gap] == _element_default(case), (
+            f"id {gap} should have kept the element default"
+        )
 
 
 @pytest.mark.skipif(not CASES, reason="vectors carry no sequence_growth block")
