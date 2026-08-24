@@ -11,7 +11,8 @@
     "floats": "finite values as JSON numbers; +/-infinity as the strings 'inf'/'-inf'",
     "blob.value_hex": "lowercase hex of the blob payload",
     "array.element_type": "input element width/type fed to the encoder (u8..u64, i8..i64, fp32, fp64)",
-    "invalid_utf8": "NEGATIVE vectors: a `string` field (id 0) whose bytes are not valid UTF-8. A strict (SOFAB_STRICT_UTF8) build MUST decode serialized_hex to the INVALID outcome and refuse to encode string_hex with the invalid-argument error. Backward-compatible: consumers that only read 'vectors' ignore this key. See test_vectors_README.md."
+    "invalid_utf8": "NEGATIVE vectors: a `string` field (id 0) whose bytes are not valid UTF-8. A strict (SOFAB_STRICT_UTF8) build MUST decode serialized_hex to the INVALID outcome and refuse to encode string_hex with the invalid-argument error. Backward-compatible: consumers that only read 'vectors' ignore this key. See test_vectors_README.md.",
+    "sequence_growth": "GROWTH cases (CORELIB_PLAN S7.2 item 8): a wrapper array's length is highest present id + 1 (MESSAGE_SPEC S5.1), so its container grows as elements arrive -- the one allocation shape where growth is conformant (ARCHITECTURE S9.5). A case is keyed by a DELIVERY SEQUENCE OF ELEMENT IDS, not by bytes, because two ports that grow differently emit identical bytes: the port builds the message from 'deliver' and asserts 'expect'. Indices are CAP-RELATIVE -- 'id_from_cap'/'length_from_cap' are offsets added to the port's own configured max_dyn_array_count, which is per-target and never a family-wide number; every case assumes a cap of at least 4. Gated by requires 'dynamic_arrays': statically bounded profiles (C, C++ corelib: c-cpp, Rust no_std) never grow and do not run this block. Expectations come from ARCHITECTURE S9.5 and CORELIB_PLAN S7.2 item 8, NOT from the generating implementation, which authors these cases without executing them. Backward-compatible: consumers that only read 'vectors' ignore this key. See test_vectors_README.md."
   },
   "vectors": [
     {
@@ -1257,6 +1258,138 @@
       "serialized_hex": "0212e282",
       "decode_outcome": "invalid",
       "encode_outcome": "invalid_argument"
+    }
+  ],
+  "sequence_growth": [
+    {
+      "name": "growth_index_at_cap_minus_one",
+      "group": "growth/index",
+      "description": "Two string elements, at id 0 and at the last legal index (cap-1). The array is cap long although two elements arrived: a sparse array allocates by its highest id, not by how many elements were delivered. The at-cap-1 index is accepted (ARCHITECTURE S9.5).",
+      "requires": ["sequence", "fixlen", "dynamic_arrays"],
+      "field_id": 0,
+      "element_type": "string",
+      "deliver": [
+        { "id": 0, "value": "a" },
+        { "id_from_cap": -1, "value": "b" }
+      ],
+      "expect": {
+        "outcome": "complete",
+        "length_from_cap": 0
+      }
+    },
+    {
+      "name": "growth_index_at_cap",
+      "group": "growth/index",
+      "description": "A string element at id 0, then one at the cap itself. max_dyn_array_count binds the element INDEX for a wrapper array (there is no count header to bind), so id >= cap is LimitExceeded -- checked BEFORE the container grows, so nothing is allocated for it. A policy rejection, not INVALID: the bytes are well-formed and decode under a looser cap (CORELIB_PLAN S6.2.1).",
+      "requires": ["sequence", "fixlen", "dynamic_arrays"],
+      "field_id": 0,
+      "element_type": "string",
+      "deliver": [
+        { "id": 0, "value": "a" },
+        { "id_from_cap": 0, "value": "b" }
+      ],
+      "expect": {
+        "outcome": "limit_exceeded",
+        "terminal": true,
+        "max_length": 1
+      }
+    },
+    {
+      "name": "growth_gap_filled",
+      "group": "growth/gap",
+      "description": "String elements at ids 0, 2 and 3 -- id 1 is an interior element equal to its default and so MUST NOT be written (MESSAGE_SPEC S5.1). The gap is well-formed: the array is 4 long, id 1 holds the element default, and the gap neither shortens nor shifts the array.",
+      "requires": ["sequence", "fixlen", "dynamic_arrays"],
+      "field_id": 0,
+      "element_type": "string",
+      "deliver": [
+        { "id": 0, "value": "a" },
+        { "id": 2, "value": "c" },
+        { "id": 3, "value": "d" }
+      ],
+      "expect": {
+        "outcome": "complete",
+        "length": 4,
+        "default_ids": [1]
+      }
+    },
+    {
+      "name": "growth_no_partial_extension",
+      "group": "growth/reject",
+      "description": "A string element at id 0, then one at the cap (rejected), then one at id 1. The rejection is terminal (CORELIB_PLAN S6.3), and the container must not be left extended toward the rejected index: the check runs before the grow, so the length never passes what legitimately arrived.",
+      "requires": ["sequence", "fixlen", "dynamic_arrays"],
+      "field_id": 0,
+      "element_type": "string",
+      "deliver": [
+        { "id": 0, "value": "a" },
+        { "id_from_cap": 0, "value": "x" },
+        { "id": 1, "value": "b" }
+      ],
+      "expect": {
+        "outcome": "limit_exceeded",
+        "terminal": true,
+        "max_length": 1
+      }
+    },
+    {
+      "name": "growth_empty_array",
+      "group": "growth/length",
+      "description": "A wrapper array framed empty -- the explicit-empty form, with no element at all. There is no highest present id, so the length is 0 and the container never grows (MESSAGE_SPEC S5.1). The zero end of the range the cap bounds at the other.",
+      "requires": ["sequence", "dynamic_arrays"],
+      "field_id": 0,
+      "element_type": "string",
+      "deliver": [],
+      "expect": {
+        "outcome": "complete",
+        "length": 0
+      }
+    },
+    {
+      "name": "growth_single_at_cap_minus_one",
+      "group": "growth/index",
+      "description": "One string element, at cap-1, with nothing before it. The array is still cap long: the length is highest present id + 1 whatever the delivery order or count, so a single element at the boundary is the whole allocation on its own.",
+      "requires": ["sequence", "fixlen", "dynamic_arrays"],
+      "field_id": 0,
+      "element_type": "string",
+      "deliver": [
+        { "id_from_cap": -1, "value": "a" }
+      ],
+      "expect": {
+        "outcome": "complete",
+        "length_from_cap": 0
+      }
+    },
+    {
+      "name": "growth_index_at_cap_minus_one_struct",
+      "group": "growth/index",
+      "description": "growth_index_at_cap_minus_one with STRUCT elements: each element is a framed sub-sequence carrying one unsigned field at id 0, not a leaf. A framed element reaches the container through the collector's sequence path rather than its leaf path, so the boundary is asserted on both. The verdict is the same -- the bound is the index, never the element kind.",
+      "requires": ["sequence", "dynamic_arrays"],
+      "field_id": 0,
+      "element_type": "struct",
+      "deliver": [
+        { "id": 0, "value": 1 },
+        { "id_from_cap": -1, "value": 2 }
+      ],
+      "expect": {
+        "outcome": "complete",
+        "length_from_cap": 0
+      }
+    },
+    {
+      "name": "growth_index_at_cap_struct",
+      "group": "growth/index",
+      "description": "growth_index_at_cap with STRUCT elements: an over-cap index is LimitExceeded on the framed element path too, before the frame is applied and before the container grows.",
+      "requires": ["sequence", "dynamic_arrays"],
+      "field_id": 0,
+      "element_type": "struct",
+      "deliver": [
+        { "id": 0, "value": 1 },
+        { "id_from_cap": 0, "value": 2 }
+      ],
+      "expect": {
+        "outcome": "limit_exceeded",
+        "terminal": true,
+        "max_length": 1
+      }
     }
   ]
 }

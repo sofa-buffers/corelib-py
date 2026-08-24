@@ -625,6 +625,17 @@ ruff check src/sofab tests   # lint
 mypy --strict src/sofab      # type-check
 ```
 
+`assets/test_vectors.json` is the shared cross-language suite, copied verbatim
+from `corelib-c-cpp`. Its `sequence_growth` block describes a **wrapper array's
+container** growing as elements arrive — a length no wire word announces, since
+MESSAGE_SPEC §5.1 makes it *highest present id + 1*. That container belongs to
+the layer above the codec, and this port ships no such layer, so the suite
+supplies one and asserts what the codec owes it: each element's index surfaced
+unrenumbered before anything is extended, and a rejection at an index that is
+terminal. Growth **geometry** — extending to at least `id + 1` so a sparse array
+does not cost O(n²) copies — is therefore not a property of anything here to
+measure.
+
 If the compile fails or no compiler is available, the install falls back to
 pure-Python (the extension is marked *optional* in `setup.py`). Both engines
 ship, so both are run:

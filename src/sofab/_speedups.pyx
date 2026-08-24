@@ -1825,6 +1825,8 @@ cdef class Decoder:
     cdef object _buf
     # The caller's reassembly buffer, and the span of it holding a construct
     # that spans a chunk boundary. See the pure engine for what it is for.
+    # A latched receiver-limit rejection -- see the pure engine.
+    cdef object _limit
     cdef object _rbuf
     cdef Py_ssize_t _rstart
     cdef Py_ssize_t _rend
@@ -1906,6 +1908,7 @@ cdef class Decoder:
         self._tsp = 0
         self._status = <int>Status.COMPLETE
         self._err = None
+        self._limit = None
         self._resume_kind = _R_NONE
         self._resume_entry = -1
         self._running = False
@@ -2798,6 +2801,8 @@ cdef class Decoder:
         cdef object buf
         if self._running:
             raise SofaRangeError("feed() is not re-entrant")
+        if self._limit is not None:
+            raise self._limit
         if self._status == <int>Status.INVALID:
             return Status.INVALID
         # Two shapes, because they want opposite things.
@@ -2837,6 +2842,13 @@ cdef class Decoder:
         except SofaIncompleteError:
             self._status = <int>Status.INCOMPLETE
             return Status.INCOMPLETE
+        except SofaLimitError as exc:
+            # §6.3: a terminal, receiver-local policy rejection -- see the pure
+            # engine. Raised by this decoder's own check or by a handler deciding
+            # on an index the codec surfaced (§6.2.1).
+            self._limit = exc
+            self._err = exc
+            raise
         except SofaDecodeError as exc:
             self._err = exc
             self._status = <int>Status.INVALID
@@ -2923,6 +2935,7 @@ cdef class Decoder:
         self._keep_cur_wtype = -1
         self._status = <int>Status.COMPLETE
         self._err = None
+        self._limit = None
         self._resume_kind = _R_NONE
         self._resume_entry = -1
         self._tsp = 0

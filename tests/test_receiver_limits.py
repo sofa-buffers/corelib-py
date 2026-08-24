@@ -19,7 +19,14 @@ import pytest
 from vectors import DECODER_ENGINES as ENGINES
 from vectors import Recorder
 
-from sofab import ARRAY_MAX, FIXLEN_MAX, Encoder, SofaLimitError, SofaRangeError
+from sofab import (
+    ARRAY_MAX,
+    FIXLEN_MAX,
+    Encoder,
+    SofaLimitError,
+    SofaRangeError,
+    Status,
+)
 
 NAMES = ("max_dyn_array_count", "max_dyn_string_len", "max_dyn_blob_len")
 CEILINGS = {
@@ -146,3 +153,99 @@ def test_the_limit_leaves_a_reassembly_buffer_untouched(engine):
     with pytest.raises(SofaLimitError):
         dec.feed(bytes([0x0A]) + _uvarint((1_000_000 << 3) | 0x3))
     assert buf == bytearray(64)
+
+
+# --- a limit rejection is terminal (§6.3) -----------------------------------
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_limit_rejection_is_terminal(engine):
+    """§6.3: `LimitExceeded` is "a terminal, receiver-local policy rejection".
+
+    Every later feed re-raises it and consumes nothing, so a caller cannot walk
+    on past a rejection it caught -- and the fields behind the refused one are
+    never delivered.
+    """
+    enc = Encoder()
+    enc.write_string(1, "x" * 2000)
+    enc.write_unsigned(2, 7)
+    enc.flush()
+
+    rec = Recorder()
+    dec = engine(visitor=rec, max_dyn_string_len=16)
+    with pytest.raises(SofaLimitError):
+        dec.feed(enc.getvalue())
+    assert rec.events == []
+
+    for _ in range(2):
+        with pytest.raises(SofaLimitError):
+            dec.feed(b"")
+        assert rec.events == []
+
+    tail = Encoder()
+    tail.write_unsigned(9, 1)
+    tail.flush()
+    with pytest.raises(SofaLimitError):
+        dec.feed(tail.getvalue())
+    assert rec.events == []
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_limit_a_handler_raised_is_terminal_too(engine):
+    """§6.2.1 gives the codec the report and the visitor the decision -- for a
+    sequence array's element index there is no count header, so the decision is
+    the handler's. A rejection reached that way is the same terminal rejection.
+    """
+
+    class Picky(Recorder):
+        def on_sequence_begin(self, field_id):
+            if field_id >= 4:
+                raise SofaLimitError(f"element index {field_id} is past my cap")
+            return super().on_sequence_begin(field_id)
+
+    enc = Encoder()
+    enc.write_sequence_begin_lazy(0)
+    enc.write_sequence_begin_lazy(9)
+    enc.write_unsigned(0, 1)
+    enc.write_sequence_end_keep()
+    enc.write_sequence_end_keep()
+    enc.flush()
+
+    rec = Picky()
+    dec = engine(visitor=rec)
+    with pytest.raises(SofaLimitError):
+        dec.feed(enc.getvalue())
+    with pytest.raises(SofaLimitError):
+        dec.feed(b"")
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_the_rejection_is_on_the_error_channel_not_the_status(engine):
+    """§6.3 leaves the surfacing open between "a fourth decode outcome" and "a
+    terminal failure carrying the LimitExceeded code on the error channel".
+    This port takes the second: the bytes are well formed, so the status never
+    becomes INVALID, and `error` is where the rejection is."""
+    enc = Encoder()
+    enc.write_string(1, "x" * 2000)
+    enc.flush()
+    dec = engine(visitor=Recorder(), max_dyn_string_len=16)
+    with pytest.raises(SofaLimitError) as caught:
+        dec.feed(enc.getvalue())
+    assert dec.error is caught.value
+    assert dec.status is not Status.INVALID
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_reset_clears_the_rejection(engine):
+    enc = Encoder()
+    enc.write_string(1, "x" * 2000)
+    enc.flush()
+    dec = engine(visitor=Recorder(), max_dyn_string_len=16)
+    with pytest.raises(SofaLimitError):
+        dec.feed(enc.getvalue())
+    dec.reset()
+    assert dec.error is None
+    small = Encoder()
+    small.write_string(1, "ok")
+    small.flush()
+    assert dec.feed(small.getvalue()) is Status.COMPLETE
