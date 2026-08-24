@@ -643,6 +643,23 @@ Encoding never allocates an output buffer at all (§5.1).
   buffer itself, never a copy of it and never any other memory. A sink that only
   reads or copies during the call may let the view go; one that keeps it has
   *taken* the buffer and must install a replacement before it returns (below).
+* **The handles this codec allocates, in full.** CORELIB_PLAN §6.6.2 lets a
+  codec allocate a *typed handle* where the language will not express a copy
+  without one, provided it carries no message bytes and no wire number sizes it —
+  and asks for the list. Python's only way to name a region of someone else's
+  buffer is a `memoryview`, so this port allocates four kinds and no others:
+
+  | handle | when |
+  |---|---|
+  | over the output buffer | one per installation (`buffer_set`), plus one full-buffer slice kept for the installation and handed to the sink at every flush of it; a short final flush builds and drops one |
+  | over the input buffer | one per `bytes` taken out of an accumulating `bytearray`, so the payload is copied once instead of twice |
+  | over a decode destination | one per `on_array_begin` / `on_blob_begin` that returns a buffer |
+  | over the words buffer | one per `Binding` decoder, at construction |
+
+  None of them holds a decoded value, and each costs the same whatever the
+  payload's size. Everything else the codec touches after construction is the
+  caller's storage.
+
 * **The start offset belongs to the installation, not to the buffer.** A flush
   sink that returns **without** installing anything has *copied* the bytes it was
   handed: the same buffer stays active and encoding resumes at offset 0. A sink
