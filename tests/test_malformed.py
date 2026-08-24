@@ -14,12 +14,12 @@ from sofab import (
     Decoder,
     Encoder,
     FixlenSubtype,
+    SofaArgumentError,
     SofaBufferError,
     SofaDecodeError,
     SofaError,
     SofaIncompleteError,
     SofaLimitError,
-    SofaRangeError,
     WireType,
 )
 
@@ -625,13 +625,13 @@ def test_limit_error_is_not_a_decode_or_incomplete_error():
 
 def test_encode_id_out_of_range():
     enc = Encoder()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_unsigned(0x80000000, 0)
 
 
 def test_encode_unsigned_out_of_range():
     enc = Encoder()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_unsigned(0, 1 << 64)
 
 
@@ -657,13 +657,13 @@ def test_encode_nesting_beyond_max_depth_rejected():
     enc = Encoder()
     for i in range(MAX_DEPTH):  # 255 nested sequences are allowed
         enc.write_sequence_begin_lazy(i % 100)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_sequence_begin_lazy(0)  # the 256th must be refused
 
 
 def test_sequence_end_without_begin():
     enc = Encoder()
-    with pytest.raises(SofaRangeError):  # §6.3 InvalidArgument — a caller mistake
+    with pytest.raises(SofaArgumentError):  # §6.3 InvalidArgument — a caller mistake
         enc.write_sequence_end()
 
 
@@ -694,7 +694,7 @@ def test_sticky_mode_records_first_error_and_noops():
     enc.write_unsigned(0, 1 << 64)  # range error, recorded
     enc.write_unsigned(1, 5)  # becomes a no-op
     assert enc.error is not None
-    assert isinstance(enc.error, SofaRangeError)
+    assert isinstance(enc.error, SofaArgumentError)
     assert enc.getvalue() == b""
 
 

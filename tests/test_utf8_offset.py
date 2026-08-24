@@ -40,8 +40,8 @@ from vectors import Recorder, Status, raise_for, uvarint, values, verdict, walk
 from sofab import (
     Encoder,
     FixlenSubtype,
+    SofaArgumentError,
     SofaDecodeError,
-    SofaRangeError,
     WireType,
 )
 
@@ -223,7 +223,7 @@ def test_encoder_rejects_a_late_surrogate_in_a_long_string():
     the value it is, and nothing may reach the wire for the refused field."""
     enc = Encoder()
     enc.write_string(0, "keep me")
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_string(1, "a" * 4096 + "\ud800" + "b" * 4096)
     # Only the first field is on the wire; the refused one left nothing behind.
     assert enc.getvalue() == _fixlen(0, FixlenSubtype.STRING, b"keep me")

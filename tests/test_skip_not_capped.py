@@ -34,7 +34,7 @@ import pytest
 from vectors import DECODER_ENGINES as ENGINES
 from vectors import Recorder, Status, bound, walk
 
-from sofab import Binding, Encoder, SofaLimitError, SofaRangeError
+from sofab import Binding, Encoder, SofaArgumentError, SofaLimitError
 
 # The issue's own message: a 100-byte blob at id 7 the handler does not want,
 # with a cap of 10 -- and a plain field on either side of it, so a skip that
@@ -124,7 +124,7 @@ def test_the_callers_reassembly_buffer_is_what_bounds_a_skip(engine):
     somewhere, and §6.6.2 makes that somewhere the caller's buffer. So the
     memory a skip can cost is bounded -- by the buffer the caller sized, not by
     a policy limit -- and a payload that does not fit is refused on
-    :class:`SofaRangeError`.
+    :class:`SofaArgumentError`.
 
     That is the right channel for it: a capacity fact about the caller's own
     storage, not a policy verdict on the message. The bytes are well formed, and
@@ -145,7 +145,7 @@ def test_the_callers_reassembly_buffer_is_what_bounds_a_skip(engine):
         max_dyn_blob_len=CAP,
         reassembly=bytearray(16),
     )
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         for off in range(0, len(data), 8):
             dec.feed(data[off : off + 8])
 

@@ -60,11 +60,11 @@ from .types import (
     MAX_DEPTH,
     Field,
     FixlenSubtype,
+    SofaArgumentError,
     SofaDecodeError,
     SofaError,
     SofaIncompleteError,
     SofaLimitError,
-    SofaRangeError,
     Status,
     WireType,
 )
@@ -129,12 +129,12 @@ def _writable(dst: Any, who: str) -> memoryview:
     try:
         view = memoryview(dst)
     except TypeError as exc:
-        raise SofaRangeError(
+        raise SofaArgumentError(
             f"{who} returned a destination that is not a writable, "
             "contiguous buffer"
         ) from exc
     if view.readonly or not view.c_contiguous:
-        raise SofaRangeError(
+        raise SofaArgumentError(
             f"{who} returned a destination that is not a writable, "
             "contiguous buffer"
         )
@@ -172,7 +172,7 @@ class Decoder:
     same or treat ``None`` as "not my field". A read issued when there is **no**
     pending value at all — before the first :meth:`next`, twice for one field, or
     on a sequence start/end — is a caller mistake and raises
-    :class:`sofab.SofaRangeError`.
+    :class:`sofab.SofaArgumentError`.
     """
 
     # Every attribute this decoder holds, declared rather than left to an
@@ -272,7 +272,7 @@ class Decoder:
         :meth:`sofab.Visitor.on_array_begin`, which those hooks size themselves
         after being told the announced length or count. There the destination's
         own size is the ceiling, and a short one is
-        :class:`SofaRangeError` rather than a policy rejection.
+        :class:`SofaArgumentError` rather than a policy rejection.
 
         **There is no unset state and no unlimited mode** (§6.2.1): "unbounded by
         the schema" is still bounded by the receiver. ``None`` is refused rather
@@ -287,7 +287,7 @@ class Decoder:
         than a policy rejection (§6.2.1).
         """
         if binding is None and visitor is None:
-            raise SofaRangeError("a decoder needs a field handler (binding / visitor)")
+            raise SofaArgumentError("a decoder needs a field handler (binding / visitor)")
         for name, value, ceiling in (
             ("max_dyn_array_count", max_dyn_array_count, ARRAY_MAX),
             ("max_dyn_string_len", max_dyn_string_len, FIXLEN_MAX),
@@ -296,9 +296,9 @@ class Decoder:
             if value is ceiling:
                 continue  # a default: the ceiling is what the check would accept
             if value is None:
-                raise SofaRangeError(f"{name} has no unset state (§6.2.1)")
+                raise SofaArgumentError(f"{name} has no unset state (§6.2.1)")
             if value < 0 or value > ceiling:
-                raise SofaRangeError(
+                raise SofaArgumentError(
                     f"{name}={value} is outside 0..{ceiling}"
                 )
         self._max_dyn_array_count = max_dyn_array_count
@@ -334,7 +334,7 @@ class Decoder:
             # PyByteArray_AS_STRING. Widening this would mean two buffer
             # protocols where §5.3 wants one behaviour.
             if not isinstance(reassembly, bytearray):
-                raise SofaRangeError("reassembly must be a bytearray")
+                raise SofaArgumentError("reassembly must be a bytearray")
             self._rbuf = reassembly
         self._buf: bytes | bytearray = b""
         # len(self._buf), kept in step with it. The buffer only ever changes in
@@ -398,15 +398,15 @@ class Decoder:
         self._wd: Any = None
         if binding is not None:
             if words is None:
-                raise SofaRangeError("a binding needs a words buffer")
+                raise SofaArgumentError("a binding needs a words buffer")
             raw = memoryview(words)
             if raw.readonly:
-                raise SofaRangeError("the words buffer must be writable")
+                raise SofaArgumentError("the words buffer must be writable")
             raw = raw.cast("B")
             if raw.nbytes % 8:
-                raise SofaRangeError("the words buffer must be a multiple of 8 bytes")
+                raise SofaArgumentError("the words buffer must be a multiple of 8 bytes")
             if raw.nbytes < binding.tree_words_required * 8:
-                raise SofaRangeError(
+                raise SofaArgumentError(
                     f"words buffer holds {raw.nbytes // 8} slots, "
                     f"the binding needs {binding.tree_words_required}"
                 )
@@ -415,9 +415,9 @@ class Decoder:
             self._wd = raw.cast("d")
             if objects is None:
                 if binding.tree_objects_required:
-                    raise SofaRangeError("a binding with string/blob fields needs objects")
+                    raise SofaArgumentError("a binding with string/blob fields needs objects")
             elif len(objects) < binding.tree_objects_required:
-                raise SofaRangeError(
+                raise SofaArgumentError(
                     f"objects holds {len(objects)} entries, "
                     f"the binding needs {binding.tree_objects_required}"
                 )
@@ -1067,7 +1067,7 @@ class Decoder:
         ``INVALID`` (§6.3).
         """
         if self._running:
-            raise SofaRangeError("feed() is not re-entrant")
+            raise SofaArgumentError("feed() is not re-entrant")
         if self._limit is not None:
             raise self._limit
         if self._status is Status.INVALID:
@@ -1157,7 +1157,7 @@ class Decoder:
                 r[:held] = r[self._rstart : self._rend]
                 self._rstart, self._rend = 0, held
             if held + n > len(r):
-                raise SofaRangeError(
+                raise SofaArgumentError(
                     f"reassembly buffer holds {len(r)} bytes; the construct "
                     f"spanning this chunk needs {held + n}"
                 )
@@ -1191,7 +1191,7 @@ class Decoder:
             self._rstart = self._pos
             return
         if carry > len(r):
-            raise SofaRangeError(
+            raise SofaArgumentError(
                 f"reassembly buffer holds {len(r)} bytes; the construct "
                 f"spanning this chunk needs {carry}"
             )
@@ -1601,11 +1601,11 @@ class Decoder:
         """
         view = _writable(dst, "on_blob_begin")
         if view.itemsize != 1:
-            raise SofaRangeError(
+            raise SofaArgumentError(
                 "on_blob_begin's destination must hold single bytes"
             )
         if view.nbytes < size:
-            raise SofaRangeError(
+            raise SofaArgumentError(
                 f"on_blob_begin returned {view.nbytes} bytes for a blob of {size}"
             )
         self._keep = pos = self._pos
@@ -1685,7 +1685,7 @@ class Decoder:
         view = _writable(dst, "on_array_begin")
         isz = view.itemsize
         if isz not in (1, 2, 4, 8):
-            raise SofaRangeError(
+            raise SofaArgumentError(
                 f"on_array_begin's destination holds {isz}-byte items; "
                 "1, 2, 4 or 8 are supported"
             )
@@ -1694,12 +1694,12 @@ class Decoder:
         # without a second test per element -- and refused rather than silently
         # truncated.
         if isz != 8 and not _width_fits(isz, zigzag, lo, hi):
-            raise SofaRangeError(
+            raise SofaArgumentError(
                 "on_array_begin declared a width that does not fit its "
                 f"{isz}-byte destination"
             )
         if view.nbytes < count * isz:
-            raise SofaRangeError(
+            raise SofaArgumentError(
                 f"on_array_begin returned {view.nbytes // isz} slots "
                 f"for an array of {count}"
             )

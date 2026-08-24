@@ -21,7 +21,7 @@ import io
 import pytest
 from vectors import build_full_scale
 
-from sofab import MIN_OUTPUT_BUFFER, SofaRangeError
+from sofab import MIN_OUTPUT_BUFFER, SofaArgumentError
 from sofab.encoder import _SCRATCH_SIZE as PY_SCRATCH
 from sofab.encoder import Encoder as PyEncoder
 
@@ -157,7 +157,7 @@ def test_writer_model_refuses_getvalue(enc_cls):
     "partial output as if it were complete" (§5.1)."""
     enc = enc_cls(io.BytesIO())
     enc.write_unsigned(1, 7)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.getvalue()
 
 
@@ -167,7 +167,7 @@ def test_convenience_buffers_are_sink_installed(enc_cls):
     encoder mid-stream is bound by MIN_OUTPUT_BUFFER like any other (§5.1) —
     the convenience models are not a second, unchecked ownership model."""
     for enc in (enc_cls(), enc_cls(io.BytesIO())):
-        with pytest.raises(SofaRangeError):
+        with pytest.raises(SofaArgumentError):
             enc.buffer_set(bytearray(MIN_OUTPUT_BUFFER - 1), 0)
         enc.buffer_set(bytearray(MIN_OUTPUT_BUFFER), 0)  # exactly the minimum: fine
 

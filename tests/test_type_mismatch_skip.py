@@ -9,7 +9,7 @@ following ``next()`` (or an explicit ``skip()``) discards it.
 
 The other half of what the removed ``SofaStateError`` used to cover is a genuine
 caller mistake — a read with **no** pending value at all — for which §6.3 has one
-code, ``InvalidArgument`` → :class:`SofaRangeError`.
+code, ``InvalidArgument`` → :class:`SofaArgumentError`.
 
 Both engines carry independent copies of these checks, so every test runs on the
 pure-Python classes *and* on the compiled accelerator when it is present: a split
@@ -25,7 +25,7 @@ import sofab
 from sofab import Binding
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
-from sofab.types import SofaError, SofaLimitError, SofaRangeError
+from sofab.types import SofaArgumentError, SofaError, SofaLimitError
 
 _ENGINES = [(PyEncoder, PyDecoder)]
 try:  # the native accelerator, when compiled in, must behave identically
@@ -53,9 +53,9 @@ def _feed(Decoder, build, binding, **kw):
 def test_no_invalid_usage_class_exists():
     """§6.3 fixes the taxonomy at five codes and has none for "invalid usage".
     The old class is gone and so is the alias that briefly stood in for it, so a
-    caller mistake is a :class:`SofaRangeError` (§6.3 ``InvalidArgument``) and
+    caller mistake is a :class:`SofaArgumentError` (§6.3 ``InvalidArgument``) and
     nothing else names the removed category."""
-    assert issubclass(SofaRangeError, SofaError)
+    assert issubclass(SofaArgumentError, SofaError)
     assert not hasattr(sofab, "SofaStateError")
 
 
@@ -196,9 +196,9 @@ def test_a_contradicting_binding_inside_a_sequence(Encoder, Decoder):
 
 @engine
 def test_sequence_end_without_begin_is_invalid_argument(Encoder, Decoder):
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_sequence_end()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_sequence_end_keep()
 
 
@@ -206,7 +206,7 @@ def test_sequence_end_without_begin_is_invalid_argument(Encoder, Decoder):
 def test_getvalue_on_a_caller_owned_buffer_is_invalid_argument(Encoder, Decoder):
     enc = Encoder.over_buffer(bytearray(16), offset=0)
     enc.write_unsigned(1, 7)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.getvalue()
 
 
@@ -214,7 +214,7 @@ def test_getvalue_on_a_caller_owned_buffer_is_invalid_argument(Encoder, Decoder)
 def test_sticky_mode_latches_the_invalid_argument(Encoder, Decoder):
     enc = Encoder(sticky=True)
     enc.write_sequence_end()  # no matching begin → latched, not raised
-    assert isinstance(enc.error, SofaRangeError)
+    assert isinstance(enc.error, SofaArgumentError)
 
 
 def test_array_shrank_mid_encode_is_invalid_argument():
@@ -231,7 +231,7 @@ def test_array_shrank_mid_encode_is_invalid_argument():
             return 1
 
     values.extend([Evil(), 2, 3])
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         sp.Encoder().write_unsigned_array(1, values)
 
 

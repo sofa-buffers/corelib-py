@@ -65,7 +65,7 @@ from .types import (
     SIGNED_MIN,
     UNSIGNED_MAX,
     FixlenSubtype,
-    SofaRangeError,
+    SofaArgumentError,
     WireType,
 )
 
@@ -386,11 +386,11 @@ class Binding:
         A sequence with no binding is skipped whole, sub-tree and all — the
         auto-skip §5.2 requires — and costs nothing but the walk."""
         if not isinstance(child, Binding):
-            raise SofaRangeError("sequence child must be a Binding")
+            raise SofaArgumentError("sequence child must be a Binding")
         if child._frozen and not self._frozen:
             # The child is already closed, so binding it here would extend a
             # frozen tree by the back door.
-            raise SofaRangeError("sequence child is already in use by a decoder")
+            raise SofaArgumentError("sequence child is already in use by a decoder")
         return self._add(K_SEQUENCE, field_id, 0, 0, count_at, child)
 
     # --- internals ----------------------------------------------------------
@@ -407,27 +407,27 @@ class Binding:
         elem_hi: Any = None,
     ) -> Binding:
         if self._frozen:
-            raise SofaRangeError(
+            raise SofaArgumentError(
                 "this binding is already in use by a decoder; build the table "
                 "before the decoder, not after"
             )
         fid = _index(field_id, "field id")
         if fid < 0 or fid > ID_MAX:
-            raise SofaRangeError(f"field id {fid} out of range")
+            raise SofaArgumentError(f"field id {fid} out of range")
         if fid in self._by_id:
-            raise SofaRangeError(f"field id {fid} is already bound")
+            raise SofaArgumentError(f"field id {fid} is already bound")
         slot = _index(at, "slot index")
         if slot < 0:
-            raise SofaRangeError(f"slot index {slot} out of range")
+            raise SofaArgumentError(f"slot index {slot} out of range")
         n = _index(cap, "capacity")
         if n < 0 or n > (FIXLEN_MAX if kind in _OBJECT_KINDS else ARRAY_MAX):
-            raise SofaRangeError(f"capacity {n} out of range")
+            raise SofaArgumentError(f"capacity {n} out of range")
         if count_at is None:
             cnt = -1
         else:
             cnt = _index(count_at, "count slot")
             if cnt < 0:
-                raise SofaRangeError(f"count slot {cnt} out of range")
+                raise SofaArgumentError(f"count slot {cnt} out of range")
             self._words_required = max(self._words_required, cnt + 1)
 
         if kind in _OBJECT_KINDS:
@@ -441,7 +441,7 @@ class Binding:
         hi = (SIGNED_MAX if kind == K_ARRAY_SIGNED else UNSIGNED_MAX) \
             if elem_hi is None else _index(elem_hi, "elem_max")
         if not (SIGNED_MIN <= lo <= SIGNED_MAX) or not (0 <= hi <= UNSIGNED_MAX):
-            raise SofaRangeError("declared element width out of range")
+            raise SofaArgumentError("declared element width out of range")
         entry = Entry(kind, fid, slot, n, cnt, child, lo, hi,
                       elem_lo is not None or elem_hi is not None)
         self._entries.append(entry)
@@ -454,7 +454,7 @@ def _index(value: Any, what: str) -> int:
     try:
         index: int = value.__index__()
     except AttributeError as exc:
-        raise SofaRangeError(
+        raise SofaArgumentError(
             f"{what} must be an integer, got {type(value).__name__}"
         ) from exc
     return index

@@ -89,7 +89,7 @@ class Visitor:
             the buffer protocol. The decoder writes into it and does **not**
             call the typed hook — the handler already has the values where it
             wanted them, and none of them was ever a Python object. A buffer
-            too short is :class:`sofab.SofaRangeError`; the decoder never grows
+            too short is :class:`sofab.SofaArgumentError`; the decoder never grows
             one (CORELIB_PLAN §6.6).
         ``elem_min`` / ``elem_max``
             The element width the schema declares, or ``None`` for an open
@@ -121,7 +121,7 @@ class Visitor:
         :meth:`on_bytes`. Return a writable, contiguous buffer of at least
         ``size`` bytes and the decoder copies the payload straight into it and
         does **not** call :meth:`on_bytes`. One too short is
-        :class:`sofab.SofaRangeError`; the decoder never grows one
+        :class:`sofab.SofaArgumentError`; the decoder never grows one
         (CORELIB_PLAN §6.6), and the refusal comes at the length word, before a
         byte is written.
 

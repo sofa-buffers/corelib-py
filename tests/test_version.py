@@ -97,3 +97,15 @@ def test_installed_distribution_matches_the_module() -> None:
 
 def test_version_is_exported() -> None:
     assert "__version__" in sofab.__all__
+
+
+def test_the_old_error_name_is_still_importable():
+    """``SofaRangeError`` was renamed to :class:`sofab.SofaArgumentError`, after
+    the ``InvalidArgument`` code it carries (CORELIB_PLAN §6.3). The old name is
+    the same class, not a subclass, so ``except`` and ``isinstance`` on either
+    name catch what the other raises."""
+    import sofab
+
+    assert sofab.SofaRangeError is sofab.SofaArgumentError
+    assert "SofaRangeError" in sofab.__all__
+    assert "SofaArgumentError" in sofab.__all__

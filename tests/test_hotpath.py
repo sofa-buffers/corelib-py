@@ -28,8 +28,8 @@ from sofab.types import (
     SIGNED_MIN,
     UNSIGNED_MAX,
     FixlenSubtype,
+    SofaArgumentError,
     SofaDecodeError,
-    SofaRangeError,
     WireType,
 )
 
@@ -126,7 +126,7 @@ def test_unsigned_domain_accepted(enc_cls, value):
 @pytest.mark.parametrize("value", [-1, -(1 << 63), 1 << 64, (1 << 64) + 1, 1 << 200, -(1 << 200)])
 def test_unsigned_domain_rejected(enc_cls, value):
     enc = enc_cls()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_unsigned(1, value)
 
 
@@ -143,7 +143,7 @@ def test_signed_domain_accepted(enc_cls, value):
 @pytest.mark.parametrize("value", [1 << 63, SIGNED_MIN - 1, 1 << 200, -(1 << 200)])
 def test_signed_domain_rejected(enc_cls, value):
     enc = enc_cls()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_signed(1, value)
 
 
@@ -212,7 +212,7 @@ def test_non_integral_values_are_refused_not_truncated(enc_cls, value):
         ("write_sequence_begin_lazy", (value,)),  # the id that is held back
     ):
         enc = enc_cls()
-        with pytest.raises(SofaRangeError):
+        with pytest.raises(SofaArgumentError):
             getattr(enc, method)(*args)
 
 
@@ -248,7 +248,7 @@ def test_integer_rule_holds_over_a_fixed_buffer_too(enc_cls, value):
             getattr(enc, method)(*args)
             assert enc.bytes_used() > 0
         else:
-            with pytest.raises(SofaRangeError):
+            with pytest.raises(SofaArgumentError):
                 getattr(enc, method)(*args)
 
 
@@ -259,7 +259,7 @@ def test_rejection_is_a_sofa_error_so_sticky_mode_latches_it(enc_cls):
     enc = enc_cls(sticky=True)
     enc.write_unsigned(1, 3.7)
     enc.write_unsigned(2, 5)                     # suppressed: the error latched
-    assert isinstance(enc.error, SofaRangeError)
+    assert isinstance(enc.error, SofaArgumentError)
     assert enc.getvalue() == b""
 
 
@@ -267,11 +267,11 @@ def test_rejection_is_a_sofa_error_so_sticky_mode_latches_it(enc_cls):
 def test_array_element_domain_rejected(enc_cls):
     for elems in ([1, 1 << 64], [1, -1]):
         enc = enc_cls()
-        with pytest.raises(SofaRangeError):
+        with pytest.raises(SofaArgumentError):
             enc.write_unsigned_array(1, elems)
     for elems in ([1, 1 << 63], [1, SIGNED_MIN - 1]):
         enc = enc_cls()
-        with pytest.raises(SofaRangeError):
+        with pytest.raises(SofaArgumentError):
             enc.write_signed_array(1, elems)
 
 
@@ -280,10 +280,10 @@ def test_array_element_domain_rejected_over_fixed_buffer(enc_cls):
     """The fixed-buffer model takes a different element loop; it rejects the
     same values as the growable one."""
     enc = enc_cls.over_buffer(bytearray(64), 0)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_unsigned_array(1, [1, 1 << 64])
     enc = enc_cls.over_buffer(bytearray(64), 0)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_signed_array(1, [1, 1 << 63])
 
 

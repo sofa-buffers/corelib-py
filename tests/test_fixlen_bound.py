@@ -7,7 +7,7 @@ which rejects it in ``Decoder.next``. An encoder that framed a longer payload
 would therefore hand the caller a message no conformant receiver can read, and
 report success while doing it (the encode-side form of §5.1's "never present
 partial output as complete"). The refusal is §6.3's ``InvalidArgument``, i.e.
-:class:`SofaRangeError`, and it happens *before* any byte of the field reaches
+:class:`SofaArgumentError`, and it happens *before* any byte of the field reaches
 the buffer.
 
 The oversized payload here is never materialised: 2 GiB of real bytes is not
@@ -23,7 +23,7 @@ import pytest
 from vectors import ENCODER_ENGINES as ENGINES
 
 from sofab.encoder import Encoder as PyEncoder
-from sofab.types import FIXLEN_MAX, FixlenSubtype, SofaRangeError, WireType
+from sofab.types import FIXLEN_MAX, FixlenSubtype, SofaArgumentError, WireType
 
 
 class OversizedBlob:
@@ -51,7 +51,7 @@ class OversizedBlob:
 class TestBlobOverFixlenMax:
     def test_refused_with_a_range_error(self, engine):
         enc = engine()
-        with pytest.raises(SofaRangeError):
+        with pytest.raises(SofaArgumentError):
             enc.write_bytes(1, OversizedBlob())
 
     def test_nothing_reaches_the_output(self, engine):
@@ -60,14 +60,14 @@ class TestBlobOverFixlenMax:
         # readable prefix rather than a dangling header.
         enc = engine()
         enc.write_unsigned(0, 7)
-        with pytest.raises(SofaRangeError):
+        with pytest.raises(SofaArgumentError):
             enc.write_bytes(1, OversizedBlob())
         assert enc.getvalue() == b"\x00\x07"
 
     def test_nothing_reaches_a_writer_sink(self, engine):
         out = io.BytesIO()
         enc = engine(out)
-        with pytest.raises(SofaRangeError):
+        with pytest.raises(SofaArgumentError):
             enc.write_bytes(1, OversizedBlob())
         enc.flush()
         assert out.getvalue() == b""
@@ -75,7 +75,7 @@ class TestBlobOverFixlenMax:
     def test_sticky_latches_it(self, engine):
         enc = engine(sticky=True)
         enc.write_bytes(1, OversizedBlob())
-        assert isinstance(enc.error, SofaRangeError)
+        assert isinstance(enc.error, SofaArgumentError)
         enc.write_unsigned(2, 1)  # skipped, per sticky mode
         assert enc.getvalue() == b""
 
@@ -96,6 +96,6 @@ def test_pure_choke_point_bounds_the_materialised_length():
     could produce.
     """
     enc = PyEncoder()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc._write_fixlen(1, OversizedBlob(), FixlenSubtype.STRING)
     assert enc.getvalue() == b""

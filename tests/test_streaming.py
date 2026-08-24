@@ -11,8 +11,8 @@ from sofab import (
     MIN_OUTPUT_BUFFER,
     Decoder,
     Encoder,
+    SofaArgumentError,
     SofaBufferError,
-    SofaRangeError,
 )
 from sofab.encoder import Encoder as PyEncoder
 
@@ -68,14 +68,14 @@ def test_buffer_below_the_minimum_is_rejected_where_it_is_handed_over(enc_cls):
     usable = MIN_OUTPUT_BUFFER - 1  # one byte short of the floor
     sink = bytearray().extend
 
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc_cls.over_buffer(bytearray(usable), 0, sink)
     # the same shortfall produced by the start offset rather than by the length
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc_cls.over_buffer(bytearray(16), 16 - usable, sink)
     # a mid-stream buffer-set is the same handover and rejects there too
     enc = enc_cls.over_buffer(bytearray(16), 0, sink)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.buffer_set(bytearray(16), 16 - usable)
 
 

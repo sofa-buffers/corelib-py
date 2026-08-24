@@ -27,10 +27,10 @@ from sofab.types import (
     SIGNED_MAX,
     UNSIGNED_MAX,
     FixlenSubtype,
+    SofaArgumentError,
     SofaBufferError,
     SofaDecodeError,
     SofaIncompleteError,
-    SofaRangeError,
     WireType,
 )
 
@@ -55,41 +55,41 @@ def _hdr(field_id: int, wtype: int) -> bytes:
 
 
 def test_write_signed_out_of_range_raises():
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_signed(0, SIGNED_MAX + 1)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_signed(0, -(1 << 70))
 
 
 def test_write_unsigned_out_of_range_raises():
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_unsigned(0, UNSIGNED_MAX + 1)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_unsigned(0, -1)
 
 
 def test_write_id_out_of_range_raises():
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_unsigned(ID_MAX + 1, 0)
 
 
 def test_unsigned_array_element_out_of_range_raises():
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_unsigned_array(1, [1, 2, UNSIGNED_MAX + 1])
 
 
 def test_signed_array_element_out_of_range_raises():
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_signed_array(1, [0, -(1 << 70)])
 
 
 def test_sequence_end_without_begin_raises():
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_sequence_end()
 
 
 def test_sequence_end_keep_without_begin_raises():
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_sequence_end_keep()
 
 
@@ -99,7 +99,7 @@ def test_sequence_nesting_exceeds_max_depth_raises():
 
     for i in range(MAX_DEPTH):
         enc.write_sequence_begin_lazy(i)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_sequence_begin_lazy(0)
 
 
@@ -114,7 +114,7 @@ def test_sticky_latches_first_error_and_turns_writes_into_noops():
     assert enc.error is None
     enc.write_signed(0, 1 << 70)  # out of range → latches, does not raise
     first = enc.error
-    assert isinstance(first, SofaRangeError)
+    assert isinstance(first, SofaArgumentError)
 
     # every subsequent writer is now a no-op that must not raise
     enc.write_unsigned(1, 5)
@@ -161,7 +161,7 @@ def test_sticky_records_but_does_not_raise_for_each_writer():
 
 def test_buffer_set_offset_out_of_range_raises():
     for offset in (-1, 9):  # before the front / past the end
-        with pytest.raises(SofaRangeError):
+        with pytest.raises(SofaArgumentError):
             Encoder.over_buffer(bytearray(8), offset=offset)
     # offset == len is *in* range: it is a zero-byte buffer, and a buffer
     # installed without a sink is subject to no minimum (CORELIB_PLAN §5.1) —
@@ -179,7 +179,7 @@ def test_fixed_buffer_full_without_sink_raises():
 def test_getvalue_on_fixed_buffer_raises():
     enc = Encoder.over_buffer(bytearray(16), offset=0)
     enc.write_unsigned(1, 7)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.getvalue()
 
 
@@ -399,17 +399,17 @@ def test_a_float_array_binding_on_a_scalar_field_is_skipped():
 
 
 def test_write_string_id_out_of_range_raises():
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_string(ID_MAX + 1, "x")
 
 
 def test_write_bytes_id_out_of_range_raises():
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_bytes(ID_MAX + 1, b"x")
 
 
 def test_write_float_array_id_out_of_range_raises():
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_float32_array(ID_MAX + 1, [1.0])
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         Encoder().write_float64_array(ID_MAX + 1, [1.0])

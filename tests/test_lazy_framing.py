@@ -295,24 +295,24 @@ def test_deep_nesting_commits_the_whole_run_in_order(Encoder, depth):
 def test_depth_bookkeeping_is_unchanged(Encoder):
     """Invariant 5: ``begin_lazy`` still increments depth and still rejects past
     MAX_DEPTH; ``end`` and ``end_keep`` both decrement."""
-    from sofab.types import MAX_DEPTH, SofaRangeError
+    from sofab.types import MAX_DEPTH, SofaArgumentError
 
     enc = Encoder()
     for _ in range(MAX_DEPTH):
         enc.write_sequence_begin_lazy(0)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_sequence_begin_lazy(0)
     enc.write_sequence_end()  # room again
     enc.write_sequence_begin_lazy(0)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_sequence_begin_lazy(0)
 
     # end_keep decrements too: close everything, then over-close.
     for _ in range(MAX_DEPTH):
         enc.write_sequence_end_keep()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_sequence_end_keep()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_sequence_end()
 
 
@@ -321,12 +321,12 @@ def test_begin_lazy_rejects_an_out_of_range_id(Encoder):
     """The id check moved out of the header path (a lazy begin writes no header),
     so it has to be done up front — an invalid id must not sit in the pending run
     waiting to blow up at commit time."""
-    from sofab.types import ID_MAX, SofaRangeError
+    from sofab.types import ID_MAX, SofaArgumentError
 
     enc = Encoder()
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_sequence_begin_lazy(ID_MAX + 1)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         enc.write_sequence_begin_lazy(-1)
     # ...and nothing was left open or pending.
     enc.write_unsigned(0, 1)

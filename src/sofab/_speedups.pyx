@@ -278,7 +278,7 @@ cdef extern from *:
     # carry Cython's own ``except? -1``, which routes every call site through
     # Cython's generic conversion helper. Calling CPython directly lets the hot
     # path decide for itself what a failure means — an out-of-range value must
-    # surface as SofaRangeError, not as the bare OverflowError left pending.
+    # surface as SofaArgumentError, not as the bare OverflowError left pending.
     #
     # They take a *borrowed* pointer so array element loops need no per-element
     # incref/decref pair: nothing in such a loop can run Python code, so the
@@ -513,7 +513,7 @@ from .types import (
     SofaError,
     SofaIncompleteError,
     SofaLimitError,
-    SofaRangeError,
+    SofaArgumentError,
     Status,
     WireType,
 )
@@ -838,7 +838,7 @@ cdef inline int64_t _i64_arg(object value, int what=_WHAT_S) except? -0xDEAD:
     return _i64_elem(<PyObject*>value, what)
 
 cdef object _index_arg(object value, int what):
-    """The int ``value`` losslessly is, or SofaRangeError.
+    """The int ``value`` losslessly is, or SofaArgumentError.
 
     Integer fields accept whatever Python itself accepts where an integer is
     required: an object implementing ``__index__`` (int, bool, IntEnum, NumPy
@@ -851,7 +851,7 @@ cdef object _index_arg(object value, int what):
     try:
         return PyNumber_Index(value)
     except TypeError:
-        raise SofaRangeError("%s must be an integer, not %s"
+        raise SofaArgumentError("%s must be an integer, not %s"
                              % (_WHATS[what], type(value).__name__)) from None
 
 cdef uint64_t _u64_other(object value, int what) except? 0xDEAD:
@@ -861,14 +861,14 @@ cdef uint64_t _u64_other(object value, int what) except? 0xDEAD:
     cdef uint64_t out
     if _IsLongLike(<PyObject*>idx) and _ToU64(<PyObject*>idx, &out):
         return out
-    raise SofaRangeError("%s %d out of range" % (_WHATS[what], idx))
+    raise SofaArgumentError("%s %d out of range" % (_WHATS[what], idx))
 
 cdef int64_t _i64_other(object value, int what) except? -0xDEAD:
     cdef object idx = _index_arg(value, what)
     cdef int64_t out
     if _IsLongLike(<PyObject*>idx) and _ToI64(<PyObject*>idx, &out):
         return out
-    raise SofaRangeError("%s %d out of range" % (_WHATS[what], idx))
+    raise SofaArgumentError("%s %d out of range" % (_WHATS[what], idx))
 
 cdef inline uint64_t _id_arg(object field_id) except? 0xDEAD:
     # Field ids are 0..ID_MAX (2**31-1), so the *value* range is narrower than
@@ -885,13 +885,13 @@ cdef inline uint64_t _id_arg(object field_id) except? 0xDEAD:
             return small
         if _ToI64(<PyObject*>field_id, &r):
             if r < 0 or r > <int64_t>_ID_MAX:
-                raise SofaRangeError("id %d out of range 0..%d" % (field_id, _ID_MAX))
+                raise SofaArgumentError("id %d out of range 0..%d" % (field_id, _ID_MAX))
             return <uint64_t>r
-        raise SofaRangeError("id %d out of range 0..%d" % (field_id, _ID_MAX))
+        raise SofaArgumentError("id %d out of range 0..%d" % (field_id, _ID_MAX))
     idx = _index_arg(field_id, _WHAT_ID)
     if _IsLongLike(<PyObject*>idx) and _ToI64(<PyObject*>idx, &r) and 0 <= r <= <int64_t>_ID_MAX:
         return <uint64_t>r
-    raise SofaRangeError("id %d out of range 0..%d" % (idx, _ID_MAX))
+    raise SofaArgumentError("id %d out of range 0..%d" % (idx, _ID_MAX))
 
 
 # --- array-input plumbing -----------------------------------------------------
@@ -912,7 +912,7 @@ cdef inline PyObject* _elem(list seq, Py_ssize_t i) except NULL:
     # count is already on the wire at this point, so a short read has to be an
     # error rather than a silently truncated array.
     if i >= PyList_GET_SIZE(seq):
-        raise SofaRangeError("array shrank while it was being encoded")
+        raise SofaArgumentError("array shrank while it was being encoded")
     return PyList_GET_ITEM(seq, i)
 
 cdef inline list _as_float_list(object values):
@@ -1071,7 +1071,7 @@ cdef class Encoder:
     def buffer_set(self, bytearray buffer, int offset=0):
         cdef Py_ssize_t size = PyByteArray_GET_SIZE(buffer)
         if not (0 <= <Py_ssize_t>offset <= size):
-            raise SofaRangeError("offset must be within the buffer")
+            raise SofaArgumentError("offset must be within the buffer")
         # MIN_OUTPUT_BUFFER (S5.1) binds a buffer installed *with* a flush sink,
         # here and at every mid-stream set, so an unusable buffer is refused where
         # it is handed over rather than partway through a message. Without a sink
@@ -1079,7 +1079,7 @@ cdef class Encoder:
         # or reports buffer-full -- which is what keeps a caller sizing from a
         # generated MAX_SIZE exact, down to a zero-byte remainder.
         if size - <Py_ssize_t>offset < _MIN_OUTPUT_BUFFER and self._has_sink():
-            raise SofaRangeError(
+            raise SofaArgumentError(
                 "a buffer installed with a flush sink needs at least "
                 "MIN_OUTPUT_BUFFER=%d usable byte(s), got %d"
                 % (_MIN_OUTPUT_BUFFER, size - <Py_ssize_t>offset))
@@ -1306,7 +1306,7 @@ cdef class Encoder:
         # returning an undrained tail would be partial output dressed up as a
         # whole message (S5.1).
         if not self._in_memory:
-            raise SofaRangeError("getvalue() is only valid for the in-memory model")
+            raise SofaArgumentError("getvalue() is only valid for the in-memory model")
         if self._result is None:        # never drained: the message is the prefix
             return PyBytes_FromStringAndSize(
                 <char*>self._fixed_ptr, <Py_ssize_t>self._cursor)
@@ -1367,7 +1367,7 @@ cdef class Encoder:
 
     def write_string(self, object field_id, str text):
         # Strict UTF-8: no errors= argument, so a lone/unpaired surrogate raises
-        # UnicodeEncodeError, which we map to SofaRangeError — the encode-side
+        # UnicodeEncodeError, which we map to SofaArgumentError — the encode-side
         # InvalidArgument outcome (CORELIB_PLAN §6.4 / MESSAGE_SPEC §8). Python
         # str is a Unicode type, hence always strict; SOFAB_STRICT_UTF8 is a
         # no-op and omitted. Mirrors the pure-Python Encoder.write_string.
@@ -1383,7 +1383,7 @@ cdef class Encoder:
         try:
             utf8 = PyUnicode_AsUTF8AndSize(text, &n)
         except UnicodeEncodeError as exc:
-            self._fail(SofaRangeError("string field is not valid UTF-8: %s" % exc))
+            self._fail(SofaArgumentError("string field is not valid UTF-8: %s" % exc))
             return
         self._write_fixlen_raw(field_id, <const unsigned char*>utf8, <size_t>n, _ST_STRING)
 
@@ -1397,7 +1397,7 @@ cdef class Encoder:
         # pure-Python Encoder.write_bytes.
         cdef Py_ssize_t n = len(data)
         if n > <Py_ssize_t>_FIXLEN_MAX:
-            self._fail(SofaRangeError(
+            self._fail(SofaArgumentError(
                 "fixlen payload of %d bytes exceeds FIXLEN_MAX=%d" % (n, _FIXLEN_MAX)))
             return
         cdef bytes b = bytes(data)
@@ -1414,7 +1414,7 @@ cdef class Encoder:
             # unreadable message reported as success (§5.1). Before the header,
             # so a refused field leaves nothing behind.
             if n > <size_t>_FIXLEN_MAX:
-                raise SofaRangeError(
+                raise SofaArgumentError(
                     "fixlen payload of %d bytes exceeds FIXLEN_MAX=%d" % (n, _FIXLEN_MAX))
             self._header(field_id, _WT_FIXLEN)
             self._emit_varint((<uint64_t>n << 3) | <uint64_t>subtype)
@@ -1429,7 +1429,7 @@ cdef class Encoder:
         cdef Py_ssize_t n = PyBytes_GET_SIZE(data)
         try:
             if n > <Py_ssize_t>_FIXLEN_MAX:  # §6.2 — see _write_fixlen_raw
-                raise SofaRangeError(
+                raise SofaArgumentError(
                     "fixlen payload of %d bytes exceeds FIXLEN_MAX=%d" % (n, _FIXLEN_MAX))
             self._header(field_id, _WT_FIXLEN)
             self._emit_varint((<uint64_t>n << 3) | <uint64_t>subtype)
@@ -1528,7 +1528,7 @@ cdef class Encoder:
 
     cdef int _array_header(self, object field_id, int wtype, Py_ssize_t count) except -1:
         if count < 0 or count > <Py_ssize_t>_ARRAY_MAX:
-            raise SofaRangeError("array count %d out of range 0..%d" % (count, _ARRAY_MAX))
+            raise SofaArgumentError("array count %d out of range 0..%d" % (count, _ARRAY_MAX))
         self._header(field_id, wtype)
         self._emit_varint(<uint64_t>count)
         return 0
@@ -1548,7 +1548,7 @@ cdef class Encoder:
             return
         try:
             if self._depth >= _MAX_DEPTH:
-                raise SofaRangeError("nesting exceeds MAX_DEPTH=%d" % _MAX_DEPTH)
+                raise SofaArgumentError("nesting exceeds MAX_DEPTH=%d" % _MAX_DEPTH)
             # This is the one write that does not go through _header — the id is
             # held back rather than emitted — so it applies the same rule itself.
             self._pending_push(<uint32_t>_id_arg(field_id))
@@ -1563,7 +1563,7 @@ cdef class Encoder:
             return
         try:
             if self._depth <= 0:
-                raise SofaRangeError("sequence_end without matching begin")
+                raise SofaArgumentError("sequence_end without matching begin")
             if self._npending:
                 # The innermost open sequence is the last held-back one (the
                 # pending run is a suffix), so dropping it is a plain pop.
@@ -1582,7 +1582,7 @@ cdef class Encoder:
             return
         try:
             if self._depth <= 0:
-                raise SofaRangeError("sequence_end without matching begin")
+                raise SofaArgumentError("sequence_end without matching begin")
             if self._npending:
                 self._commit_pending()
             self._emit_varint(<uint64_t>_WT_SEQUENCE_END)
@@ -1952,7 +1952,7 @@ cdef class Decoder:
         self._rend = 0
         if reassembly is not None:
             if type(reassembly) is not bytearray:
-                raise SofaRangeError("reassembly must be a bytearray")
+                raise SofaArgumentError("reassembly must be a bytearray")
             self._rbuf = reassembly
         # Built on the first descent -- see the pure engine.
         self._vstack = None
@@ -1966,7 +1966,7 @@ cdef class Decoder:
             self._bind_visitor(visitor)
         self._objects = objects
         if binding is None and visitor is None:
-            raise SofaRangeError("a decoder needs a field handler (binding / visitor)")
+            raise SofaArgumentError("a decoder needs a field handler (binding / visitor)")
         if binding is not None:
             self._tables = _compiled_for(binding)
             self._bent = self._tables.bent
@@ -2021,9 +2021,9 @@ cdef class Decoder:
     cdef inline int _check_limit(self, str name, object value, object ceiling) except -1:
         # §6.2.1: no unset state, no unlimited mode, and a domain of 0..ceiling.
         if value is None:
-            raise SofaRangeError("%s has no unset state (§6.2.1)" % name)
+            raise SofaArgumentError("%s has no unset state (§6.2.1)" % name)
         if value < 0 or value > ceiling:
-            raise SofaRangeError("%s=%s is outside 0..%s" % (name, value, ceiling))
+            raise SofaArgumentError("%s=%s is outside 0..%s" % (name, value, ceiling))
         return 0
 
     cdef int _bind_visitor(self, object visitor) except -1:
@@ -2471,7 +2471,7 @@ cdef class Decoder:
         # _skip_pending, which drops the cap (#128). Reached only once a read
         # has found the kind wrong, so the ordinary path never pays for it.
         if self._pk == _PEND_NONE:
-            raise SofaRangeError("no value pending for the current field")
+            raise SofaArgumentError("no value pending for the current field")
         if self._pk == _PEND_LIMIT:
             raise SofaLimitError(self._limit_msg)
         return None
@@ -2652,7 +2652,7 @@ cdef class Decoder:
             if self._pk == _PEND_LIMIT and self._pk_real == _PEND_FIXLEN:
                 return self._pend_size
             if self._pk == _PEND_NONE:
-                raise SofaRangeError("no value pending for the current field")
+                raise SofaArgumentError("no value pending for the current field")
             return None  # §7.3: not a fixlen field, so it has no fixlen length
         return self._pend_size
 
@@ -2786,7 +2786,7 @@ cdef class Decoder:
     cdef int _bind_words(self, object words, object objects) except -1:
         cdef Py_ssize_t need
         if words is None:
-            raise SofaRangeError("a binding needs a words buffer")
+            raise SofaArgumentError("a binding needs a words buffer")
         self._wview = <Py_buffer*>malloc(sizeof(Py_buffer))
         if self._wview == NULL:
             raise MemoryError()
@@ -2798,22 +2798,22 @@ cdef class Decoder:
             # The pure engine reaches the same verdict through memoryview and
             # reports it as §6.3 InvalidArgument. §5.3 requires the accelerator
             # to be invisible, so it must not surface a different exception type.
-            raise SofaRangeError(
+            raise SofaArgumentError(
                 "the words buffer must be a writable, contiguous buffer") from exc
         if self._wview.len % 8:
-            raise SofaRangeError("the words buffer must be a multiple of 8 bytes")
+            raise SofaArgumentError("the words buffer must be a multiple of 8 bytes")
         self._words = <uint64_t*>self._wview.buf
         self._nwords = self._wview.len // 8
         need = self._tables.words_required
         if self._nwords < need:
-            raise SofaRangeError("words buffer holds %d slots, the binding needs %d"
+            raise SofaArgumentError("words buffer holds %d slots, the binding needs %d"
                                  % (self._nwords, need))
         need = self._tables.objects_required
         if objects is None:
             if need:
-                raise SofaRangeError("a binding with string/blob fields needs objects")
+                raise SofaArgumentError("a binding with string/blob fields needs objects")
         elif <Py_ssize_t>len(objects) < need:
-            raise SofaRangeError("objects holds %d entries, the binding needs %d"
+            raise SofaArgumentError("objects holds %d entries, the binding needs %d"
                                  % (len(objects), need))
         return 0
 
@@ -2860,7 +2860,7 @@ cdef class Decoder:
         """
         cdef object buf
         if self._running:
-            raise SofaRangeError("feed() is not re-entrant")
+            raise SofaArgumentError("feed() is not re-entrant")
         if self._limit is not None:
             raise self._limit
         if self._status == <int>Status.INVALID:
@@ -2940,7 +2940,7 @@ cdef class Decoder:
                 self._rstart = 0
                 self._rend = held
             if held + n > len(r):
-                raise SofaRangeError(
+                raise SofaArgumentError(
                     "reassembly buffer holds %d bytes; the construct spanning "
                     "this chunk needs %d" % (len(r), held + n))
         r[self._rend:self._rend + n] = data
@@ -2966,7 +2966,7 @@ cdef class Decoder:
             self._rstart = self._pos
             return 0
         if carry > len(r):
-            raise SofaRangeError(
+            raise SofaArgumentError(
                 "reassembly buffer holds %d bytes; the construct spanning "
                 "this chunk needs %d" % (len(r), carry))
         r[:carry] = self._buf[self._pos:self._n]
@@ -3326,15 +3326,15 @@ cdef class Decoder:
         try:
             PyObject_GetBuffer(dst, &view, PyBUF_WRITABLE | PyBUF_SIMPLE)
         except (BufferError, TypeError) as exc:
-            raise SofaRangeError(
+            raise SofaArgumentError(
                 "on_blob_begin returned a destination that is not a writable, "
                 "contiguous buffer") from exc
         try:
             if view.itemsize != 1:
-                raise SofaRangeError(
+                raise SofaArgumentError(
                     "on_blob_begin's destination must hold single bytes")
             if view.len < size:
-                raise SofaRangeError(
+                raise SofaArgumentError(
                     "on_blob_begin returned %d bytes for a blob of %d"
                     % (view.len, size))
             p = self._take_fixlen_ptr(size)
@@ -3402,13 +3402,13 @@ cdef class Decoder:
         try:
             PyObject_GetBuffer(dst, &view, PyBUF_WRITABLE | PyBUF_SIMPLE)
         except (BufferError, TypeError) as exc:
-            raise SofaRangeError(
+            raise SofaArgumentError(
                 "on_array_begin returned a destination that is not a writable, "
                 "contiguous buffer") from exc
         try:
             isz = view.itemsize
             if isz != 1 and isz != 2 and isz != 4 and isz != 8:
-                raise SofaRangeError(
+                raise SofaArgumentError(
                     "on_array_begin's destination holds %d-byte items; 1, 2, 4 "
                     "or 8 are supported" % isz)
             # A destination narrower than 8 bytes is only safe if the declared
@@ -3416,11 +3416,11 @@ cdef class Decoder:
             # loop can narrow without a second test per element -- and refused
             # rather than silently truncated.
             if isz != 8 and not self._width_fits(isz, zigzag, bounded, clo, chi):
-                raise SofaRangeError(
+                raise SofaArgumentError(
                     "on_array_begin declared a width that does not fit its "
                     "%d-byte destination" % isz)
             if view.len < count * isz:
-                raise SofaRangeError(
+                raise SofaArgumentError(
                     "on_array_begin returned %d slots for an array of %d"
                     % (view.len // isz, count))
             self._fill_varints_at(view.buf, isz, count, zigzag,

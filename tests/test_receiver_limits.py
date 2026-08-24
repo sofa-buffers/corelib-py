@@ -23,8 +23,8 @@ from sofab import (
     ARRAY_MAX,
     FIXLEN_MAX,
     Encoder,
+    SofaArgumentError,
     SofaLimitError,
-    SofaRangeError,
     Status,
 )
 
@@ -39,7 +39,7 @@ CEILINGS = {
 @pytest.mark.parametrize("engine", ENGINES)
 @pytest.mark.parametrize("name", NAMES)
 def test_none_is_refused_there_is_no_unset_state(engine, name):
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         engine(visitor=Recorder(), **{name: None})
 
 
@@ -47,7 +47,7 @@ def test_none_is_refused_there_is_no_unset_state(engine, name):
 @pytest.mark.parametrize("name", NAMES)
 def test_a_limit_outside_its_domain_is_refused(engine, name):
     for bad in (-1, CEILINGS[name] + 1):
-        with pytest.raises(SofaRangeError):
+        with pytest.raises(SofaArgumentError):
             engine(visitor=Recorder(), **{name: bad})
 
 
@@ -159,7 +159,7 @@ def test_a_handlers_own_destination_is_not_the_senders_to_dictate(engine):
 def test_a_destination_too_short_is_a_range_error_not_a_limit(engine):
     """With the cap out of the way, the only ceiling left on the caller's own
     buffer is that buffer's size -- and a count it cannot hold is
-    :class:`SofaRangeError`, never a policy rejection. The decoder is protecting
+    :class:`SofaArgumentError`, never a policy rejection. The decoder is protecting
     itself from an overrun, not judging the message: the bytes are fine, and the
     same message fills a longer destination.
     """
@@ -172,7 +172,7 @@ def test_a_destination_too_short_is_a_range_error_not_a_limit(engine):
     # id 1, unsigned array, count 2**31-1, then one lone element byte.
     wire = bytes([0x0B]) + _uvarint(0x7FFFFFFF) + b"\x01"
     dec = engine(visitor=Handler(), max_dyn_array_count=4)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         dec.feed(wire)
 
 
@@ -205,7 +205,7 @@ def test_the_same_two_answers_for_a_blob(engine):
     # and overrunning it is a range error rather than a policy rejection.
     asked.clear()
     dec = engine(visitor=Handler(bytearray(8)), max_dyn_blob_len=10)
-    with pytest.raises(SofaRangeError):
+    with pytest.raises(SofaArgumentError):
         dec.feed(wire)
     assert asked == [100]
 
