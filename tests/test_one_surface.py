@@ -13,17 +13,32 @@ bounds at ``maxlen=10`` decoded COMPLETE through the binding and raised
 :class:`sofab.SofaLimitError` through the visitor, because §6.2.1's
 schema-bound exemption had been implemented on one route only.
 
-A ``Binding`` is now a :class:`sofab.Visitor` built from the table
-(``sofab.binding.handler``) and nothing else, and the declaration the exemption
-turns on -- what the *schema* bounds a field at -- is a hook on that one
-surface, :meth:`sofab.Visitor.on_schema_bound`. So the two cannot disagree:
-there is one of them. These tests hold that down from both ends -- structurally
-(no engine has a second value path left) and behaviourally (a table and a
-hand-written visitor that declare the same thing reach the same outcome, over a
-matrix of messages and receiver limits, on both engines).
+A table is now reached **through** the one surface, never beside it: a handler
+declares its slots once from :meth:`sofab.Visitor.destinations`, and
+``Decoder(binding=...)`` is the constructor shorthand for a handler that
+declares exactly that. It is the same bargain :meth:`sofab.Visitor.on_string_begin`
+and :meth:`sofab.Visitor.on_array_begin` already strike per field -- name a
+destination and the codec writes there instead of calling back -- made once for
+the whole message.
+
+What makes that one surface is not where the value lands but where the *rules*
+live. There is exactly one implementation of each: the schema bound is settled
+in ``Decoder._settle_bound``, reached from a table entry and from
+:meth:`sofab.Visitor.on_schema_bound` alike, and the receiver cap, the §7.3 tag
+test, the UTF-8 check, the declared element width and the resume transaction are
+not duplicated at all -- a mapped field and an unmapped one run the same code
+until the assignment itself. So the two cannot disagree: there is one of them.
+
+These tests hold that down from both ends -- structurally (no engine has a
+second implementation of the rules, and no adapter is left to grow one) and
+behaviourally (a table and a hand-written visitor that declare the same thing
+reach the same outcome, over a matrix of messages and receiver limits, on both
+engines).
 """
 
 from __future__ import annotations
+
+import inspect
 
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
@@ -34,7 +49,6 @@ from sofab import (
     Encoder,
     Field,
     FixlenSubtype,
-    SofaArgumentError,
     SofaDecodeError,
     SofaLimitError,
     Visitor,
@@ -42,25 +56,63 @@ from sofab import (
 )
 from sofab import binding as binding_mod
 from sofab import decoder as pure_decoder
+from sofab.decoder import Decoder as PyDecoder
+
+try:
+    from sofab._speedups import Decoder as NativeDecoder
+except ImportError:  # pragma: no cover - the pure-only build
+    NativeDecoder = None
 
 # --- structural: there is only one path left ---------------------------------
 
 
-def test_a_binding_is_a_visitor():
-    """The whole of what a table is now: a handler on the one surface."""
+def test_a_table_is_reached_through_the_visitor():
+    """The whole of what a table is now: something a handler *declares*, on the
+    one surface -- not a second thing a caller can hand the decoder instead."""
     b = Binding().unsigned(1, at=0)
-    h = binding_mod.handler(b, bytearray(8), None, None)
-    assert isinstance(h, Visitor)
+    words = bytearray(8)
+
+    class Declaring(Visitor):
+        def destinations(self):
+            return (b, words, None)
+
+    # The base class declares none, so an ordinary visitor is unaffected.
+    assert Visitor().destinations() is None
+
+    enc = Encoder()
+    enc.write_unsigned(1, 42)
+    msg = bytes(enc.getvalue())
+
+    for engine in (PyDecoder, NativeDecoder):
+        if engine is None:
+            continue
+        words[:] = bytes(8)
+        assert engine(visitor=Declaring()).feed(msg) is Status.COMPLETE
+        assert memoryview(words).cast("Q")[0] == 42
+
+        # ``binding=`` is the same declaration, written at the constructor.
+        w2 = bytearray(8)
+        assert engine(binding=b, words=w2).feed(msg) is Status.COMPLETE
+        assert memoryview(w2).cast("Q")[0] == 42
 
 
-def test_no_engine_has_a_second_value_path():
+def test_no_engine_has_a_second_implementation_of_the_rules():
     """The rule §5.3.1 is really about: not two surfaces, so not two
-    implementations. The bound-decode methods are gone from the pure decoder,
-    and the native decoder no longer takes a compiled table."""
+    implementations.
+
+    The old second *value path* (``_take_bound``) is gone, and so is the adapter
+    that replaced it (``sofab.binding.handler`` / ``_BoundVisitor``) -- either
+    one is a place a rule could be written down twice. What is left is a single
+    schema-bound site both routes reach.
+    """
     assert not hasattr(pure_decoder.Decoder, "_take_bound")
-    assert not hasattr(Binding, "_compiled")
-    b = Binding().unsigned(1, at=0)
-    assert not hasattr(b, "_compiled")
+    assert not hasattr(binding_mod, "handler")
+    assert not hasattr(binding_mod, "_BoundVisitor")
+    # The one site, and the hook half that feeds it rather than re-deciding.
+    assert hasattr(pure_decoder.Decoder, "_settle_bound")
+    src = inspect.getsource(pure_decoder.Decoder._schema_bound)
+    assert "_settle_bound" in src
+    assert "SofaDecodeError" not in src, "the hook half must not re-decide the bound"
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -447,39 +499,76 @@ def test_a_skipped_field_is_never_asked(engine):
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_a_binding_refuses_a_raw_fp32_fallback(engine):
-    """Which fp32 route a handler takes is a property of *the handler* (§6.5's
-    channel is chosen by overriding the hook), and one surface means one
-    handler. A table delivers the widened double, so it cannot also carry a
-    fallback that wanted the bits — refused, rather than silently delivering
-    the wrong one."""
+def test_the_fp32_channel_is_per_field_not_per_decoder(engine):
+    """§6.5's raw-bits channel is chosen by overriding the hook, and a table
+    entry is a declaration about *its own* field.
+
+    So the combination is well defined rather than ambiguous: a field the table
+    names gets the widened double in its slot -- that is what the table asked
+    for -- and a field it does not name reaches the fallback, which asked for the
+    bits. Different fields, different declarations, and no field is ever offered
+    both.
+    """
+    enc = Encoder()
+    enc.write_float32(1, 1.5)     # bound: widened into the slot
+    enc.write_float32(2, 2.5)     # unbound: raw bits to the fallback
+    msg = bytes(enc.getvalue())
 
     class Bits(Visitor):
-        def on_float32_bits(self, field_id, bits):
-            pass
+        def __init__(self):
+            self.bits = []
 
-    b = Binding().unsigned(1, at=0)
-    with pytest.raises(SofaArgumentError, match="on_float32_bits"):
-        engine(binding=b, words=bytearray(8), visitor=Bits())
+        def on_float32_bits(self, field_id, bits):
+            self.bits.append((field_id, bits))
+
+    sink = Bits()
+    words = bytearray(8)
+    b = Binding().float32(1, at=0)
+    assert engine(binding=b, words=words, visitor=sink).feed(msg) is Status.COMPLETE
+    assert memoryview(words).cast("d")[0] == 1.5
+    assert sink.bits == [(2, 0x40200000)]
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_a_binding_refuses_a_raw_fp32_array_fallback(engine):
+def test_the_fp32_array_channel_is_per_field_too(engine):
+    enc = Encoder()
+    enc.write_float32_array(1, [1.5, 2.5])
+    enc.write_float32_array(2, [3.5])
+    msg = bytes(enc.getvalue())
+
     class ArrayBits(Visitor):
+        def __init__(self):
+            self.seen = []
+
         def on_float32_array_bits(self, field_id, count, payload):
-            pass
+            self.seen.append((field_id, count, bytes(payload)))
 
-    b = Binding().unsigned(1, at=0)
-    with pytest.raises(SofaArgumentError, match="on_float32_array_bits"):
-        engine(binding=b, words=bytearray(8), visitor=ArrayBits())
+    sink = ArrayBits()
+    words = bytearray(16)
+    b = Binding().float32_array(1, at=0, cap=2)
+    assert engine(binding=b, words=words, visitor=sink).feed(msg) is Status.COMPLETE
+    assert list(memoryview(words).cast("d")) == [1.5, 2.5]
+    assert [(fid, n) for fid, n, _ in sink.seen] == [(2, 1)]
 
 
-def test_both_engines_share_the_one_table_compiler():
-    """Both engines turn a table into a handler with the same function, so a
-    table cannot mean one thing in one engine and something else in the other."""
+def test_both_engines_settle_a_declared_bound_the_same_way():
+    """A table cannot mean one thing in one engine and something else in the
+    other: the same declaration, the same message and the same receiver limit
+    reach the same verdict and the same slots in both."""
     native = pytest.importorskip("sofab._speedups")
-    assert pure_decoder._binding_handler is binding_mod.handler
-    assert native._binding_handler is binding_mod.handler
+    enc = Encoder()
+    enc.write_string(1, "x" * 10)
+    msg = bytes(enc.getvalue())
+
+    out = []
+    for engine in (pure_decoder.Decoder, native.Decoder):
+        b = Binding().string(1, at=0, maxlen=10)
+        objects: list = [None]
+        dec = engine(
+            binding=b, words=bytearray(8), objects=objects, max_dyn_string_len=4
+        )
+        out.append((dec.feed(msg), objects[0]))
+    assert out[0] == out[1] == (Status.COMPLETE, "x" * 10)
 
 
 # --- a table and a visitor, together -----------------------------------------
@@ -637,3 +726,84 @@ def test_the_base_visitor_declares_no_bound():
     """The default: a handler that says nothing leaves every field to the
     receiver caps."""
     assert Visitor().on_schema_bound(Field(1, WireType.FIXLEN)) == -1
+
+
+# --- the map's own state, across a reset and a scope it does not name ---------
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_reset_inside_a_mapped_sequence_rewinds_the_map(engine):
+    """A decode abandoned inside a nested scope leaves the map pointing at the
+    child. ``reset`` rewinds it to the one the caller declared -- the slots are
+    construction-time state (§6.6), so the index moves, not the storage."""
+    child = Binding().unsigned(1, at=1)
+    b = Binding().unsigned(1, at=0).sequence(2, child, count_at=2)
+
+    enc = Encoder()
+    enc.write_unsigned(1, 7)
+    enc.write_sequence_begin_lazy(2)
+    enc.write_unsigned(1, 9)
+    enc.write_sequence_end()
+    msg = bytes(enc.getvalue())
+
+    words = bytearray(8 * 8)
+    dec = engine(binding=b, words=words)
+    # Stop inside the sequence: the child map is live and unbalanced.
+    assert dec.feed(msg[:-1]) is Status.INCOMPLETE
+    u = memoryview(words).cast("Q")
+    assert (u[0], u[1], u[2]) == (7, 9, 1)
+
+    dec.reset()
+    words[:] = bytes(len(words))
+    # The next message decodes against the ROOT map again, not the child's.
+    assert dec.feed(msg) is Status.COMPLETE
+    assert (u[0], u[1], u[2]) == (7, 9, 1)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_map_with_no_fallback_skips_a_sequence_it_does_not_name(engine):
+    """§4.9's fresh id scope with nobody to hand it to: the whole sub-tree is
+    consumed and discarded, and the fields after it still land."""
+    b = Binding().unsigned(1, at=0).unsigned(9, at=1)
+
+    enc = Encoder()
+    enc.write_unsigned(1, 7)
+    enc.write_sequence_begin_lazy(5)      # unmapped, no fallback
+    enc.write_unsigned(1, 1234)           # must NOT reach slot 0
+    enc.write_sequence_end()
+    enc.write_unsigned(9, 11)
+    msg = bytes(enc.getvalue())
+
+    words = bytearray(4 * 8)
+    dec = engine(binding=b, words=words)
+    assert dec.feed(msg) is Status.COMPLETE
+    u = memoryview(words).cast("Q")
+    assert (u[0], u[1]) == (7, 11)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_skipped_unmapped_sequence_resumes_across_a_chunk(engine):
+    """The skip is a transaction like every other read (§5.2): running out of
+    bytes inside a sub-tree nobody wants is INCOMPLETE, and the retry finishes
+    *that* skip rather than restarting the field walk behind it."""
+    b = Binding().unsigned(1, at=0).unsigned(9, at=1)
+
+    enc = Encoder()
+    enc.write_unsigned(1, 7)
+    enc.write_sequence_begin_lazy(5)      # unmapped, no fallback
+    enc.write_unsigned(1, 1234)
+    enc.write_unsigned(2, 5678)
+    enc.write_sequence_end()
+    enc.write_unsigned(9, 11)
+    msg = bytes(enc.getvalue())
+
+    words = bytearray(4 * 8)
+    dec = engine(binding=b, words=words, reassembly=64)
+    u = memoryview(words).cast("Q")
+    # One byte at a time, so the skip is suspended at every boundary inside the
+    # sub-tree and has to be resumed rather than restarted.
+    status = None
+    for i in range(len(msg)):
+        status = dec.feed(msg[i : i + 1])
+    assert status is Status.COMPLETE
+    assert (u[0], u[1]) == (7, 11)
