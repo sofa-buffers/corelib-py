@@ -665,8 +665,8 @@ it with `on_schema_bound`:
 b = Binding().string(1, at=0, maxlen=4194304)   # `name: { string, maxlen: 4194304 }`
 
 class Names(Visitor):                           # the same statement, by hand
-    def on_schema_bound(self, field):
-        return 4194304 if field.id == 1 else -1
+    def on_schema_bound(self, field_id, n):
+        return 4194304 if field_id == 1 else -1
 ```
 
 Declaring it does two things at once: the receiver-side cap stops applying to
@@ -674,6 +674,12 @@ that field, and the decoder enforces the declared bound itself — an over-bound
 length is `INVALID` (`SofaDecodeError`, MESSAGE_SPEC §7.1), never
 `SofaLimitError`. `on_schema_bound` is asked at the count/length header, for a
 `string`, a `blob` or an array the handler has accepted, and for nothing else.
+
+Both arguments are plain integers — the id, and the count or length the *sender*
+announced — and that is deliberate: it is the one hook generated code overrides
+on every message, so overriding it must cost nothing per field. `on_field` is the
+only hook that takes a `Field`, and therefore the only one that makes the decoder
+build one.
 
 #### So is a field nobody materializes
 

@@ -48,7 +48,6 @@ from sofab import (
     Binding,
     Encoder,
     Field,
-    FixlenSubtype,
     SofaDecodeError,
     SofaLimitError,
     Visitor,
@@ -151,9 +150,9 @@ class _DeclaringVisitor(Recorder):
         self.declared = declared
         self.asked: list[tuple] = []
 
-    def on_schema_bound(self, field: Field) -> int:
-        self.asked.append((field.id, field.type, field.subtype))
-        return self.declared if field.id == 1 else -1
+    def on_schema_bound(self, field_id: int, n: int) -> int:
+        self.asked.append((field_id, n))
+        return self.declared if field_id == 1 else -1
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -175,7 +174,7 @@ def test_the_audited_divergence_is_gone(engine):
     status, _rec, _dec = walk(engine, data, recorder=rec, max_dyn_string_len=4)
     assert status is Status.COMPLETE
     assert rec.events == [("str", 1, BOUNDED)]
-    assert rec.asked == [(1, WireType.FIXLEN, FixlenSubtype.STRING)]
+    assert rec.asked == [(1, 10)]     # the id, and the length the WIRE announced
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -220,7 +219,7 @@ class _Mirror(Visitor):
         self._e = e
         return None
 
-    def on_schema_bound(self, field: Field) -> int:
+    def on_schema_bound(self, field_id: int, n: int) -> int:
         return -1 if self._e is None else self._e[3]
 
     def on_array_begin(self, field_id, wtype, count):
@@ -387,8 +386,8 @@ class _Bound(Recorder):
         self.declared = declared
         self.ids = ids
 
-    def on_schema_bound(self, field):
-        return self.declared if field.id in self.ids else -1
+    def on_schema_bound(self, field_id, n):
+        return self.declared if field_id in self.ids else -1
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -453,8 +452,8 @@ def test_a_scalar_is_never_asked(engine):
             super().__init__()
             self.asked = []
 
-        def on_schema_bound(self, field):
-            self.asked.append(field.id)
+        def on_schema_bound(self, field_id, n):
+            self.asked.append((field_id, n))
             return -1
 
     enc = Encoder()
@@ -466,7 +465,7 @@ def test_a_scalar_is_never_asked(engine):
     rec = Asked()
     status, _rec, _dec = walk(engine, enc.getvalue(), recorder=rec)
     assert status is Status.COMPLETE
-    assert rec.asked == [5]
+    assert rec.asked == [(5, 1)]      # only the string, with its byte length
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -483,8 +482,8 @@ def test_a_skipped_field_is_never_asked(engine):
             super().on_field(field)
             return False
 
-        def on_schema_bound(self, field):
-            self.asked.append(field.id)
+        def on_schema_bound(self, field_id, n):
+            self.asked.append(field_id)
             return 1
 
     enc = Encoder()
@@ -588,8 +587,8 @@ class _Every(Recorder):
         self.bounds: list[int] = []
         self.seq_answer: object = None
 
-    def on_schema_bound(self, field):
-        self.bounds.append(field.id)
+    def on_schema_bound(self, field_id, n):
+        self.bounds.append(field_id)
         return -1
 
     def on_sequence_begin(self, field_id):
@@ -725,7 +724,7 @@ def test_a_mistyped_sequence_id_is_the_fallbacks(engine):
 def test_the_base_visitor_declares_no_bound():
     """The default: a handler that says nothing leaves every field to the
     receiver caps."""
-    assert Visitor().on_schema_bound(Field(1, WireType.FIXLEN)) == -1
+    assert Visitor().on_schema_bound(1, 0) == -1
 
 
 # --- the map's own state, across a reset and a scope it does not name ---------
@@ -807,3 +806,69 @@ def test_a_skipped_unmapped_sequence_resumes_across_a_chunk(engine):
         status = dec.feed(msg[i : i + 1])
     assert status is Status.COMPLETE
     assert (u[0], u[1]) == (7, 11)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_the_hook_is_told_what_the_wire_announced(engine):
+    """The second argument is the count or length the SENDER stated, which is
+    what the handler needs to answer without the decoder building an object for
+    it: a byte length for a string or blob, an element count for an array."""
+
+    class Seen(Recorder):
+        def __init__(self):
+            super().__init__()
+            self.seen = []
+
+        def on_schema_bound(self, field_id, n):
+            self.seen.append((field_id, n))
+            return -1
+
+    enc = Encoder()
+    enc.write_string(1, "abcde")            # 5 bytes
+    enc.write_bytes(2, b"xyz")              # 3 bytes
+    enc.write_unsigned_array(3, [1, 2, 3, 4])   # 4 elements
+    enc.write_float64_array(4, [1.0, 2.0])      # 2 elements
+    enc.write_unsigned(5, 7)                # a scalar: never asked
+    rec = Seen()
+    status, _rec, _dec = walk(engine, enc.getvalue(), recorder=rec)
+    assert status is Status.COMPLETE
+    assert rec.seen == [(1, 5), (2, 3), (3, 4), (4, 2)]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_declaring_a_bound_costs_no_object(engine):
+    """The point of the two-integer signature: the hook is handed the id and the
+    announced count/length as plain ``int``s, so a handler that declares schema
+    bounds and overrides nothing else never causes a ``Field`` to be built."""
+
+    class Bounds(Visitor):
+        def __init__(self):
+            self.types = []
+
+        def on_schema_bound(self, field_id, n):
+            self.types.append((type(field_id), type(n)))
+            return -1
+
+    enc = Encoder()
+    enc.write_string(1, "abc")
+    enc.write_unsigned_array(2, [1, 2])
+    sink = Bounds()
+    assert engine(visitor=sink).feed(bytes(enc.getvalue())) is Status.COMPLETE
+    assert sink.types == [(int, int), (int, int)]
+
+
+def test_only_on_field_makes_the_decoder_build_one():
+    """The mechanism behind the test above, read off the pure engine's own flag:
+    ``on_schema_bound`` no longer forces a ``Field`` per field, ``on_field``
+    still does."""
+
+    class Bounds(Visitor):
+        def on_schema_bound(self, field_id, n):
+            return -1
+
+    class Fields(Visitor):
+        def on_field(self, field):
+            return None
+
+    assert pure_decoder.Decoder(visitor=Bounds())._make_field is False
+    assert pure_decoder.Decoder(visitor=Fields())._make_field is True

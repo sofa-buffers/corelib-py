@@ -2006,7 +2006,6 @@ cdef class Decoder:
     cdef Py_ssize_t _n
     cdef Py_ssize_t _pos
     cdef int _depth
-    cdef object _cur
     # Field id of the header _next_wire last parsed, unboxed.
     cdef uint64_t _cur_id
     # Wire type of ``_cur`` as a plain int (-1 before the first field / at EOF),
@@ -2186,7 +2185,6 @@ cdef class Decoder:
         self._n = 0
         self._pos = 0
         self._depth = 0
-        self._cur = None
         self._cur_wtype = -1
         self._spill = None
         self._pk = _PEND_NONE
@@ -2318,8 +2316,10 @@ cdef class Decoder:
         self._wants_field = type(visitor).on_field is not _BASE_ON_FIELD
         self._wants_bound = (
             type(visitor).on_schema_bound is not _BASE_ON_SCHEMA_BOUND)
-        # A Field is built for the two hooks that take one, and nothing else.
-        self._make_field = self._wants_field or self._wants_bound
+        # A Field is built for the ONE hook that takes one. Every other hook --
+        # on_schema_bound included -- takes integers, so declaring a schema
+        # bound costs no object per field.
+        self._make_field = self._wants_field
         self._wants_seq_begin = (
             type(visitor).on_sequence_begin is not _BASE_ON_SEQUENCE_BEGIN)
         self._wants_array_begin = (
@@ -2551,19 +2551,20 @@ cdef class Decoder:
 
     # --- field iteration ----------------------------------------------------
 
-    cdef int _next_wire(self, bint want_field) except -2:
+    cdef int _next_wire(self) except -2:
         # Parse one field header and publish its identity; returns the wire type,
         # or -1 at clean EOF. ``skip()``, ``drive()`` and the push driver all
         # iterate fields, and going through the Python method wrapper for every
         # one of them costs a full attribute lookup and call frame.
         #
-        # ``want_field`` is what the push driver buys its speed with. A caller
-        # that binds fields to destinations (see FeedBinding) never looks at a
-        # Field object, and building one per field means an allocation plus up to
-        # five boxed ints — measurably more than parsing the header. With it
-        # False nothing is boxed that the wire does not force: the id, the fixlen
-        # length and the array count stay in C registers unless a Field is asked
-        # for or a configured receiver cap has to compare against them.
+        # No Field is built here, and that is what the push driver buys its
+        # speed with: building one means an allocation plus up to five boxed
+        # ints, measurably more than parsing the header, and this walk cannot
+        # yet know whether anyone will be offered the field -- one the handler's
+        # destination map names never reaches on_field. Nothing is boxed that
+        # the wire does not force: the id, the fixlen length and the array count
+        # stay in C registers unless a configured receiver cap has to compare
+        # against them. _build_field makes one where it is actually needed.
         cdef uint64_t header
         cdef int wtype
         cdef object field_id
@@ -2642,16 +2643,12 @@ cdef class Decoder:
                     cap = self._max_dyn_string_len
                 elif subtype == _ST_BLOB:
                     cap = self._max_dyn_blob_len
-            if want_field or cap is not None:
-                # One boxed length, reused: it is the Field's ``size`` and the
-                # value a configured cap is compared against and named in its
-                # message. Neither is wanted on the bound path, so neither is
-                # built there.
+            if cap is not None:
+                # Boxed only for the cap: the value a configured limit is
+                # compared against and named in its message. No Field is built
+                # here -- see _build_field.
                 boxed = PyLong_FromUnsignedLongLong(length)
-                if want_field:
-                    self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
-                                         _WT[_WT_FIXLEN], boxed, _ZERO, _ST[subtype])
-                if cap is not None and boxed > cap:
+                if boxed > cap:
                     if subtype == _ST_STRING:
                         self._park_limit("string length %d exceeds max_dyn_string_len %s"
                                          % (boxed, cap))
@@ -2663,26 +2660,18 @@ cdef class Decoder:
         if wtype < _WT_FIXLEN:  # UNSIGNED (0) or SIGNED (1)
             self._pk = _PEND_SCALAR
             self._pend_wtype = wtype
-            if want_field:
-                self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
-                                     _WT[wtype], _ZERO, _ZERO, _NONE)
             return wtype
 
         if wtype == _WT_SEQUENCE_END:
             if self._depth <= 0:
                 raise SofaDecodeError("unbalanced sequence end")
             self._depth -= 1
-            if want_field:
-                self._cur = _mkfield(_ZERO, _WT[_WT_SEQUENCE_END], _ZERO, _ZERO, _NONE)
             return wtype
 
         if wtype == _WT_SEQUENCE_START:
             if self._depth >= _MAX_DEPTH:
                 raise SofaDecodeError("nesting exceeds MAX_DEPTH=%d" % _MAX_DEPTH)
             self._depth += 1
-            if want_field:
-                self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
-                                     _WT[_WT_SEQUENCE_START], _ZERO, _ZERO, _NONE)
             return wtype
 
         if wtype == _WT_ARRAY_UNSIGNED or wtype == _WT_ARRAY_SIGNED:
@@ -2693,13 +2682,10 @@ cdef class Decoder:
             self._pend_wtype = wtype
             self._pend_count = count
             cap = self._max_dyn_array_count if self._capped else _NONE
-            if want_field or cap is not _NONE:
+            if cap is not _NONE:
                 boxed = PyLong_FromUnsignedLongLong(count)   # see the fixlen branch
-                if want_field:
-                    self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
-                                         _WT[wtype], _ZERO, boxed, _NONE)
                 # Parked, not raised — see the fixlen branch above (§6.2.1).
-                if cap is not None and boxed > cap:
+                if boxed > cap:
                     self._park_limit("array count %d exceeds max_dyn_array_count %s" % (boxed, cap))
             return wtype
 
@@ -2730,15 +2716,10 @@ cdef class Decoder:
         self._pend_count = count
         self._pend_size = elem_size
         cap = self._max_dyn_array_count if self._capped else _NONE
-        if want_field or cap is not _NONE:
+        if cap is not _NONE:
             boxed = PyLong_FromUnsignedLongLong(count)      # see the fixlen branch
-            if want_field:
-                self._cur = _mkfield(PyLong_FromUnsignedLongLong(fid),
-                                     _WT[_WT_ARRAY_FIXLEN],
-                                     PyLong_FromUnsignedLongLong(elem_size), boxed,
-                                     _ST[subtype])
             # Parked, not raised — see the fixlen branch above (§6.2.1).
-            if cap is not None and boxed > cap:
+            if boxed > cap:
                 self._park_limit("array count %d exceeds max_dyn_array_count %s" % (boxed, cap))
         return wtype
 
@@ -2835,7 +2816,6 @@ cdef class Decoder:
             # so a re-issued skip replays the whole sequence (§5.2).
             floor = self._pos
             depth = self._depth
-            cur = self._cur
             cur_wtype = self._cur_wtype
             pk = self._pk
             pend_wtype = self._pend_wtype
@@ -2845,13 +2825,12 @@ cdef class Decoder:
             target = depth - 1
             try:
                 while self._depth > target:
-                    if self._next_wire(False) < 0:
+                    if self._next_wire() < 0:
                         raise self._suspend("truncated sequence")
             except SofaIncompleteError:
                 self._pos = floor
                 self._keep = floor
                 self._depth = depth
-                self._cur = cur
                 self._cur_wtype = cur_wtype
                 self._pk = pk
                 self._pend_wtype = pend_wtype
@@ -2859,12 +2838,6 @@ cdef class Decoder:
                 self._pend_count = pend_count
                 self._pend_size = pend_size
                 raise
-            # The walk asked for no Field objects, so ``_cur`` still names the
-            # sequence that was just consumed. Publish the end marker the walk
-            # stopped on, exactly as a Field-building walk would have left it —
-            # `field` is part of the public surface and the pure engine leaves
-            # the same thing behind (§5.3). One object per skip, not per field.
-            self._cur = _mkfield(_ZERO, _WT[_WT_SEQUENCE_END], _ZERO, _ZERO, _NONE)
             return 0
         if self._pk != _PEND_NONE:
             self._skip_pending()
@@ -3288,7 +3261,6 @@ cdef class Decoder:
         self._rstart = 0
         self._rend = 0
         self._depth = 0
-        self._cur = None
         self._cur_wtype = -1
         self._spill = None
         self._pk = _PEND_NONE
@@ -3367,7 +3339,7 @@ cdef class Decoder:
                 raise
 
         while True:
-            t = self._next_wire(make_field)
+            t = self._next_wire()
             if t < 0:
                 return 0
 
@@ -3459,17 +3431,19 @@ cdef class Decoder:
                     self._resume_entry = ei
                     raise
                 continue
-            if make_field:
-                f = self._cur
-                if self._wants_field and visitor.on_field(f) is False:
-                    # Skipped: the pending value stays pending and the next
-                    # header discards it, which suspends in exactly the same
-                    # place an explicit skip would and costs one call less.
-                    # Nothing is materialized and nothing is validated (S6.7.2),
-                    # so neither the cap nor a schema bound is answered for it.
-                    continue
-                if self._wants_bound:
-                    self._schema_bound(visitor, f)
+            if make_field and visitor.on_field(self._build_field(t)) is False:
+                # Skipped: the pending value stays pending and the next header
+                # discards it, which suspends in exactly the same place an
+                # explicit skip would and costs one call less. Nothing is
+                # materialized and nothing is validated (S6.7.2), so neither the
+                # cap nor a schema bound is answered for it.
+                continue
+            if self._wants_bound:
+                # Independent of make_field now: this hook takes integers, so a
+                # handler that declares schema bounds and nothing else builds no
+                # Field at all.
+                self._schema_bound(
+                    visitor, PyLong_FromUnsignedLongLong(self._cur_id))
             if not has_visitor:
                 # Nobody wants it: the pending value stays pending and the next
                 # header discards it, which suspends in exactly the same place
@@ -3482,17 +3456,23 @@ cdef class Decoder:
                 self._resume_entry = -1
                 raise
 
-    cdef int _schema_bound(self, object visitor, object f) except -1:
+    cdef int _schema_bound(self, object visitor, object fid) except -1:
         # The hook half: ask the handler, then hand the answer to the one site
-        # that owns the rule. The map path calls _settle_bound directly.
+        # that owns the rule. The map path calls _settle_bound directly. Both
+        # arguments are integers, so overriding the hook costs no object per
+        # field -- which is the whole reason it does not take a Field.
         cdef int pk = self._pk
         cdef int real = self._pk_real if pk == _PEND_LIMIT else pk
+        cdef object n
         if real == _PEND_FIXLEN:
             if self._pend_subtype < _ST_STRING:
                 return 0   # an fp32/fp64 payload: a fixed width, nothing to bound
-        elif real != _PEND_VARRAY and real != _PEND_FARRAY:
+            n = PyLong_FromUnsignedLongLong(self._pend_size)
+        elif real == _PEND_VARRAY or real == _PEND_FARRAY:
+            n = PyLong_FromUnsignedLongLong(self._pend_count)
+        else:
             return 0
-        return self._settle_bound(<Py_ssize_t>visitor.on_schema_bound(f))
+        return self._settle_bound(<Py_ssize_t>visitor.on_schema_bound(fid, n))
 
     cdef int _settle_bound(self, Py_ssize_t bound) except -1:
         # THE site. What the schema declares does two things (S6.2.1,
@@ -3809,6 +3789,29 @@ cdef class Decoder:
         finally:
             PyBuffer_Release(&view)
         return 0
+
+    cdef object _build_field(self, int t):
+        # The Field on_field is handed. Built HERE, not in the header walk, and
+        # only for a field that is actually going to be offered: a field the
+        # handler's destination map names never reaches on_field, so one built
+        # for it was an object the caller could not observe. Everything it
+        # carries is already on the decoder, so nothing is re-parsed for it.
+        cdef int pk = self._pk
+        cdef int real = self._pk_real if pk == _PEND_LIMIT else pk
+        cdef object fid = PyLong_FromUnsignedLongLong(self._cur_id)
+        if real == _PEND_SCALAR:
+            return _mkfield(fid, _WT[t], _ZERO, _ZERO, _NONE)
+        if real == _PEND_FIXLEN:
+            return _mkfield(fid, _WT[_WT_FIXLEN],
+                            PyLong_FromUnsignedLongLong(self._pend_size), _ZERO,
+                            _ST[self._pend_subtype])
+        if real == _PEND_VARRAY:
+            return _mkfield(fid, _WT[t], _ZERO,
+                            PyLong_FromUnsignedLongLong(self._pend_count), _NONE)
+        return _mkfield(fid, _WT[_WT_ARRAY_FIXLEN],
+                        PyLong_FromUnsignedLongLong(self._pend_size),
+                        PyLong_FromUnsignedLongLong(self._pend_count),
+                        _ST[self._pend_subtype])
 
     cdef int _mapped_field(self, Py_ssize_t ei) except -1:
         # A field the handler's declared destination map names.
