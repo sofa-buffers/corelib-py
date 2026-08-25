@@ -303,9 +303,11 @@ class Handler(Visitor):
 ```
 
 The bytes are still **validated** — §6.7.2 makes a field you read both
-materialized and validated — in fixed windows, so the check does not build the
-`str` the destination exists to avoid. Invalid UTF-8 is `INVALID` and your
-buffer is left untouched.
+materialized and validated — by a byte walk (§6.4.3's `utf8_valid`), so the
+check does not build the `str` the destination exists to avoid. Invalid UTF-8 is
+`INVALID` and your buffer is left untouched. The verdict is CPython's own on
+every payload: `tests/test_aggregate_destinations.py` pins both engines to
+`bytes.decode("utf-8")` over the whole RFC 3629 boundary set.
 
 #### Float arrays: `on_float_array_begin`
 

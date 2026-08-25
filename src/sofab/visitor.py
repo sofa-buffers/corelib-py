@@ -174,11 +174,10 @@ class Visitor:
         codec, because there was no third opt-out to take.
 
         **The payload is still validated** (§6.7.2: a field the handler reads is
-        materialized *and* validated). Validation runs over the bytes in fixed
-        windows, carrying an incomplete sequence across the window boundary the
-        way §6.4.4 permits across a chunk boundary, so nothing the wire sizes is
-        built to check them. Invalid UTF-8 is ``INVALID`` and the destination is
-        left untouched.
+        materialized *and* validated). Validation walks the bytes — §6.4.3's
+        ``utf8_valid`` primitive — so nothing the wire sizes is built to check
+        them. Invalid UTF-8 is ``INVALID`` and the destination is left
+        untouched.
 
         Called again for the same string if a chunk boundary suspends the copy,
         so return the same answer each time; the decoder restarts the payload

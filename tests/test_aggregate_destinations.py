@@ -410,3 +410,105 @@ def test_a_sticky_encoder_records_a_bad_raw_float_write_instead_of_raising(enc_c
     enc.write_unsigned(2, 7)
     enc.flush()
     assert enc.getvalue() == b""
+
+
+# --- the validator behind the string destination ----------------------------
+
+
+def _string_field(payload: bytes) -> bytes:
+    """A one-field message whose `string` payload is exactly ``payload``."""
+    enc = Encoder()
+    enc.write_bytes(2, payload)
+    enc.flush()
+    wire = bytearray(enc.getvalue())
+    head = len(wire) - len(payload)
+    # Rewrite the fixlen_word's subtype from BLOB to STRING: the encoder takes a
+    # `str` and would reject (or re-encode) these bytes on the way in, and it is
+    # the decoder's verdict on the raw payload that is under test.
+    wire[1:head] = _uvarint((len(payload) << 3) | FixlenSubtype.STRING)
+    return bytes(wire)
+
+
+def _uvarint(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        out.append(byte | (0x80 if value else 0))
+        if not value:
+            return bytes(out)
+
+
+# Every shape RFC 3629 rules out, plus the neighbours that must stay valid.
+# Kept as raw bytes so the encoder (which takes a `str`) cannot launder them.
+_UTF8_CASES = [
+    b"",
+    b"ascii only",
+    "héllo wörld".encode(),
+    "߿ࠀ￿".encode(),          # two- and three-byte boundaries
+    "\U00010000\U0010ffff".encode(),        # four-byte boundaries
+    b"\x80",                                # a bare continuation
+    b"\xbf",
+    b"\xc0\x80",                            # overlong two-byte NUL
+    b"\xc1\xbf",                            # overlong two-byte
+    b"\xc2",                                # truncated two-byte
+    b"\xc2\x41",                            # bad continuation
+    b"\xe0\x80\x80",                        # overlong three-byte
+    b"\xe0\x9f\xbf",                        # still overlong
+    b"\xe0\xa0\x80",                        # the first legal three-byte
+    b"\xed\xa0\x80",                        # a UTF-16 surrogate
+    b"\xed\x9f\xbf",                        # the codepoint just below it
+    b"\xee\x80\x80",                        # and just above
+    b"\xe2\x28\xa1",                        # bad second byte
+    b"\xe2\x82",                            # truncated three-byte
+    b"\xf0\x80\x80\x80",                    # overlong four-byte
+    b"\xf0\x8f\xbf\xbf",                    # still overlong
+    b"\xf0\x90\x80\x80",                    # the first legal four-byte
+    b"\xf4\x8f\xbf\xbf",                    # U+10FFFF
+    b"\xf4\x90\x80\x80",                    # one past it
+    b"\xf5\x80\x80\x80",                    # never a lead
+    b"\xff",
+    b"\xfe\xfe\xff\xff",
+    b"a" * 5000 + b"\xc3\xa9",              # past the payload the walk sees
+    b"a" * 5000 + b"\xc3",                  # truncated, far in
+]
+
+
+@pytest.mark.parametrize("dec_cls", DECODERS)
+@pytest.mark.parametrize("payload", _UTF8_CASES, ids=lambda p: repr(p)[:32])
+def test_the_destination_route_agrees_with_python_on_every_payload(
+    dec_cls, payload
+):
+    """The destination route validates by walking the bytes rather than
+    decoding them, and the two engines do it in different languages. Both must
+    reach the verdict CPython's own decoder reaches — on the same bytes, with
+    no `str` built where the answer is "valid".
+    """
+    try:
+        payload.decode("utf-8")
+    except UnicodeDecodeError:
+        expected = Status.INVALID
+    else:
+        expected = Status.COMPLETE
+
+    sink = StringSink(bytearray(len(payload)))
+    dec = dec_cls(visitor=sink)
+    assert dec.feed(_string_field(payload)) is expected
+    if expected is Status.COMPLETE:
+        assert bytes(sink.dst) == payload
+    else:
+        assert isinstance(dec.error, SofaDecodeError)
+
+
+@pytest.mark.parametrize("dec_cls", DECODERS)
+@pytest.mark.parametrize("payload", _UTF8_CASES, ids=lambda p: repr(p)[:32])
+def test_the_value_route_reaches_the_same_verdict(dec_cls, payload):
+    """And the route that builds the `str` agrees with the one that does not —
+    which is the divergence a second validator would otherwise introduce."""
+    try:
+        payload.decode("utf-8")
+    except UnicodeDecodeError:
+        expected = Status.INVALID
+    else:
+        expected = Status.COMPLETE
+    assert dec_cls(visitor=Visitor()).feed(_string_field(payload)) is expected

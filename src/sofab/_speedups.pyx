@@ -471,12 +471,6 @@ cdef extern from "Python.h":
     # Decodes UTF-8 straight out of the decoder's buffer, so a string field
     # never materialises an intermediate ``bytes`` object.
     str PyUnicode_DecodeUTF8(const char*, Py_ssize_t, const char*)
-    # The same, stopping at an incomplete trailing sequence instead of raising
-    # for it and reporting how many bytes it did consume. Used to validate a
-    # payload in fixed windows, so a string read into a caller destination is
-    # checked without a ``str`` of the payload's own length (S6.4.4).
-    str PyUnicode_DecodeUTF8Stateful(const char*, Py_ssize_t, const char*,
-                                     Py_ssize_t*)
     # The str's own UTF-8 form (cached on the object), so encoding a string does
     # not allocate a ``bytes`` either.
     const char* PyUnicode_AsUTF8AndSize(object, Py_ssize_t*) except NULL
@@ -665,6 +659,64 @@ cdef object _BASE_ON_STRING_BEGIN = _Visitor.on_string_begin
 cdef object _BASE_ON_FARRAY_BEGIN = _Visitor.on_float_array_begin
 cdef object _BASE_ON_F32_BITS = _Visitor.on_float32_bits
 cdef object _BASE_ON_F32_ARRAY_BITS = _Visitor.on_float32_array_bits
+
+
+cdef int _decode_utf8_checked(const unsigned char* p, Py_ssize_t size) except -1:
+    # Is this valid UTF-8? CORELIB_PLAN S6.4.3's `utf8_valid` primitive, for the
+    # one caller that needs the answer without the value: a string read into a
+    # destination the caller supplied (S6.6.3) still has to be validated
+    # (S6.7.2), and decoding it to find out would build the very str the
+    # destination exists to avoid.
+    #
+    # A byte walk rather than a decode, so a megabyte payload costs no object at
+    # all. The bounds below are the whole of RFC 3629 as CPython applies it:
+    #
+    #   * a lead below 0xC2 or above 0xF4 is never valid -- that covers the
+    #     overlong two-byte forms (0xC0/0xC1) and everything past U+10FFFF;
+    #   * a lead of 0xE0 needs a continuation of at least 0xA0 (overlong
+    #     three-byte forms), and 0xED at most 0x9F (the UTF-16 surrogates);
+    #   * a lead of 0xF0 needs at least 0x90 (overlong four-byte forms), and
+    #     0xF4 at most 0x8F (past U+10FFFF);
+    #   * every other continuation byte is 0x80..0xBF.
+    #
+    # A sequence running past `size` is malformed, not truncated: `size` is the
+    # payload's own declared length, so no more bytes are coming for it.
+    cdef Py_ssize_t i = 0
+    cdef Py_ssize_t k
+    cdef int extra
+    cdef unsigned char b, lo, hi
+    while i < size:
+        b = p[i]
+        if b < 0x80:
+            i += 1
+            continue
+        if b < 0xC2 or b > 0xF4:
+            raise SofaDecodeError("invalid UTF-8 in string field")
+        if b < 0xE0:
+            extra = 1
+            lo = 0x80
+            hi = 0xBF
+        elif b < 0xF0:
+            extra = 2
+            lo = 0xA0 if b == 0xE0 else 0x80
+            hi = 0x9F if b == 0xED else 0xBF
+        else:
+            extra = 3
+            lo = 0x90 if b == 0xF0 else 0x80
+            hi = 0x8F if b == 0xF4 else 0xBF
+        if i + extra >= size:
+            raise SofaDecodeError("invalid UTF-8 in string field")
+        b = p[i + 1]
+        if b < lo or b > hi:
+            raise SofaDecodeError("invalid UTF-8 in string field")
+        for k in range(2, extra + 1):
+            b = p[i + k]
+            if b < 0x80 or b > 0xBF:
+                raise SofaDecodeError("invalid UTF-8 in string field")
+        i += extra + 1
+    return 0
+
+
 cdef object _ARRAY_MAX_OBJ = _ARRAY_MAX
 cdef object _FIXLEN_MAX_OBJ = _FIXLEN_MAX
 cdef object _INT64_MAX_OBJ = INT64_MAX
@@ -672,44 +724,6 @@ cdef tuple _ST = tuple(FixlenSubtype)
 cdef object _FP32_OBJ = FixlenSubtype.FP32
 cdef object _FP64_OBJ = FixlenSubtype.FP64
 
-# Bytes validated per pass in _decode_utf8_checked. The transient str each pass
-# builds is bounded by this, so a payload of any length costs a constant.
-# Mirrors sofab._core.UTF8_WINDOW.
-cdef Py_ssize_t _UTF8_WINDOW = 4096
-
-
-cdef int _decode_utf8_checked(const char* p, Py_ssize_t size) except -1:
-    # Is this valid UTF-8? Answered without building a str of the payload's
-    # length: S6.6.3's destination route exists to avoid exactly that object,
-    # so validating by decoding the whole payload would give it straight back.
-    # A sequence straddling a window boundary is carried into the next pass, the
-    # way S6.4.4 carries one across a fed chunk.
-    cdef Py_ssize_t pos = 0
-    cdef Py_ssize_t n, used
-    cdef object text
-    while pos < size:
-        n = size - pos
-        if n > _UTF8_WINDOW:
-            n = _UTF8_WINDOW
-        try:
-            if pos + n >= size:
-                # The final window: an incomplete tail here is not "wait for
-                # more", it is a payload that ends inside a sequence.
-                text = PyUnicode_DecodeUTF8(p + pos, n, NULL)
-                pos += n
-            else:
-                used = 0
-                text = PyUnicode_DecodeUTF8Stateful(p + pos, n, NULL, &used)
-                if used <= 0:
-                    # Unreachable: a sequence is at most 4 bytes and the window
-                    # is far wider, so a non-final window always consumes some.
-                    raise SofaDecodeError(     # pragma: no cover
-                        "invalid UTF-8 in string field")
-                pos += used
-        except UnicodeDecodeError as exc:
-            raise SofaDecodeError("invalid UTF-8 in string field") from exc
-        text = None
-    return 0
 
 # Pending-value kinds (mirror the pure decoder's _SCALAR/_FIXLEN/_VARRAY/_FARRAY).
 cdef int _PEND_NONE = 0
@@ -3607,11 +3621,11 @@ cdef class Decoder:
                     "on_string_begin returned %d bytes for a string of %d"
                     % (view.len, size))
             p = self._take_fixlen_ptr(size)
-            # Validate before the destination is touched, so a caller never sees
-            # a half-written buffer behind an INVALID verdict. Stateful, so the
-            # whole payload is checked without a str of its length: the decoded
-            # text is dropped, and only the count of validated bytes is used.
-            _decode_utf8_checked(<const char*>p, size)
+            # Validate before the destination is touched, so a caller never
+            # sees a half-written buffer behind an INVALID verdict -- and by
+            # walking the bytes, so the str the destination exists to avoid is
+            # never built.
+            _decode_utf8_checked(p, size)
             memcpy(view.buf, <const void*>p, size)
             self._spill = None
         finally:
