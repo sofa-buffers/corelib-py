@@ -1,21 +1,27 @@
 """What the codec allocates, measured (CORELIB_PLAN §6.6.4).
 
-    Source inspection alone is still **not sufficient** [...] Conformance
-    therefore requires **both**: *read* — no allocation primitive is reachable
-    from a codec entry point, apart from the language-forced handles §6.6.2
-    allows; *measure* — an allocation count, or the heap high-water mark, over a
-    complete encode and a complete decode.
+§6.6.4 requires conformance to be checked **both** ways: *read* — no allocation
+primitive reachable from a codec entry point, apart from the language-forced
+handles §6.6.2 allows — and *measure*. It then names what "measure" means for a
+runtime that boxes the codec's values, which CPython does:
+
+    Where it does box them the count is never zero and demanding zero would
+    demand the impossible, so the measurable claim is that it **does not grow
+    with the message**: the same for a ten-byte and a ten-kilobyte payload of the
+    same field shape, and unchanged by a hostile count or length. That is the
+    property the prohibition is for, and it is what a port in such a language
+    pins with a test.
 
 The *read* half is the source and the README's itemised handle list. This file is
-the *measure* half, and it measures the property that list exists to protect:
-**no wire number sizes an allocation.** A payload a thousand times larger must
-not cost a thousand times the memory — that, not a raw byte count, is what §6.6
-is about, and it is the one thing a Python port can state honestly.
+the *measure* half, in exactly that form: a payload a thousand times larger costs
+the same, and a hostile count buys nothing. It also pins the other half of §6.6 —
+bounded working state **sized at construction**, measured with the codec built
+outside the measurement, which is the line that section draws.
 
-Two of the three paths hold. The third does not, by a decision this port has
-taken deliberately, and is measured here rather than left as an assertion —
-``test_a_visitor_that_takes_a_value_pays_for_it`` is that gap with a number on
-it.
+Every route now has a shape that does not scale.
+``test_a_visitor_that_takes_a_value_pays_for_it`` measures what the *other*
+shape costs — a handler that asks for the value rather than supplying the
+storage — so the difference between the two is a number and not a claim.
 """
 
 from __future__ import annotations
@@ -273,13 +279,14 @@ def test_a_binding_float_array_does_not_scale_with_its_length(dec_cls, enc_cls):
 @pytest.mark.parametrize("enc_cls", ENCODERS)
 @pytest.mark.parametrize("dec_cls", DECODERS)
 def test_a_visitor_that_takes_a_value_pays_for_it(dec_cls, enc_cls):
-    """The accepted §6.6.3 gap, with a number on it rather than a claim.
+    """What asking for the value costs, with a number on it rather than a claim.
 
     ``on_bytes`` receives a whole ``bytes``, and the only size the codec can
     build one from is the wire's -- which is exactly what §6.6.3 says a callback
     delivering a materialized aggregate obliges. This port ships that callback
-    anyway, alongside the ``on_blob_begin`` route that does not; the README says
-    so. The measurement pins the shape: the cost tracks the payload, once.
+    anyway, beside the ``on_blob_begin`` route that does not, because it is the
+    convenient way to read a message. The measurement pins the shape: the cost
+    tracks the payload, **once** -- not twice, and not more.
     """
 
     class Taker(Visitor):

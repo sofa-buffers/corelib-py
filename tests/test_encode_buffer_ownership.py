@@ -236,3 +236,61 @@ def test_a_taking_sink_keeps_what_it_was_handed(enc_cls):
     assert len(kept) > 1
     joined = b"".join(bytes(k) for k in kept)
     assert joined.endswith(bytes(range(200))[-8:])
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_a_taking_sink_may_scrub_the_buffer_it_was_handed(enc_cls):
+    """§7.2 item 4's other half: a sink that takes the buffer and **scrubs it
+    before returning** must not change the message.
+
+    The suite asserted the converse — that the bytes a taking sink kept are
+    still there — but never that the encoder had already finished with them. A
+    sink that hands the buffer to a transport and zeroes its own copy is the
+    real shape of that; if the encoder still read from the buffer it handed
+    over, this is where it would show.
+    """
+    packets: list[bytes] = []
+    spare = [bytearray(16) for _ in range(64)]
+    enc = None
+
+    def taking(chunk):
+        packets.append(bytes(chunk))       # the transport's copy
+        enc.buffer_set(spare[len(packets)], 0)
+        chunk[:] = b"\x00" * len(chunk)    # and the buffer is scrubbed
+        return None
+
+    enc = enc_cls.over_buffer(spare[0], 0, taking)
+    enc.write_unsigned(1, 0xDEADBEEF)
+    enc.write_bytes(2, bytes(range(200)))
+    enc.write_string(3, "tail")
+    enc.flush()
+
+    reference = enc_cls()
+    reference.write_unsigned(1, 0xDEADBEEF)
+    reference.write_bytes(2, bytes(range(200)))
+    reference.write_string(3, "tail")
+    reference.flush()
+
+    assert len(packets) > 1, "the message must have been flushed in pieces"
+    assert b"".join(packets) == reference.getvalue()
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_the_in_memory_model_holds_nothing_of_the_callers_bytes(enc_cls):
+    """§7.2 item 4, "no foreign memory, ever", for the shape that has no
+    callback argument to inspect.
+
+    `Encoder()` appends a long `string`/`blob` run to its result directly rather
+    than copying it through the 1 KiB scratch (stated in the README). What that
+    must never mean is that the *caller's* buffer ends up in the result: the
+    argument is copied to immutable `bytes` first, so mutating it afterwards
+    cannot change `getvalue()`.
+    """
+    payload = bytearray(b"x" * 5000)
+    enc = enc_cls()
+    enc.write_bytes(1, payload)
+    enc.flush()
+    before = enc.getvalue()
+    payload[:] = b"\xa5" * len(payload)
+    assert enc.getvalue() == before
+    assert b"\xa5" not in enc.getvalue()
