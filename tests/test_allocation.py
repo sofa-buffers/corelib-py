@@ -26,7 +26,7 @@ import pytest
 from vectors import DECODER_ENGINES as DECODERS
 from vectors import ENCODER_ENGINES as ENCODERS
 
-from sofab import Binding, Status, Visitor
+from sofab import MAX_DEPTH, Binding, Status, Visitor
 
 SMALL = 1 << 10
 LARGE = 1 << 20
@@ -156,6 +156,114 @@ def test_a_binding_decode_does_not_scale_with_an_arrays_length(dec_cls, enc_cls)
     assert large - small < FLAT, (
         f"a {64 << 10}-element array cost {large - small} bytes more than a "
         "64-element one; the wire is sizing an allocation"
+    )
+
+
+# --- bounded working state is sized at construction (§6.6) -------------------
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_the_hold_back_run_is_sized_at_construction(enc_cls):
+    """§6.6: bounded working state "MUST be sized to its **full extent** when
+    the codec is constructed. Growing it afterwards is forbidden even where the
+    ceiling it grows towards is correct: a pending run that doubles as nesting
+    deepens allocates on a `write` path, and that is what this section forbids."
+
+    Both engines grew the hold-back run on demand — the pure one by appending to
+    a list, the native one by doubling a ``realloc``. The encoder is built
+    *outside* the measurement here, which is exactly the line §6.6 draws.
+    """
+
+    def run(depth):
+        enc = enc_cls.over_buffer(bytearray(1 << 16), 0, lambda chunk: None)
+
+        def work():
+            for i in range(depth):
+                enc.write_sequence_begin_lazy(i)
+            enc.write_unsigned(1, 7)  # content: commits the whole held-back run
+            for _ in range(depth):
+                enc.write_sequence_end_keep()
+
+        return _peak(work)
+
+    shallow = run(1)
+    deep = run(MAX_DEPTH - 1)
+    assert deep - shallow < 1024, (
+        f"nesting {MAX_DEPTH - 1} deep cost {deep - shallow} bytes more than "
+        "nesting once; the hold-back run is growing on a write path"
+    )
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_the_decoders_descent_state_is_sized_at_construction(dec_cls, enc_cls):
+    """The same rule on the decode side: the table stack and the suspended-
+    handler stack are the decoder's own working state, so descending must not
+    allocate. Both were built on the *first descent*, which is inside ``feed``.
+    """
+
+    class Child(Visitor):
+        def on_sequence_begin(self, field_id):
+            return self
+
+    def wire_for(depth):
+        enc = enc_cls()
+        for i in range(depth):
+            enc.write_sequence_begin_lazy(i)
+        enc.write_unsigned(1, 7)
+        for _ in range(depth):
+            enc.write_sequence_end_keep()
+        enc.flush()
+        return enc.getvalue()
+
+    def run(depth):
+        wire = wire_for(depth)
+        dec = dec_cls(visitor=Child(), reassembly=bytearray(1 << 12))
+
+        def work():
+            dec.reset()
+            assert dec.feed(wire) is Status.COMPLETE
+
+        return _peak(work)
+
+    shallow = run(1)
+    deep = run(MAX_DEPTH - 1)
+    assert deep - shallow < 1024, (
+        f"descending {MAX_DEPTH - 1} deep cost {deep - shallow} bytes more than "
+        "descending once; the decoder's descent state is growing inside feed"
+    )
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_a_binding_float_array_does_not_scale_with_its_length(dec_cls, enc_cls):
+    """The float twin of the unsigned case above.
+
+    It used to build a wire-sized ``list`` *and* a wire-sized ``array`` on the
+    way into slots the caller had already sized — 2.8 MB for a 65,536-element
+    ``fp32`` array on the pure engine. The payload now crosses in fixed blocks
+    (``_core.FARRAY_CHUNK``), straight out of the fed buffer.
+    """
+
+    def run(count):
+        enc = enc_cls()
+        enc.write_float32_array(1, [1.5] * count)
+        enc.flush()
+        wire = enc.getvalue()
+        binding = Binding().float32_array(1, at=0, cap=64 << 10, count_at=1)
+        words = bytearray(8 * ((64 << 10) + 8))
+
+        def work():
+            dec = dec_cls(binding=binding, words=words)
+            assert dec.feed(wire) is Status.COMPLETE
+
+        return _peak(work)
+
+    small = run(64)
+    large = run(64 << 10)
+    assert large - small < FLAT, (
+        f"a {64 << 10}-element fp32 array cost {large - small} bytes more than "
+        "a 64-element one; the wire is sizing an allocation"
     )
 
 

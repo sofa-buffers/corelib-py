@@ -35,7 +35,6 @@ Typical use::
 from __future__ import annotations
 
 import sys
-from array import array as _array
 from typing import Any
 
 from . import _core
@@ -191,6 +190,7 @@ class Decoder:
         "_binding",
         "_bmap",
         "_bstack",
+        "_bsp",
         "_buf",
         "_capped",
         "_cur",
@@ -217,6 +217,7 @@ class Decoder:
         "_status",
         "_visitor",
         "_vstack",
+        "_vsp",
         "_wants_array_begin",
         "_wants_blob_begin",
         "_wants_field",
@@ -370,10 +371,16 @@ class Decoder:
         # that receives one, and the typed hooks take an id.
         # Visitors suspended by a descent: a handler may answer
         # on_sequence_begin with another Visitor, and the sub-tree's events go
-        # there until its end marker. Built on the first descent, not here -- a
-        # decoder is constructed per message on the one-shot path and the flat
-        # handler, which is most of them, never descends.
-        self._vstack: list[Visitor] | None = None
+        # there until its end marker.
+        #
+        # MAX_DEPTH slots, filled here rather than grown on descent: §6.6 makes
+        # construction the one place a codec may allocate, and "growing it
+        # afterwards is forbidden even where the ceiling it grows towards is
+        # correct". _next_wire refuses a message nesting past MAX_DEPTH before
+        # any of these is written, so the slots are the ceiling and the index is
+        # the depth.
+        self._vstack: list[Any] = [None] * MAX_DEPTH
+        self._vsp = 0
         self._wants_field = False
         self._wants_seq_begin = False
         self._wants_array_begin = False
@@ -384,7 +391,8 @@ class Decoder:
         # fresh id scope (§4.9), so descending *replaces* the table rather than
         # layering onto it — an id bound in the parent must not match inside.
         self._bmap: dict[int, Entry] | None = binding._by_id if binding is not None else None
-        self._bstack: list[dict[int, Entry] | None] = []
+        self._bstack: list[dict[int, Entry] | None] = [None] * MAX_DEPTH
+        self._bsp = 0
         self._status = Status.COMPLETE
         self._error: SofaError | None = None
         self._resume_kind = _R_NONE
@@ -539,6 +547,22 @@ class Decoder:
         if type(buf) is bytes:
             return buf[pos:end]
         return bytes(memoryview(buf)[pos:end])
+
+    def _span_exact(self, n: int) -> tuple[Any, int]:
+        """Claim the next ``n`` bytes **in place**: the buffer they live in and
+        the offset they start at, with nothing copied out.
+
+        For a consumer that is done with them before ``feed`` returns — §6's
+        chunk lifetime is what makes that safe, and §6.6 is why it is worth
+        having: a payload on its way into a destination the caller already owns
+        must not be copied into anything the wire sizes on the way.
+        """
+        pos = self._pos
+        end = pos + n
+        if end > self._n:
+            raise self._suspend("truncated payload")
+        self._pos = end
+        return self._buf, pos
 
     def _skip_exact(self, n: int) -> None:
         """Consume the next ``n`` bytes without materialising them (§5.2: a skip
@@ -1218,16 +1242,18 @@ class Decoder:
         self._status = Status.COMPLETE
         self._error = None
         self._limit = None
-        if self._vstack:
+        if self._vsp:
             # A descent left mid-message: the handler the caller gave us is the
-            # one at the bottom of the stack.
+            # one at the bottom of the stack. The slots themselves are kept —
+            # they are construction-time state (§6.6), so reset rewinds the
+            # index rather than dropping the list.
             self._visitor = self._vstack[0]
-            self._vstack.clear()
+            self._vsp = 0
             self._bind_visitor(self._visitor)
         self._resume_kind = _R_NONE
         self._resume_entry = None
         self._bmap = self._binding._by_id if self._binding is not None else None
-        self._bstack.clear()
+        self._bsp = 0
 
     def _value_ready(self) -> bool:
         """Are all of the pending value's bytes buffered?
@@ -1294,14 +1320,16 @@ class Decoder:
                 return False
 
             if t == _WT_SEQUENCE_END:
-                if self._bstack:
-                    self._bmap = self._bstack.pop()
+                if self._bsp:
+                    self._bsp -= 1
+                    self._bmap = self._bstack[self._bsp]
                 if visitor is not None:
                     # The end belongs to whoever was handling the scope, so a
                     # child hears its own scope close before it is popped.
                     visitor.on_sequence_end()
-                    if self._vstack:
-                        visitor = self._visitor = self._vstack.pop()
+                    if self._vsp:
+                        self._vsp -= 1
+                        visitor = self._visitor = self._vstack[self._vsp]
                         self._bind_visitor(visitor)
                         # The flags are the *handler's*, so they change with it.
                         want_field = self._wants_field
@@ -1323,7 +1351,8 @@ class Decoder:
                 if entry is not None:
                     child = entry.child
                     assert child is not None
-                    self._bstack.append(self._bmap)
+                    self._bstack[self._bsp] = self._bmap
+                    self._bsp += 1
                     self._bmap = child._by_id
                     c = entry.count_at
                     if c >= 0:
@@ -1338,13 +1367,13 @@ class Decoder:
                     if answer is not False:
                         # §4.9 opens a fresh id scope, so the enclosing table
                         # must not match inside it.
-                        self._bstack.append(self._bmap)
+                        self._bstack[self._bsp] = self._bmap
+                        self._bsp += 1
                         self._bmap = None
                         if isinstance(answer, Visitor):
                             # The handler named someone else for this sub-tree.
-                            if self._vstack is None:
-                                self._vstack = []
-                            self._vstack.append(visitor)
+                            self._vstack[self._vsp] = visitor
+                            self._vsp += 1
                             visitor = self._visitor = answer
                             self._bind_visitor(answer)
                             want_field = self._wants_field
@@ -1469,17 +1498,15 @@ class Decoder:
                     at,
                 )
             else:
-                # A float payload is fixed-width, so it is read whole and
-                # unpacked in one call; handing that to ``array`` moves it into
-                # the destination at C speed rather than element by element.
+                # A float payload is fixed-width, so it is read whole and moved
+                # into the caller's slots a block at a time — at C speed, and
+                # without the wire-sized ``list`` *and* ``array`` this used to
+                # build on the way there. §6.6: the destination is already the
+                # caller's, so nothing between the payload and it may be sized
+                # by the wire.
                 width = 4 if k == K_ARRAY_FLOAT32 else 8
-                data = self._read_exact(self._farray_nbytes(got, width))
-                values = (
-                    _core.unpack_f32_array(data, got)
-                    if k == K_ARRAY_FLOAT32
-                    else _core.unpack_f64_array(data, got)
-                )
-                self._wd[at : at + got] = _array("d", values)
+                data, off = self._span_exact(self._farray_nbytes(got, width))
+                _core.unpack_farray_into(self._wd, at, data, got, width, off)
             self._pending = None  # committed only once the payload is in hand
 
         c = e.count_at

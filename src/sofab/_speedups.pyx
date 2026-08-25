@@ -594,7 +594,8 @@ cdef int64_t _SIGNED_MAX = <int64_t>0x7FFFFFFFFFFFFFFFLL
 cdef uint64_t _ID_MAX = <uint64_t>0x7FFFFFFF
 cdef uint64_t _ARRAY_MAX = <uint64_t>0x7FFFFFFF
 cdef uint64_t _FIXLEN_MAX = <uint64_t>0x7FFFFFFF
-cdef int _MAX_DEPTH = 255
+cdef enum: _MAX_DEPTH_C = 255   # compile-time twin, for sizing fixed state
+cdef int _MAX_DEPTH = _MAX_DEPTH_C
 # The smallest streaming output buffer this port accepts (S5.1). It is 1 because
 # _put splits every atomic unit at any byte boundary; it binds only a buffer
 # installed together with a flush sink. Mirrors types.MIN_OUTPUT_BUFFER.
@@ -988,12 +989,15 @@ cdef class Encoder:
     # (MESSAGE_SPEC S2 lazy framing). Always a contiguous suffix of the open
     # sequences, so write_sequence_end simply pops the last entry.
     #
-    # A heap block that is NULL until the first hold-back and doubles on demand
-    # (CORELIB_PLAN S6: an implementation that can allocate MUST hold back to the
-    # full MAX_DEPTH, so there is no fixed window and no eager-framing fallback;
-    # only a heap-free profile may bound the run). Growing on demand also keeps an
-    # encoder that never opens a sequence from paying for the run at all -- the
-    # fixed 255-entry array this replaces cost every stream ~1 KiB it never used.
+    # A heap block of _MAX_DEPTH entries, allocated in __cinit__ and never
+    # resized. CORELIB_PLAN S6.6 fixes both halves: an implementation that can
+    # allocate MUST hold back to the full MAX_DEPTH (S6.0.1, so there is no fixed
+    # window and no eager-framing fallback), and bounded working state "MUST be
+    # sized to its full extent when the codec is constructed" -- naming this
+    # exact shape as the counter-example, "a pending run that doubles as nesting
+    # deepens allocates on a write path, and that is what this section forbids".
+    # It cost ~1 KiB per stream when it grew on demand too; it now costs it once,
+    # where a source-level audit sees it.
     cdef uint32_t* _pending
     cdef int _npending
     cdef int _pcap
@@ -1014,9 +1018,14 @@ cdef class Encoder:
         self._sticky = False
         self._error = None
         self._depth = 0
-        self._pending = NULL
+        # Sized here, not on the first hold-back: __cinit__ runs for every
+        # construction shape, over_buffer's cls.__new__ included, and it is the
+        # only place S6.6 lets an allocation happen at all.
+        self._pending = <uint32_t*>malloc(<size_t>_MAX_DEPTH_C * sizeof(uint32_t))
+        if self._pending == NULL:
+            raise MemoryError()
         self._npending = 0
-        self._pcap = 0
+        self._pcap = _MAX_DEPTH_C
 
     def __init__(self, writer=None, *, bint sticky=False):
         # S5.1 "unbounded schema" shape: a fixed scratch buffer installed *with*
@@ -1236,43 +1245,30 @@ cdef class Encoder:
 
     cdef int _commit_pending(self) except -1:
         # Emit the held-back sequence headers, outermost first. Cold: it runs at
-        # most once per non-default sequence, never per field. The run is
-        # detached before the first byte goes out, so a flush sink that re-enters
-        # the encoder cannot observe a half-committed run (it starts a fresh run
-        # of its own; the block below is then handed back or freed).
-        cdef uint32_t* run = self._pending
+        # most once per non-default sequence, never per field. The run is copied
+        # to the stack and the encoder's own run emptied before the first byte
+        # goes out, so a flush sink that re-enters the encoder starts a fresh run
+        # of its own and cannot observe a half-committed one. (The block itself
+        # is never detached -- it is construction-time state, not a per-commit
+        # allocation.)
+        cdef uint32_t run[_MAX_DEPTH_C]
         cdef int n = self._npending
-        cdef int cap = self._pcap
         cdef int i
-        self._pending = NULL
+        for i in range(n):
+            run[i] = self._pending[i]
         self._npending = 0
-        self._pcap = 0
-        try:
-            for i in range(n):
-                self._emit_varint((<uint64_t>run[i] << 3) | <uint64_t>_WT_SEQUENCE_START)
-        finally:
-            if self._pending == NULL:
-                # Nothing re-entered: keep the block for the next hold-back.
-                self._pending = run
-                self._pcap = cap
-            else:
-                free(run)
+        for i in range(n):
+            self._emit_varint((<uint64_t>run[i] << 3) | <uint64_t>_WT_SEQUENCE_START)
         return 0
 
     cdef int _pending_push(self, uint32_t field_id) except -1:
-        # Append one id to the pending run, growing the block on demand. NULL
-        # until the first hold-back, so an encoder that never opens a sequence
-        # never allocates it; capacity doubles from 8 and is implicitly bounded
-        # by _MAX_DEPTH (the run is a subset of the open sequences).
-        cdef int newcap
-        cdef uint32_t* grown
+        # Append one id to the pending run. The block holds _MAX_DEPTH entries
+        # and the run is a subset of the open sequences, whose count
+        # write_sequence_begin_lazy has already bounded by _MAX_DEPTH -- so this
+        # never grows, which is what S6.6 requires of it. The guard is the
+        # invariant written down, not a path a caller can reach.
         if self._npending >= self._pcap:
-            newcap = self._pcap * 2 if self._pcap else 8
-            grown = <uint32_t*>realloc(self._pending, <size_t>newcap * sizeof(uint32_t))
-            if grown == NULL:
-                raise MemoryError()
-            self._pending = grown
-            self._pcap = newcap
+            raise SofaArgumentError("nesting exceeds MAX_DEPTH=%d" % _MAX_DEPTH)
         self._pending[self._npending] = field_id
         self._npending += 1
         return 0
@@ -1897,7 +1893,8 @@ cdef class Decoder:
     cdef object _binding             # the Binding this table was compiled from
     cdef object _visitor
     # Visitors suspended by a descent -- see the pure engine.
-    cdef list _vstack
+    cdef list _vstack               # _MAX_DEPTH slots, filled at construction
+    cdef int _vsp
     # Whether the visitor overrides the two control hooks. Both default to a
     # no-op on the base class, and calling one that was never overridden costs a
     # Python call per field for nothing. ``_wants_field`` also decides whether a
@@ -1919,7 +1916,7 @@ cdef class Decoder:
     # Active table, and the enclosing ones: a sequence opens a fresh id scope
     # (§4.9), so descending REPLACES the table rather than layering onto it.
     cdef int _tab
-    cdef int* _tstack               # allocated on the first descent, not before
+    cdef int* _tstack               # _MAX_DEPTH+1 entries, allocated at construction
     cdef int _tsp
     cdef int _status
     cdef object _err
@@ -1939,7 +1936,12 @@ cdef class Decoder:
         self._wview = NULL
         self._nwords = 0
         self._tab = -1
-        self._tstack = NULL
+        # MAX_DEPTH bounds nesting (checked in _next_wire), so one allocation of
+        # that size covers every message that can be decoded -- and S6.6 has it
+        # made here rather than on the first descent, which is a `feed` path.
+        self._tstack = <int*>malloc(<size_t>(_MAX_DEPTH_C + 1) * sizeof(int))
+        if self._tstack == NULL:
+            raise MemoryError()
         self._tsp = 0
         self._status = <int>Status.COMPLETE
         self._err = None
@@ -1954,8 +1956,12 @@ cdef class Decoder:
             if type(reassembly) is not bytearray:
                 raise SofaArgumentError("reassembly must be a bytearray")
             self._rbuf = reassembly
-        # Built on the first descent -- see the pure engine.
-        self._vstack = None
+        # Sized at construction, like every other piece of working state
+        # (S6.6); the pure engine does the same. _next_wire refuses a message
+        # nesting past MAX_DEPTH before any slot is written, so the slots are
+        # the ceiling and the index is the depth.
+        self._vstack = [None] * _MAX_DEPTH_C
+        self._vsp = 0
         self._binding = binding
         self._visitor = visitor
         self._wants_field = False
@@ -2818,12 +2824,7 @@ cdef class Decoder:
         return 0
 
     cdef inline int _push_table(self, int tab) except -1:
-        # MAX_DEPTH already bounds nesting (checked in _next_wire), so one
-        # allocation of that size covers every message that can be decoded.
-        if self._tstack == NULL:
-            self._tstack = <int*>malloc((_MAX_DEPTH + 1) * sizeof(int))
-            if self._tstack == NULL:
-                raise MemoryError()
+        # No allocation here: the stack is sized in __cinit__ (S6.6).
         self._tstack[self._tsp] = self._tab
         self._tsp += 1
         self._tab = tab
@@ -2996,11 +2997,12 @@ cdef class Decoder:
         self._status = <int>Status.COMPLETE
         self._err = None
         self._limit = None
-        if self._vstack:
+        if self._vsp:
             # A descent left mid-message: the handler the caller gave us is the
-            # one at the bottom of the stack.
+            # one at the bottom of the stack. The slots are kept -- they are
+            # construction-time state (S6.6), so reset rewinds the index.
             self._bind_visitor(self._vstack[0])
-            self._vstack = None
+            self._vsp = 0
         self._resume_kind = _R_NONE
         self._resume_entry = -1
         self._tsp = 0
@@ -3064,8 +3066,9 @@ cdef class Decoder:
                     # The end belongs to whoever was handling the scope, so a
                     # child hears its own scope close before it is popped.
                     visitor.on_sequence_end()
-                    if self._vstack:
-                        visitor = self._vstack.pop()
+                    if self._vsp:
+                        self._vsp -= 1
+                        visitor = self._vstack[self._vsp]
                         self._bind_visitor(visitor)
                         want_field = self._wants_field
                 continue
@@ -3098,9 +3101,8 @@ cdef class Decoder:
                         self._push_table(-1)
                         if isinstance(answer, _Visitor):
                             # The handler named someone else for this sub-tree.
-                            if self._vstack is None:
-                                self._vstack = []
-                            self._vstack.append(visitor)
+                            self._vstack[self._vsp] = visitor
+                            self._vsp += 1
                             visitor = answer
                             self._bind_visitor(answer)
                             want_field = self._wants_field

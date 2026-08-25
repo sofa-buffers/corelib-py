@@ -16,6 +16,8 @@ the plain ``struct`` path (their conversion is exact and never quiets).
 from __future__ import annotations
 
 import struct
+from array import array as _array
+from typing import Any
 
 _F32 = struct.Struct("<f")
 _F64 = struct.Struct("<d")
@@ -144,3 +146,64 @@ def pack_f32_array(values: list[float]) -> bytes:
 def pack_f64_array(values: list[float]) -> bytes:
     """Encode a list of fp64 values in one ``struct`` call (little-endian)."""
     return struct.pack(f"<{len(values)}d", *values)
+
+
+# --- fixlen arrays straight into a caller destination -----------------------
+#
+# The array forms above build a ``list`` the wire sizes, which is what the
+# visitor's default route needs. Where the destination already exists — a
+# binding's ``words`` slots, a buffer a handler returned — CORELIB_PLAN §6.6
+# forbids sizing anything from the wire on the way there, so the payload is
+# moved through a **landing zone of a fixed number of elements**: §6.6.2's
+# "landing zone for a scalar", widened to a block so the copy still runs at C
+# speed. Peak allocation is then the block, whatever the count is.
+
+#: Elements converted per pass. Large enough that the per-pass overhead is
+#: amortised, small enough that the staging tuple/array is a constant.
+FARRAY_CHUNK = 64
+
+_F32_CHUNK = struct.Struct(f"<{FARRAY_CHUNK}f")
+_F64_CHUNK = struct.Struct(f"<{FARRAY_CHUNK}d")
+_U32_CHUNK = struct.Struct(f"<{FARRAY_CHUNK}I")
+
+
+def unpack_farray_into(
+    dst: Any, at: int, data: Any, count: int, width: int, start: int = 0
+) -> None:
+    """Move ``count`` little-endian fp32/fp64 values from ``data`` into ``dst``.
+
+    ``dst`` is a writable ``d``-format buffer (a ``memoryview`` cast, an
+    ``array``) and ``at`` the element index to start at; ``data`` is any buffer
+    and ``start`` the byte offset the payload begins at, so the caller need not
+    slice a copy out first. Nothing sized by ``count`` is allocated: the payload
+    crosses in blocks of :data:`FARRAY_CHUNK`.
+    """
+    fp32 = width == 4
+    off = 0
+    while off < count:
+        n = count - off
+        if n > FARRAY_CHUNK:
+            n = FARRAY_CHUNK
+        pos = start + off * width
+        if fp32:
+            if n == FARRAY_CHUNK:
+                values = _F32_CHUNK.unpack_from(data, pos)
+            else:
+                values = struct.unpack_from(f"<{n}f", data, pos)
+            if any(v != v for v in values):
+                # A NaN in the block: re-derive the whole block from its raw
+                # bits so a signaling payload survives the widening (§6.5).
+                if n == FARRAY_CHUNK:
+                    bits = _U32_CHUNK.unpack_from(data, pos)
+                else:
+                    bits = struct.unpack_from(f"<{n}I", data, pos)
+                values = tuple(
+                    _unpack_f32_bits(b) if v != v else v
+                    for v, b in zip(values, bits)
+                )
+        elif n == FARRAY_CHUNK:
+            values = _F64_CHUNK.unpack_from(data, pos)
+        else:
+            values = struct.unpack_from(f"<{n}d", data, pos)
+        dst[at + off : at + off + n] = _array("d", values)
+        off += n

@@ -167,11 +167,21 @@ class Encoder:
         # open sequences: writing any field commits the whole run at once, so
         # :meth:`write_sequence_end` can simply pop the last entry.
         #
-        # ``None`` until the first hold-back: the list grows on demand (CORELIB_PLAN
-        # §6 — an implementation that can allocate holds back to the full MAX_DEPTH,
-        # so there is no fixed window and no eager-framing fallback), and an encoder
-        # that never opens a sequence never allocates it at all.
-        self._pending: list[int] | None = None
+        # Sized to the full MAX_DEPTH here, at construction, and never resized:
+        # CORELIB_PLAN §6.6 requires an implementation that can allocate to hold
+        # back to the full MAX_DEPTH (so there is no fixed window and no
+        # eager-framing fallback) *and* requires that state to be "sized to its
+        # full extent when the codec is constructed", naming this exact shape as
+        # what it forbids — "a pending run that doubles as nesting deepens
+        # allocates on a write path".
+        #
+        # ``_spare`` is the second such run, and exists for one case: a flush
+        # sink that re-enters the encoder while a run is being committed. The
+        # two are swapped there, so the sink's own run never overwrites the one
+        # being emitted and no allocation happens on that path either.
+        self._pending: list[int] = [0] * MAX_DEPTH
+        self._spare: list[int] = [0] * MAX_DEPTH
+        self._npending = 0
         # The one allocation, made here and never resized. Installed exactly as
         # :meth:`buffer_set` would (the checks it makes are constants here: a
         # zero offset into a buffer of _SCRATCH_SIZE >= MIN_OUTPUT_BUFFER).
@@ -227,7 +237,9 @@ class Encoder:
         self._sticky = sticky
         self._error = None
         self._depth = 0
-        self._pending = None
+        self._pending = [0] * MAX_DEPTH
+        self._spare = [0] * MAX_DEPTH
+        self._npending = 0
         self.buffer_set(buffer, offset)
         return self
 
@@ -485,7 +497,7 @@ class Encoder:
             field_id = _as_int(field_id, "id")
         if field_id < 0 or field_id > ID_MAX:
             raise SofaArgumentError(f"id {field_id} out of range 0..{ID_MAX}")
-        if self._pending:
+        if self._npending:
             self._commit_pending()
         self._emit_varint((field_id << 3) | wtype)
 
@@ -493,13 +505,18 @@ class Encoder:
         """Emit the held-back sequence headers, outermost first.
 
         Cold: it runs at most once per non-default sequence, never per field.
-        The run is detached before the first byte goes out, so a flush sink that
-        re-enters the encoder cannot see a half-committed run.
+        The run is swapped out for the spare before the first byte goes out, so
+        a flush sink that re-enters the encoder starts a fresh run of its own
+        and cannot see a half-committed one. Both lists are construction-time
+        state, so the swap allocates nothing (§6.6).
         """
         run = self._pending
-        self._pending = None
-        for field_id in run or ():
-            self._emit_varint((field_id << 3) | _WT_SEQUENCE_START)
+        n = self._npending
+        self._pending = self._spare
+        self._spare = run
+        self._npending = 0
+        for i in range(n):
+            self._emit_varint((run[i] << 3) | _WT_SEQUENCE_START)
 
     def _begin(self) -> bool:
         """Sticky-mode gate. Returns ``False`` if the op should be skipped."""
@@ -851,18 +868,15 @@ class Encoder:
                 field_id = _as_int(field_id, "id")
             if field_id < 0 or field_id > ID_MAX:
                 raise SofaArgumentError(f"id {field_id} out of range 0..{ID_MAX}")
-            # No hold-back window to exhaust: the pending run is a Python list
-            # that grows on demand, so it reaches the full MAX_DEPTH (CORELIB_PLAN
-            # §6: only a heap-free profile may bound the run and frame eagerly
-            # beyond the bound). There is therefore no eager-framing fallback,
-            # and the "pending is a contiguous suffix of the open sequences"
-            # invariant holds unconditionally. The list itself is allocated here,
-            # on the first hold-back, not in the constructor — an encoder that
-            # never opens a sequence never pays for one.
-            if self._pending is None:
-                self._pending = [field_id]
-            else:
-                self._pending.append(field_id)
+            # No hold-back window to exhaust: the run is MAX_DEPTH slots wide
+            # and the depth check above has already bounded what can reach it
+            # (CORELIB_PLAN §6.0.1: only a heap-free profile may bound the run
+            # and frame eagerly beyond the bound). There is therefore no
+            # eager-framing fallback, and the "pending is a contiguous suffix of
+            # the open sequences" invariant holds unconditionally. Placing into
+            # the slot, never appending: the list does not grow (§6.6).
+            self._pending[self._npending] = field_id
+            self._npending += 1
             self._depth += 1
         except SofaError as exc:
             self._fail(exc)
@@ -883,11 +897,11 @@ class Encoder:
         try:
             if self._depth <= 0:
                 raise SofaArgumentError("sequence_end without matching begin")
-            if self._pending:
+            if self._npending:
                 # The innermost open sequence is the last held-back one (the
                 # pending run is a suffix), so dropping it is a plain pop: no
                 # header and no end marker ever reach the wire.
-                self._pending.pop()
+                self._npending -= 1
                 self._depth -= 1
                 return
             self._emit_varint(_WT_SEQUENCE_END)
@@ -925,7 +939,7 @@ class Encoder:
         try:
             if self._depth <= 0:
                 raise SofaArgumentError("sequence_end without matching begin")
-            if self._pending:
+            if self._npending:
                 self._commit_pending()
             self._emit_varint(_WT_SEQUENCE_END)
             self._depth -= 1
