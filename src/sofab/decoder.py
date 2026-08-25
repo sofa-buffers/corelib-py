@@ -1479,15 +1479,19 @@ class Decoder:
                 assert visitor is not None
                 f = self._cur
                 assert f is not None
-                if self._wants_field and visitor.on_field(f) is False:
+                if visitor.on_field(f) is False:
                     # Skipped: the value stays pending and the next header walk
                     # discards it, which suspends in exactly the same place an
                     # explicit skip would and costs one call less. Nothing is
                     # materialized and nothing is validated (§6.7.2), so no cap
                     # and no schema bound is answered for it either (§6.2.1).
                     continue
-                if self._wants_bound:
-                    self._schema_bound(visitor, f)
+            if self._wants_bound:
+                # Independent of ``make_field`` now: this hook takes integers,
+                # so a handler that declares schema bounds and nothing else
+                # builds no Field at all.
+                assert visitor is not None
+                self._schema_bound(visitor, self._cur_id)
             if visitor is None:
                 # Nobody wants it: the value stays pending and the next header
                 # walk discards it.
@@ -1499,7 +1503,7 @@ class Decoder:
                 self._resume_entry = None
                 raise
 
-    def _schema_bound(self, visitor: Visitor, f: Field) -> None:
+    def _schema_bound(self, visitor: Visitor, fid: int) -> None:
         """Ask the handler what the **schema** bounds this field's count/length
         at, and settle the field against the answer (§6.2.1).
 
@@ -1513,7 +1517,9 @@ class Decoder:
           one "to a field the schema already bounds".
 
         Only string, blob and array fields carry a count or a length to bound;
-        a scalar has neither, so none is asked for.
+        a scalar has neither, so none is asked for. The hook takes the id and the
+        announced count/length as **integers**, so overriding it costs no object
+        per field.
         """
         pending = self._pending
         assert pending is not None  # every value field parks one at its header
@@ -1523,7 +1529,7 @@ class Decoder:
             return
         if kind == _FIXLEN and real[1] < _ST_STRING:
             return  # an fp32/fp64 payload: a fixed width, nothing to bound
-        self._settle_bound(visitor.on_schema_bound(f))
+        self._settle_bound(visitor.on_schema_bound(fid, real[2]))
 
     def _settle_bound(self, declared: int) -> None:
         """**The** site the schema bound is applied at — the one place in this
@@ -1878,9 +1884,10 @@ class Decoder:
         cls = type(visitor)
         self._wants_field = cls.on_field is not Visitor.on_field
         self._wants_bound = cls.on_schema_bound is not Visitor.on_schema_bound
-        # A Field is built for the two hooks that take one, and for nothing
-        # else: the typed hooks all take an id.
-        self._make_field = self._wants_field or self._wants_bound
+        # A Field is built for the ONE hook that takes one. Every other hook —
+        # on_schema_bound included — takes integers, so declaring a schema bound
+        # costs no object per field.
+        self._make_field = self._wants_field
         self._wants_seq_begin = cls.on_sequence_begin is not Visitor.on_sequence_begin
         self._wants_array_begin = cls.on_array_begin is not Visitor.on_array_begin
         self._wants_blob_begin = cls.on_blob_begin is not Visitor.on_blob_begin

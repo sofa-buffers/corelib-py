@@ -101,33 +101,34 @@ class Visitor:
         to decode it and dispatch to the typed hook below."""
         return None
 
-    def on_schema_bound(self, field: Field) -> int:
+    def on_schema_bound(self, field_id: int, n: int) -> int:
         """The count or length the **schema** declares for this field, or ``-1``.
 
-        Asked once, at the count/length header, for a ``string``, a ``blob`` or
-        an array this handler has accepted — after :meth:`on_field`, before a
-        byte of the payload is read or any storage is written. It is the one
-        place the schema's own ceiling reaches the codec, and it changes two
-        things about the field:
+        Asked once, at the count/length header — after :meth:`on_field`, before a
+        payload byte is read or any storage is written — for a ``string``, a
+        ``blob`` or an array this handler has accepted, and for nothing else. A
+        scalar carries neither a count nor a length, so none is asked for, and a
+        field the handler skipped is never asked (§6.7.2).
 
-        * a wire count/length **above** the declared bound is ``INVALID``
-          (:class:`sofab.SofaDecodeError`, MESSAGE_SPEC §7.1) — the message
-          contradicts the schema it claims to speak;
-        * the receiver-side ``max_dyn_*`` cap **stops applying** to the field.
-          CORELIB_PLAN §6.2.1: those limits "**MUST NOT** be applied to a field
-          the schema already bounds. There the schema bound governs and its
-          violation is `INVALID` … a schema bound is a statement about
-          *validity*, a receiver limit about *capacity*."
+        ``n`` is what the **wire** announced: the byte length for a ``string`` or
+        ``blob``, the element count for an array. It is passed so a handler can
+        answer without the decoder building an object for it — this hook takes
+        two integers precisely so that overriding it costs nothing per field.
 
-        Return ``-1`` (the default) for a field the schema leaves unbounded;
-        the cap then governs it as usual. Only the handler can answer this —
-        §6.2.1 puts the numbers in generated code, and "the corelib cannot know
-        the schema" — which is why it is a hook rather than a decoder setting.
+        Returning ``n >= 0``:
 
-        The verdict lands at the header, so a bound is enforced whether the
-        payload behind it arrives or not, and before anything is allocated for
-        it. A field this handler skips is never asked, and never bound-checked:
-        it is walked, not read (§6.7.2).
+        * a wire count/length above it is ``INVALID`` — :class:`sofab.SofaDecodeError`
+          (MESSAGE_SPEC §7.1): the message contradicts the schema;
+        * the receiver-side ``max_dyn_*`` cap **stops applying** to the field
+          (§6.2.1) — a schema bound is a statement about *validity*, a receiver
+          limit about *capacity*.
+
+        Returning ``-1`` (the default) leaves the field to the receiver caps,
+        unchanged.
+
+        A handler that declares destinations (:meth:`destinations`) answers this
+        from its table for every field the table names; this hook is what the
+        rest go through, and both reach the same rule in the same place.
         """
         return -1
 

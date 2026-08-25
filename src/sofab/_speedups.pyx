@@ -2318,8 +2318,10 @@ cdef class Decoder:
         self._wants_field = type(visitor).on_field is not _BASE_ON_FIELD
         self._wants_bound = (
             type(visitor).on_schema_bound is not _BASE_ON_SCHEMA_BOUND)
-        # A Field is built for the two hooks that take one, and nothing else.
-        self._make_field = self._wants_field or self._wants_bound
+        # A Field is built for the ONE hook that takes one. Every other hook --
+        # on_schema_bound included -- takes integers, so declaring a schema
+        # bound costs no object per field.
+        self._make_field = self._wants_field
         self._wants_seq_begin = (
             type(visitor).on_sequence_begin is not _BASE_ON_SEQUENCE_BEGIN)
         self._wants_array_begin = (
@@ -3459,17 +3461,19 @@ cdef class Decoder:
                     self._resume_entry = ei
                     raise
                 continue
-            if make_field:
-                f = self._cur
-                if self._wants_field and visitor.on_field(f) is False:
-                    # Skipped: the pending value stays pending and the next
-                    # header discards it, which suspends in exactly the same
-                    # place an explicit skip would and costs one call less.
-                    # Nothing is materialized and nothing is validated (S6.7.2),
-                    # so neither the cap nor a schema bound is answered for it.
-                    continue
-                if self._wants_bound:
-                    self._schema_bound(visitor, f)
+            if make_field and visitor.on_field(self._cur) is False:
+                # Skipped: the pending value stays pending and the next header
+                # discards it, which suspends in exactly the same place an
+                # explicit skip would and costs one call less. Nothing is
+                # materialized and nothing is validated (S6.7.2), so neither the
+                # cap nor a schema bound is answered for it.
+                continue
+            if self._wants_bound:
+                # Independent of make_field now: this hook takes integers, so a
+                # handler that declares schema bounds and nothing else builds no
+                # Field at all.
+                self._schema_bound(
+                    visitor, PyLong_FromUnsignedLongLong(self._cur_id))
             if not has_visitor:
                 # Nobody wants it: the pending value stays pending and the next
                 # header discards it, which suspends in exactly the same place
@@ -3482,17 +3486,23 @@ cdef class Decoder:
                 self._resume_entry = -1
                 raise
 
-    cdef int _schema_bound(self, object visitor, object f) except -1:
+    cdef int _schema_bound(self, object visitor, object fid) except -1:
         # The hook half: ask the handler, then hand the answer to the one site
-        # that owns the rule. The map path calls _settle_bound directly.
+        # that owns the rule. The map path calls _settle_bound directly. Both
+        # arguments are integers, so overriding the hook costs no object per
+        # field -- which is the whole reason it does not take a Field.
         cdef int pk = self._pk
         cdef int real = self._pk_real if pk == _PEND_LIMIT else pk
+        cdef object n
         if real == _PEND_FIXLEN:
             if self._pend_subtype < _ST_STRING:
                 return 0   # an fp32/fp64 payload: a fixed width, nothing to bound
-        elif real != _PEND_VARRAY and real != _PEND_FARRAY:
+            n = PyLong_FromUnsignedLongLong(self._pend_size)
+        elif real == _PEND_VARRAY or real == _PEND_FARRAY:
+            n = PyLong_FromUnsignedLongLong(self._pend_count)
+        else:
             return 0
-        return self._settle_bound(<Py_ssize_t>visitor.on_schema_bound(f))
+        return self._settle_bound(<Py_ssize_t>visitor.on_schema_bound(fid, n))
 
     cdef int _settle_bound(self, Py_ssize_t bound) except -1:
         # THE site. What the schema declares does two things (S6.2.1,
