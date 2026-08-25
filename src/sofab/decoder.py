@@ -1281,6 +1281,12 @@ class Decoder:
         # A Field is built only for a visitor that overrides ``on_field`` — the
         # one consumer that takes one. Not building it is most of what makes the
         # other paths fast (see _next_wire).
+        #
+        # It is a *per-handler* flag, so descending into a child handler and
+        # returning from one both change it: kept in a local for the loop's
+        # sake, it is re-read at each of the two places the handler changes.
+        # Without that a child overriding ``on_field`` was never asked (and the
+        # walk asserted on the Field nobody had built).
         want_field = self._wants_field
         while True:
             t = self._next_wire(want_field)
@@ -1297,6 +1303,8 @@ class Decoder:
                     if self._vstack:
                         visitor = self._visitor = self._vstack.pop()
                         self._bind_visitor(visitor)
+                        # The flags are the *handler's*, so they change with it.
+                        want_field = self._wants_field
                 continue
 
             bmap = self._bmap
@@ -1339,6 +1347,7 @@ class Decoder:
                             self._vstack.append(visitor)
                             visitor = self._visitor = answer
                             self._bind_visitor(answer)
+                            want_field = self._wants_field
                         continue
                 try:
                     self._skip_sequence()
