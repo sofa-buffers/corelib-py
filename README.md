@@ -604,40 +604,64 @@ followed it or on which engine read it (MESSAGE_SPEC §7.1). Omit them for
 
 The key point for Python: **decoding allocates results for you unless you ask it
 not to.** The visitor's typed hooks hand back fresh `int`/`str`/`bytes`/`list`
-objects; a `Binding`, `on_array_begin` or `on_blob_begin` writes into storage you
+objects; a `Binding`, or one of the five *begin* hooks, writes into storage you
 supplied and sized instead. Encoding never allocates an output buffer at all
 (§5.1).
 
+**Every aggregate has a route that does not size an allocation from the wire**
+(§6.6.3). Each hook is told the announced count or byte length first, before a
+byte is decoded, and refuses a destination too short rather than growing one:
+
+| aggregate | destination route | returns |
+|---|---|---|
+| `blob` | `on_blob_begin(id, size)` | a writable buffer of `size` bytes |
+| `string` | `on_string_begin(id, size)` | a writable buffer of `size` **bytes** — the payload's UTF-8, validated on the way in |
+| unsigned / signed array | `on_array_begin(id, wtype, count)` | `(dst, elem_min, elem_max)` |
+| `fp32` / `fp64` array | `on_float_array_begin(id, subtype, count)` | a writable buffer of `count` 8-byte slots |
+| `fp32` / `fp64` scalar | — | a value; a scalar is not storage (§6.6.3) |
+
+`fp32` additionally has §6.5's raw channel — `on_float32_bits` and
+`on_float32_array_bits`, paired with `Encoder.write_float32_bits` /
+`write_float32_array_bits` — for a consumer that has to reproduce the wire bytes
+rather than the value.
+
 **Where this port stands against CORELIB_PLAN §6.6, stated plainly.** The codec
-allocates nothing a wire number sizes on three paths — encode, a `Binding`
+allocates nothing a wire number sizes on the paths above — encode, a `Binding`
 decode, and a visitor decode that takes the destination routes — and
-`tests/test_allocation.py` measures exactly that: a payload a thousand times
-larger costs the same. It does not hold on the fourth: `on_string`, `on_bytes`,
-`on_unsigned_array` and the float-array hooks each hand back a whole value, and
+`tests/test_allocation.py` and `tests/test_aggregate_destinations.py` measure
+exactly that: a payload a thousand times larger costs the same. It does not hold
+where a handler asks for the **value**: `on_string`, `on_bytes`,
+`on_unsigned_array` and the float-array hooks each hand back a whole object, and
 the only size available to build one from is the wire's, which is what §6.6.3
 says such a callback obliges. Those hooks are kept because they are the
-convenient way to read a message, and the routes that avoid them are documented
-above. Beneath both, CPython allocates for every object a handler is given, so a
+convenient way to read a message, and every one of them now has an opt-out.
+Beneath both, CPython allocates for every object a handler is given, so a
 literal zero is not reachable in this language whatever the API looks like.
 
-* **Decode: the library owns the input buffer.** `Decoder` keeps a single
-  internal buffer, extended by `feed` and never handed out, so there is **no
-  zero-copy aliasing**: a handler receives a fresh `str`, independent `bytes`, a
-  fresh `int`/`float` or a new `list`, and every one of them stays valid after
-  the decoder advances.
-* **Decode: where a chunk-straddling construct is joined is yours to decide.**
-  By default the decoder joins it in a `bytearray` of its own, extended to
-  whatever the message declares. Pass `reassembly=bytearray(n)` and it joins in
-  **your** buffer instead, refusing a construct that does not fit rather than
-  growing one — which is what bounds a decode's memory by construction, and what
-  CORELIB_PLAN §6.6.2 asks of a codec. The default is the convenience; the
-  parameter is the conformant path, and generated code should take it.
+* **Decode: no value outlives the callback, and nothing is aliased.** A handler
+  receives a fresh `str`, independent `bytes`, a fresh `int`/`float` or a new
+  `list`, and every one of them stays valid after the decoder advances. The one
+  exception is `on_float32_array_bits`, which is §6.7's pass-through route: it is
+  handed a read-only view of the bytes *you* fed, and the view is **released**
+  when the callback returns, so it cannot be kept by accident.
+* **Decode: a chunk-straddling construct is joined in one bounded buffer.**
+  `Decoder(reassembly=…)` takes a `bytearray` you supply, or an `int` for the
+  decoder to size one from at construction; omit it and it takes
+  `sofab.DEFAULT_REASSEMBLY` (4096) bytes. There is no other shape and it never
+  grows: a construct that does not fit is `SofaArgumentError`, which is what
+  bounds a decode's memory by construction. CORELIB_PLAN §6.6.2 requires exactly
+  that — no sender can enlarge this buffer by sending different bytes. The 4096
+  is this port's number and not the specification's; raise it for a reader that
+  streams larger `string`/`blob`/array payloads **across chunk boundaries**.
+  A message fed in one call never touches the buffer, whatever its size.
 * **Decode: a decoded value can land in your storage too.** `Binding` writes the
-  numeric fields straight into slots you supply; `on_array_begin` takes a buffer
-  for an integer array's elements and `on_blob_begin` one for a blob's payload,
-  and neither builds a Python object on the way. What is left materialising is a
-  `str` (which must be validated, and this port validates by decoding), a float
-  array, and the scalars — those are values, not storage.
+  numeric fields straight into slots you supply, and the five *begin* hooks above
+  take a buffer for every aggregate — none of them builds a Python object on the
+  way. A `string` is still **validated** when it goes into your buffer (§6.7.2:
+  a field the handler reads is materialized *and* validated); the check runs over
+  the bytes in fixed windows, so it does not build the `str` the destination
+  exists to avoid. What is left materialising is the scalars, and those are
+  values, not storage.
 * **Decode: a suspended construct keeps its bytes, and only its bytes.**
   Everything fed is retained until it is consumed, so a field split across chunks
   is never half-decoded; the consumed prefix is dropped on the next `feed`, down
@@ -660,7 +684,11 @@ literal zero is not reachable in this language whatever the API looks like.
   blob or fixlen-array payload by advancing the cursor, so nothing is allocated
   for bytes that are being discarded: skipping a 1 MiB blob already in the
   buffer is a pointer bump. The bytes are still **buffered** when the payload
-  straddles a chunk boundary, so what a skip saves is the copy, not the window.
+  straddles a chunk boundary, so what a skip saves is the copy, not the window —
+  and a skipped construct larger than the reassembly buffer is therefore refused
+  where a port that skips by advancing a cursor would walk past it. That is the
+  resume contract's doing: a suspended skip replays from the construct's first
+  byte, so the bytes cannot be dropped as they arrive.
 * **Encode: one ownership model — the output buffer is fixed, and never grows.**
   CORELIB_PLAN §5.1 forbids a corelib to allocate an output buffer or to grow
   one, so there is a single mechanism here with three ways to reach it:
@@ -675,10 +703,16 @@ literal zero is not reachable in this language whatever the API looks like.
     `flush()`. Nothing is retained, so `getvalue()` raises `SofaArgumentError`.
   * `Encoder()` is the same scratch buffer with the sink appending into the
     *result* — the message `getvalue()` hands back, joined from the drained
-    chunks (a message that fits in the scratch is never chunked at all, and a
-    `string`/`blob` run longer than the buffer becomes one chunk rather than
-    being copied through it). What grows is the message being returned, not a
-    buffer being written into: `bytes_used()` never exceeds 1 KiB.
+    chunks (a message that fits in the scratch is never chunked at all). What
+    grows is the message being returned, not a buffer being written into:
+    `bytes_used()` never exceeds 1 KiB. **One deviation, on this shape only:** a
+    `string`/`blob` run at least a bufferful long is appended to the result
+    directly instead of being copied through the scratch. §5.1.6 says every byte
+    a sink receives lies inside the installed buffer, and here it does not. The
+    run is the encoder's own immutable copy, the output bytes are identical, and
+    no caller buffer and no caller sink exist on this path — `Encoder(writer)`
+    and `over_buffer(…, flush)`, which have both, copy everything through the
+    buffer. `tests/test_encode_buffer_ownership.py` pins all three.
 
   The scratch is one allocation per encoder, made at construction and never
   resized. A caller who wants zero library allocation supplies the buffer with
@@ -693,10 +727,13 @@ literal zero is not reachable in this language whatever the API looks like.
   there — where the buffer is handed over, never partway through a message.
   A buffer installed **without** a sink is subject to no minimum: no flush can
   occur, so the buffer simply holds the message or reports `SofaBufferError`, and
-  sizing it from a generated `MAX_SIZE` stays exact. There is no pass-through: a
-  `string`/`blob` run is copied into the output buffer like any other output, and
-  every flush hands the sink a `memoryview` **over that buffer** — the installed
-  buffer itself, never a copy of it and never any other memory. A sink that only
+  sizing it from a generated `MAX_SIZE` stays exact. **Nothing but the installed
+  buffer reaches a caller's sink**: a `string`/`blob` run is copied into the
+  output buffer like any other output, and every flush hands the sink a
+  `memoryview` **over that buffer** — the installed buffer itself, never a copy
+  of it and never any other memory (§5.1.6). The one exception is the in-memory
+  `Encoder()`, which has no caller sink; it is stated with that constructor
+  above. A sink that only
   reads or copies during the call may let the view go; one that keeps it has
   *taken* the buffer and must install a replacement before it returns (below).
 * **The handles this codec allocates, in full.** CORELIB_PLAN §6.6.2 lets a
@@ -726,9 +763,9 @@ literal zero is not reachable in this language whatever the API looks like.
   flushed packet, including when it passes the **same** buffer back.
 * **Lazy sequence framing holds no buffer.** The ids
   `write_sequence_begin_lazy` holds back are encoder state, never buffer content:
-  the pending run is allocated on the first hold-back — an encoder that never
-  opens a sequence never pays for it — and grows on demand to the full
-  `MAX_DEPTH`. A flush therefore cannot split a held-back run, and a tiny output
+  the pending run is `MAX_DEPTH` slots wide, sized at construction and never
+  grown (§6.6), so the hold-back reaches the full depth and every depth is
+  canonical. A flush therefore cannot split a held-back run, and a tiny output
   buffer yields exactly the one-shot bytes.
 
 ## Build & test
@@ -745,12 +782,16 @@ mypy --strict src/sofab      # type-check
 from `corelib-c-cpp`. Its `sequence_growth` block describes a **wrapper array's
 container** growing as elements arrive — a length no wire word announces, since
 MESSAGE_SPEC §5.1 makes it *highest present id + 1*. That container belongs to
-the layer above the codec, and this port ships no such layer, so the suite
-supplies one and asserts what the codec owes it: each element's index surfaced
-unrenumbered before anything is extended, and a rejection at an index that is
-terminal. Growth **geometry** — extending to at least `id + 1` so a sparse array
-does not cost O(n²) copies — is therefore not a property of anything here to
-measure.
+the layer above the codec, and this port ships that layer: `sofab.collectors`
+(`StringSeq`, `BytesSeq`, `UnsignedSeq`, `SignedSeq`, `Float32Seq`,
+`Float64Seq`, `NestedSeq`). **It allocates, on the generated layer's behalf**
+(CORELIB_PLAN §6.6.1) — its lists are not a §6.6 breach, because the codec never
+calls into it: a collector is reached only from inside a visitor callback the
+codec made, and the codec keeps no reference to anything it takes.
+`tests/test_sequence_growth.py` replays every case in the block against it, and
+`tests/test_collectors.py` measures the growth **geometry** with `tracemalloc`
+— extending to at least `id + 1` in one pass, so a sparse array costs O(n) and
+not O(n²).
 
 If the compile fails or no compiler is available, the install falls back to
 pure-Python (the extension is marked *optional* in `setup.py`). Both engines

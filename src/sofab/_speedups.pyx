@@ -34,8 +34,9 @@ benchmark workloads showed:
 * **Attribute and call shapes the interpreter can specialize.** ``Field``'s five
   attributes are published as slot descriptors and the methods as plain method
   descriptors (hence ``binding=False`` / ``always_allow_keywords=False`` above),
-  which is what lets CPython's inline caches turn ``field.id`` and ``dec.next()``
-  into their specialized forms instead of the generic attribute path.
+  which is what lets CPython's inline caches turn ``field.id`` and
+  ``dec.feed(chunk)`` into their specialized forms instead of the generic
+  attribute path.
 * **Nothing is copied that is only going to be read.** Array writes walk the
   caller's list in place, string writes take the str's own UTF-8 buffer, and
   fixlen reads are built straight off the decode buffer.
@@ -49,7 +50,8 @@ therefore cost speed on an unexpected build, never correctness.
 cimport cython
 
 from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_FromStringAndSize, PyBytes_GET_SIZE
-from cpython.bytearray cimport PyByteArray_AS_STRING, PyByteArray_GET_SIZE
+from cpython.bytearray cimport (PyByteArray_AS_STRING, PyByteArray_GET_SIZE,
+                                PyByteArray_FromStringAndSize)
 from cpython.list cimport PyList_Append, PyList_GET_ITEM, PyList_GET_SIZE, PyList_New
 from cpython.buffer cimport (PyObject_GetBuffer, PyBuffer_Release,
                              PyBUF_WRITABLE, PyBUF_SIMPLE)
@@ -469,6 +471,12 @@ cdef extern from "Python.h":
     # Decodes UTF-8 straight out of the decoder's buffer, so a string field
     # never materialises an intermediate ``bytes`` object.
     str PyUnicode_DecodeUTF8(const char*, Py_ssize_t, const char*)
+    # The same, stopping at an incomplete trailing sequence instead of raising
+    # for it and reporting how many bytes it did consume. Used to validate a
+    # payload in fixed windows, so a string read into a caller destination is
+    # checked without a ``str`` of the payload's own length (S6.4.4).
+    str PyUnicode_DecodeUTF8Stateful(const char*, Py_ssize_t, const char*,
+                                     Py_ssize_t*)
     # The str's own UTF-8 form (cached on the object), so encoding a string does
     # not allocate a ``bytes`` either.
     const char* PyUnicode_AsUTF8AndSize(object, Py_ssize_t*) except NULL
@@ -604,6 +612,13 @@ cdef Py_ssize_t _MIN_OUTPUT_BUFFER = MIN_OUTPUT_BUFFER
 # Reassembly space a decoder takes when the caller names no size. Mirrors
 # sofab.types.DEFAULT_REASSEMBLY; both engines bound memory the same way.
 cdef Py_ssize_t _DEFAULT_REASSEMBLY = DEFAULT_REASSEMBLY
+
+cdef inline object _fresh_bytearray(Py_ssize_t n):
+    # A bytearray of n bytes whose contents are not zeroed. Only the span
+    # _reassemble has actually written is ever read back, and zeroing costs one
+    # store per byte on a buffer a one-shot decode never touches at all --
+    # measurably, ~208 ns of a ~450 ns decoder construction at the default size.
+    return PyByteArray_FromStringAndSize(NULL, n)
 # Size of the scratch buffer the convenience constructors install (S5.1
 # "unbounded schema" shape). One allocation per encoder, made at construction and
 # never resized -- the encoder drains it through its sink whenever it fills, so
@@ -646,12 +661,55 @@ cdef object _BASE_ON_FIELD = _Visitor.on_field
 cdef object _BASE_ON_SEQUENCE_BEGIN = _Visitor.on_sequence_begin
 cdef object _BASE_ON_ARRAY_BEGIN = _Visitor.on_array_begin
 cdef object _BASE_ON_BLOB_BEGIN = _Visitor.on_blob_begin
+cdef object _BASE_ON_STRING_BEGIN = _Visitor.on_string_begin
+cdef object _BASE_ON_FARRAY_BEGIN = _Visitor.on_float_array_begin
 cdef object _BASE_ON_F32_BITS = _Visitor.on_float32_bits
 cdef object _BASE_ON_F32_ARRAY_BITS = _Visitor.on_float32_array_bits
 cdef object _ARRAY_MAX_OBJ = _ARRAY_MAX
 cdef object _FIXLEN_MAX_OBJ = _FIXLEN_MAX
 cdef object _INT64_MAX_OBJ = INT64_MAX
 cdef tuple _ST = tuple(FixlenSubtype)
+cdef object _FP32_OBJ = FixlenSubtype.FP32
+cdef object _FP64_OBJ = FixlenSubtype.FP64
+
+# Bytes validated per pass in _decode_utf8_checked. The transient str each pass
+# builds is bounded by this, so a payload of any length costs a constant.
+# Mirrors sofab._core.UTF8_WINDOW.
+cdef Py_ssize_t _UTF8_WINDOW = 4096
+
+
+cdef int _decode_utf8_checked(const char* p, Py_ssize_t size) except -1:
+    # Is this valid UTF-8? Answered without building a str of the payload's
+    # length: S6.6.3's destination route exists to avoid exactly that object,
+    # so validating by decoding the whole payload would give it straight back.
+    # A sequence straddling a window boundary is carried into the next pass, the
+    # way S6.4.4 carries one across a fed chunk.
+    cdef Py_ssize_t pos = 0
+    cdef Py_ssize_t n, used
+    cdef object text
+    while pos < size:
+        n = size - pos
+        if n > _UTF8_WINDOW:
+            n = _UTF8_WINDOW
+        try:
+            if pos + n >= size:
+                # The final window: an incomplete tail here is not "wait for
+                # more", it is a payload that ends inside a sequence.
+                text = PyUnicode_DecodeUTF8(p + pos, n, NULL)
+                pos += n
+            else:
+                used = 0
+                text = PyUnicode_DecodeUTF8Stateful(p + pos, n, NULL, &used)
+                if used <= 0:
+                    # Unreachable: a sequence is at most 4 bytes and the window
+                    # is far wider, so a non-final window always consumes some.
+                    raise SofaDecodeError(     # pragma: no cover
+                        "invalid UTF-8 in string field")
+                pos += used
+        except UnicodeDecodeError as exc:
+            raise SofaDecodeError("invalid UTF-8 in string field") from exc
+        text = None
+    return 0
 
 # Pending-value kinds (mirror the pure decoder's _SCALAR/_FIXLEN/_VARRAY/_FARRAY).
 cdef int _PEND_NONE = 0
@@ -661,7 +719,8 @@ cdef int _PEND_VARRAY = 3
 cdef int _PEND_FARRAY = 4
 # A pending value a receiver-side cap has rejected (§6.2.1). The kind it stands
 # in for is kept in _pk_real and the rejection's message in _limit_msg, so the
-# rejection can still be waived by schema_bounded() and a peek can read through
+# rejection can still be waived by a binding entry's declared bound, and a
+# route that needs the count or the subtype can read through
 # it.
 #
 # Parked rather than raised because the verdict is not final at the header: it
@@ -1891,16 +1950,17 @@ cdef _Compiled _compiled_for(object binding):
 
 
 cdef class Decoder:
-    """Native pull decoder — see :class:`sofab.decoder.Decoder` for the contract.
+    """Native push decoder — see :class:`sofab.decoder.Decoder` for the contract.
 
-    Reads from any object exposing ``read(n) -> bytes``. Incoming bytes are held
-    in one contiguous buffer and parsed by advancing a C cursor with direct
-    pointer indexing; it refills transparently from the reader when it runs off
-    the end mid-item, so it serves both a fully-buffered message and a reader
-    that dribbles one byte at a time.
+    Bytes go in through ``feed`` and fields come out at a ``visitor`` or a
+    ``binding``. Incoming bytes are held in one contiguous buffer and parsed by
+    advancing a C cursor with direct pointer indexing; a construct that runs off
+    the end suspends and resumes from its first byte on the next ``feed``, so the
+    same path serves a whole message and a reader that dribbles one byte at a
+    time.
     """
 
-    # Receiver-configured decode limits (None = no limit); kept as Python objects
+    # Receiver-configured decode limits; kept as Python objects
     # so the comparison stays exact for a caller-supplied int of any magnitude.
     # Whether any receiver cap is configured at all. All three default to off,
     # and without this the header walk touches a Python attribute per string,
@@ -1963,6 +2023,8 @@ cdef class Decoder:
     cdef bint _wants_seq_begin
     cdef bint _wants_array_begin
     cdef bint _wants_blob_begin
+    cdef bint _wants_string_begin
+    cdef bint _wants_farray_begin
     cdef bint _wants_f32_bits
     cdef bint _wants_f32_array_bits
     cdef object _objects             # list destination for string/blob fields
@@ -1972,7 +2034,7 @@ cdef class Decoder:
     cdef uint64_t* _words            # caller-owned slot buffer
     # Heap-allocated rather than inline: a Py_buffer is 80 bytes and only a
     # decoder with a binding ever fills one, so keeping it out of the struct
-    # keeps every pull decoder — one per message on the one-shot path — smaller.
+    # keeps every decoder — one per message on the one-shot path — smaller.
     cdef Py_buffer* _wview
     cdef Py_ssize_t _nwords
     # Active table, and the enclosing ones: a sequence opens a fresh id scope
@@ -2021,7 +2083,7 @@ cdef class Decoder:
         self._rend = 0
         # One reassembly shape, never grown (S6.6.2) -- see the pure engine.
         if reassembly is None:
-            self._rbuf = bytearray(_DEFAULT_REASSEMBLY)
+            self._rbuf = _fresh_bytearray(_DEFAULT_REASSEMBLY)
         elif type(reassembly) is bytearray:
             self._rbuf = reassembly
         elif type(reassembly) is int:
@@ -2029,7 +2091,7 @@ cdef class Decoder:
                 raise SofaArgumentError(
                     "reassembly=%d is too small; 16 bytes is the least that "
                     "can hold a construct spanning a chunk" % reassembly)
-            self._rbuf = bytearray(<Py_ssize_t>reassembly)
+            self._rbuf = _fresh_bytearray(<Py_ssize_t>reassembly)
         else:
             raise SofaArgumentError(
                 "reassembly must be a bytearray, a byte count, or omitted")
@@ -2119,6 +2181,10 @@ cdef class Decoder:
             type(visitor).on_array_begin is not _BASE_ON_ARRAY_BEGIN)
         self._wants_blob_begin = (
             type(visitor).on_blob_begin is not _BASE_ON_BLOB_BEGIN)
+        self._wants_string_begin = (
+            type(visitor).on_string_begin is not _BASE_ON_STRING_BEGIN)
+        self._wants_farray_begin = (
+            type(visitor).on_float_array_begin is not _BASE_ON_FARRAY_BEGIN)
         # S6.5's raw fp32 channel, opt-in by override -- see the pure engine.
         self._wants_f32_bits = (
             type(visitor).on_float32_bits is not _BASE_ON_F32_BITS)
@@ -2547,7 +2613,7 @@ cdef class Decoder:
     cdef object _mismatch(self):
         # The answer a typed read owes a pending value whose wire tag
         # contradicts it: None — MESSAGE_SPEC §7.3, not an error. The value
-        # stays pending, so the next next() (or an explicit skip()) discards it
+        # stays pending, so the next header walk (or an explicit skip) discards it
         # exactly like an unknown id, nothing is written to the caller, and the
         # decode stays COMPLETE. Two conditions reach here that are not that:
         # no pending value at all is a caller mistake (§6.3 InvalidArgument),
@@ -2744,7 +2810,7 @@ cdef class Decoder:
             # A parked receiver cap (§6.2.1) keeps the pending fixlen intact, and
             # this peek reads and allocates nothing — so it answers through the
             # parked rejection. That is what lets generated code decide the
-            # SCHEMA bound (INVALID, §7.1) whether or not schema_bounded() has
+            # SCHEMA bound (INVALID, §7.1) whether or not a binding entry has
             # been called yet. Mirrors Decoder.fixlen_len in the pure engine.
             # ... and, for the same reason, it does not re-raise the cap the
             # way a consuming read does.
@@ -2760,7 +2826,7 @@ cdef class Decoder:
         cdef const unsigned char* p
         if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_STRING:
             return self._mismatch()
-        n = <Py_ssize_t>self._pend_size      # bounded by FIXLEN_MAX in next()
+        n = <Py_ssize_t>self._pend_size      # bounded by FIXLEN_MAX at the header
         p = self._take_fixlen_ptr(n)
         try:
             # Decoded straight off the buffer: strict UTF-8 (no ``errors=``), so
@@ -2841,8 +2907,26 @@ cdef class Decoder:
         self._pk = _PEND_NONE   # committed only once the payload is in hand
         return data
 
+    cdef const unsigned char* _take_farray_ptr(self) except NULL:
+        # _take_fixlen_ptr for a fixlen-array payload: the bytes in place where
+        # they are already buffered, and _read_exact parked in _spill where they
+        # are not. The whole tag is matched by the caller (S7.3).
+        cdef Py_ssize_t n = self._farray_nbytes(self._pend_count,
+                                                self._pend_size)
+        cdef const unsigned char* p
+        if self._n - self._pos >= n:
+            self._pk = _PEND_NONE
+            self._spill = None
+            p = self._p + self._pos
+            self._pos += n
+            return p
+        self._arm()
+        self._spill = self._read_exact(n)
+        self._pk = _PEND_NONE   # committed only once the payload is in hand
+        return <const unsigned char*>PyBytes_AS_STRING(self._spill)
+
     cdef object _read_farray(self, int subtype, Py_ssize_t width):
-        # The element width is settled at the fixlen_word by next() — §4.8 fixes
+        # The element width is settled at the fixlen_word — §4.8 fixes
         # it to 4 for fp32 and 8 for fp64, and §5.2 wants that INVALID verdict
         # before any payload read — so a pending array always matches ``width``
         # and the payload read below yields exactly count*width bytes or raises.
@@ -3325,7 +3409,7 @@ cdef class Decoder:
     cdef inline void _unpark(self, Py_ssize_t declared) noexcept:
         # A field the binding declares a bound for is schema-bounded, so the
         # receiver-side cap does not apply to it (§6.2.1). Same effect as
-        # schema_bounded(), without the Python call.
+        # a binding entry's declared bound, without the Python call.
         if declared and self._pk == _PEND_LIMIT:
             self._pk = self._pk_real
             self._limit_msg = None
@@ -3474,6 +3558,89 @@ cdef class Decoder:
             PyBuffer_Release(&view)
         return 0
 
+    cdef int _take_string_into(self, object dst, Py_ssize_t size) except -1:
+        # S6.6.3's destination route for a string. No str is built on the way,
+        # but the bytes are still validated: S6.7.2 makes a field the handler
+        # *reads* both materialized and validated. Mirrors the pure engine.
+        cdef Py_buffer view
+        cdef const unsigned char* p
+        cdef Py_ssize_t used = 0
+        try:
+            PyObject_GetBuffer(dst, &view, PyBUF_WRITABLE | PyBUF_SIMPLE)
+        except (BufferError, TypeError) as exc:
+            raise SofaArgumentError(
+                "on_string_begin returned a destination that is not a "
+                "writable, contiguous buffer") from exc
+        try:
+            if view.itemsize != 1:
+                raise SofaArgumentError(
+                    "on_string_begin's destination must hold single bytes")
+            if view.len < size:
+                raise SofaArgumentError(
+                    "on_string_begin returned %d bytes for a string of %d"
+                    % (view.len, size))
+            p = self._take_fixlen_ptr(size)
+            # Validate before the destination is touched, so a caller never sees
+            # a half-written buffer behind an INVALID verdict. Stateful, so the
+            # whole payload is checked without a str of its length: the decoded
+            # text is dropped, and only the count of validated bytes is used.
+            _decode_utf8_checked(<const char*>p, size)
+            memcpy(view.buf, <const void*>p, size)
+            self._spill = None
+        finally:
+            PyBuffer_Release(&view)
+        return 0
+
+    cdef int _visit_farray_into(self, object visitor, object fid,
+                                Py_ssize_t width) except -1:
+        # Offer a fixlen array's elements a destination (S6.6.3). Returns 0 when
+        # the handler wants the list instead. Mirrors the pure engine.
+        cdef object dst
+        cdef Py_ssize_t count = <Py_ssize_t>self._pend_count
+        cdef Py_buffer view
+        cdef const unsigned char* p
+        cdef double* out
+        cdef Py_ssize_t i
+        if not self._wants_farray_begin:
+            return 0
+        dst = visitor.on_float_array_begin(
+            fid, _FP32_OBJ if width == 4 else _FP64_OBJ, count)
+        if dst is None:
+            return 0
+        if self._pk == _PEND_LIMIT:
+            # Spent: the destination is the handler's own storage, so there is
+            # no allocation of this decoder's left for the cap to prevent.
+            self._pk = self._pk_real
+            self._limit_msg = None
+        try:
+            PyObject_GetBuffer(dst, &view, PyBUF_WRITABLE | PyBUF_SIMPLE)
+        except (BufferError, TypeError) as exc:
+            raise SofaArgumentError(
+                "on_float_array_begin returned a destination that is not a "
+                "writable, contiguous buffer") from exc
+        try:
+            if view.itemsize != 8:
+                raise SofaArgumentError(
+                    "on_float_array_begin's destination must hold 8-byte "
+                    "items; a Python float is a double, and so is every value "
+                    "written here")
+            if view.len < count * 8:
+                raise SofaArgumentError(
+                    "on_float_array_begin returned %d slots for an array of %d"
+                    % (view.len // 8, count))
+            p = self._take_farray_ptr()
+            out = <double*>view.buf
+            if width == 4:
+                for i in range(count):
+                    out[i] = _unpack_f32(p + i * 4)
+            else:
+                for i in range(count):
+                    out[i] = _unpack_f64(p + i * 8)
+            self._spill = None
+        finally:
+            PyBuffer_Release(&view)
+        return 1
+
     cdef int _visit_varints(self, object visitor, object fid, int wtype,
                             bint zigzag) except -1:
         # Deliver an integer array by whichever route on_array_begin asked for
@@ -3584,6 +3751,17 @@ cdef class Decoder:
             elif st == _ST_FP64:
                 visitor.on_float64(fid, self._float64())
             elif st == _ST_STRING:
+                # Same bargain as on_blob_begin below (#128): the handler is
+                # told the announced byte length before a byte is copied, and a
+                # buffer it hands back is one it sized itself.
+                if self._wants_string_begin:
+                    dst = visitor.on_string_begin(fid, self._pend_size)
+                    if dst is not None:
+                        if self._pk == _PEND_LIMIT:
+                            self._pk = self._pk_real
+                            self._limit_msg = None
+                        self._take_string_into(dst, <Py_ssize_t>self._pend_size)
+                        return 0
                 visitor.on_string(fid, self._string())
             else:
                 # Offered before a parked receiver cap is answered (#128).
@@ -3613,9 +3791,9 @@ cdef class Decoder:
         elif st == _ST_FP32:
             if self._wants_f32_array_bits:
                 self._visit_farray_bits(visitor, fid)
-            else:
+            elif not self._visit_farray_into(visitor, fid, 4):
                 visitor.on_float32_array(fid, self._read_float32_array())
-        else:
+        elif not self._visit_farray_into(visitor, fid, 8):
             visitor.on_float64_array(fid, self._read_float64_array())
         return 0
 

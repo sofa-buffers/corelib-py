@@ -3,9 +3,10 @@
 A wrapper array carries no length: MESSAGE_SPEC §5.1 makes it *highest present
 id + 1*, so its container grows as elements arrive. The growth itself belongs to
 the static helper / generated layer (§6.6.1) and never to the codec — this port
-ships no such layer, so the container below is the test's, standing in for
-generated code exactly as the vectors' own note describes ("the port builds the
-message from `deliver` and asserts `expect`").
+ships that layer as ``sofab.collectors``, so the container below is the
+library's own, driven through the public visitor API exactly as generated code
+drives it ("the port builds the message from `deliver` and asserts `expect`").
+Its growth **geometry** is measured in ``tests/test_collectors.py``.
 
 What the codec owes, and what these cases pin, is §6.2.1's other half:
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import struct
 from array import array as _array
+from codecs import utf_8_decode as _utf8_decode
 from typing import Any
 
 _F32 = struct.Struct("<f")
@@ -219,3 +220,49 @@ def unpack_farray_into(
             values = struct.unpack_from(f"<{n}d", data, pos)
         dst[at + off : at + off + n] = _array("d", values)
         off += n
+
+
+# --- UTF-8 validation without materializing the string ----------------------
+
+#: Bytes validated per pass. The transient ``str`` each pass builds is bounded
+#: by this, so a payload of any length costs a constant.
+UTF8_WINDOW = 4096
+
+
+def utf8_valid(data: Any, start: int, size: int) -> bool:
+    """Are ``size`` bytes of ``data`` from ``start`` valid UTF-8?
+
+    CORELIB_PLAN §6.4.3's primitive, for the one caller that needs the answer
+    without the value: a `string` read into a destination the caller supplied
+    (§6.6.3) still has to be validated (§6.7.2), and decoding it to find out
+    would build the very ``str`` the destination exists to avoid.
+
+    The bytes are checked in windows of :data:`UTF8_WINDOW`, with a sequence
+    straddling a window boundary carried into the next pass exactly as §6.4.4
+    carries one across a fed chunk. Peak allocation is therefore the window,
+    whatever the payload's length.
+    """
+    view = memoryview(data)
+    try:
+        pos = 0
+        while pos < size:
+            n = size - pos
+            if n > UTF8_WINDOW:
+                n = UTF8_WINDOW
+            final = pos + n >= size
+            try:
+                _text, used = _utf8_decode(
+                    view[start + pos : start + pos + n], "strict", final
+                )
+            except UnicodeDecodeError:
+                return False
+            if used <= 0:
+                # An incomplete sequence at the end of a non-final window. UTF-8
+                # sequences are at most 4 bytes and the window is far wider, so
+                # this can only mean the window *is* the tail — which `final`
+                # already covered.
+                return False  # pragma: no cover
+            pos += used
+        return True
+    finally:
+        view.release()

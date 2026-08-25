@@ -417,3 +417,54 @@ def test_a_child_handler_gets_its_own_on_field(engine):
     dec = engine(visitor=Root())
     assert dec.feed(wire) is Status.COMPLETE
     assert [(i, s) for i, _t, s in seen] == [(0, 2), (1, 0)]
+
+
+# --- growth geometry (§7.2 item 8) -------------------------------------------
+
+
+def test_the_container_extends_to_the_index_in_one_pass():
+    """§7.2 item 8: "Test it where the language offers [an allocation-counting
+    facility]; where it does not, say so in the port's README rather than
+    reporting the case as passed." Python offers ``tracemalloc``, so it is
+    tested.
+
+    The property is that a **sparse** wrapper array does not cost O(n²): placing
+    at a far index extends the container to at least ``index + 1`` in one pass,
+    rather than re-copying the whole list per element. CPython's ``list`` gives
+    that for free — appending is amortised O(1) — and the point of the case is
+    to notice if the collector ever stops using it.
+    """
+    import tracemalloc
+
+    span = 1 << 14
+
+    def place(step):
+        out: list = []
+        coll = UnsignedSeq(out, cap=span)
+        tracemalloc.start()
+        try:
+            base = tracemalloc.get_traced_memory()[0]
+            for index in range(0, span, step):
+                coll.on_unsigned(index, index)
+            return tracemalloc.get_traced_memory()[1] - base, out
+        finally:
+            tracemalloc.stop()
+
+    dense, out_dense = place(1)
+    sparse, out_sparse = place(1 << 8)
+
+    # Both reach the same length: the gap is filled, not skipped (MESSAGE_SPEC §2).
+    assert len(out_dense) == span
+    assert len(out_sparse) == span - (1 << 8) + 1
+    assert out_sparse[0] == 0 and out_sparse[1] == 0 and out_sparse[1 << 8] == 1 << 8
+
+    # And the sparse walk costs no more than the dense one: if the container were
+    # rebuilt per element rather than extended, 64 far placements over 16,384
+    # slots would peak at many times a single list of that size.
+    assert sparse <= dense * 2, (
+        f"a sparse array peaked at {sparse} bytes against {dense} for the dense "
+        "one; the container is being rebuilt rather than extended"
+    )
+    # One list of `span` slots is ~8 bytes per slot; anything near a multiple of
+    # that is a copy per element.
+    assert sparse < span * 8 * 3, f"{sparse} bytes for {span} slots"

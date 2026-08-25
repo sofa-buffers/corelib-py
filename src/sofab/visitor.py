@@ -1,14 +1,14 @@
-"""Visitor-pattern decode driver — the language-idiomatic pull alternative.
+"""The decode surface. CORELIB_PLAN §5.3.1 makes it the only one:
 
-ARCHITECTURE.md lists the visitor pattern as a recommended decoder shape:
-
-    "The decoder calls typed visitor methods on a user-supplied object.
-     Pull-reading becomes the visitor receives the value or chooses to skip."
+    "A corelib exposes exactly one decode surface: the visitor. The decoder
+     calls typed visitor methods on a caller-supplied object; pull-reading
+     becomes 'the visitor writes the decoded value into one of the object's own
+     members and skips what it does not recognise'."
 
 :class:`Visitor` is a base class whose hooks all default to *no-op* (the value
 is still consumed, so an unhandled field is transparently skipped). Subclass it
-and override only the fields you care about, then hand it to
-:meth:`sofab.Decoder.drive`.
+and override only the fields you care about, then pass it to
+:class:`sofab.Decoder` as ``visitor=``.
 
 Two control hooks let a visitor decline work *before* the value is decoded — so
 skipping a 10k-element array or a deep sub-tree costs nothing:
@@ -19,15 +19,17 @@ skipping a 10k-element array or a deep sub-tree costs nothing:
   nested sequence (its matching end is consumed too, so ``on_sequence_end`` is
   *not* called for a skipped sequence).
 
-The driver itself is layered on the public pull API, so it inherits the same
-"advance a cursor over a contiguous buffer" hot path as direct pull decoding.
+Which hooks a handler overrides is read off its **type**, once, when the
+decoder binds it — so a hook nobody overrides costs nothing per field, and a
+child handler returned from :meth:`Visitor.on_sequence_begin` is measured on its
+own type rather than its parent's.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from .types import Field, WireType
+from .types import Field, FixlenSubtype, WireType
 
 
 class Visitor:
@@ -134,9 +136,7 @@ class Visitor:
         return the same answer each time; the decoder restarts the payload from
         its first byte.
 
-        Not offered for strings. A string the handler reads must be validated
-        (§6.7.2), and this port validates by decoding, which builds the ``str``
-        a destination exists to avoid — so there would be nothing to save.
+        The string twin is :meth:`on_string_begin`.
 
         **A configured** ``max_dyn_blob_len`` **does not gate this hook.** It is
         asked first, and asked whatever the announced size is. The limit is
@@ -147,6 +147,76 @@ class Visitor:
         unwilling to take that many can refuse it here, which is its call to
         make. Return ``None`` and the cap applies again, because then the
         ``bytes`` is the decoder's to build and the wire is its only size.
+        """
+        return None
+
+    def on_string_begin(self, field_id: int, size: int) -> Any:
+        """A string's byte length has been read; no payload byte has been
+        copied yet, and none has been validated.
+
+        Return ``None`` to take the default — a ``str``, handed to
+        :meth:`on_string`. Return a writable, contiguous buffer of at least
+        ``size`` **bytes** and the decoder validates the payload as UTF-8, copies
+        the wire bytes straight into it, and does **not** call
+        :meth:`on_string`. One too short is :class:`sofab.SofaArgumentError`;
+        the decoder never grows one (CORELIB_PLAN §6.6), and the refusal comes at
+        the length word, before a byte is written.
+
+        ``size`` is the **wire byte length**, which is what a schema ``maxlen``
+        bounds (MESSAGE_SPEC §1) — not a character count. What lands in the
+        buffer is UTF-8, so a target that wants Python text decodes it itself;
+        what this saves is the ``str`` the decoder would otherwise have had to
+        build, sized by the wire.
+
+        This is §6.6.3's second shape for the third aggregate, and it is the
+        sharpest of the three: with a caller ``reassembly=`` buffer *and* a
+        ``Binding``, a 1 MiB string still cost a 1 MiB allocation inside the
+        codec, because there was no third opt-out to take.
+
+        **The payload is still validated** (§6.7.2: a field the handler reads is
+        materialized *and* validated). Validation runs over the bytes in fixed
+        windows, carrying an incomplete sequence across the window boundary the
+        way §6.4.4 permits across a chunk boundary, so nothing the wire sizes is
+        built to check them. Invalid UTF-8 is ``INVALID`` and the destination is
+        left untouched.
+
+        Called again for the same string if a chunk boundary suspends the copy,
+        so return the same answer each time; the decoder restarts the payload
+        from its first byte.
+
+        **A configured** ``max_dyn_string_len`` **does not gate this hook**, on
+        the same reasoning as :meth:`on_blob_begin`.
+        """
+        return None
+
+    def on_float_array_begin(
+        self, field_id: int, subtype: FixlenSubtype, count: int
+    ) -> Any:
+        """A fixlen (``fp32``/``fp64``) array's count has been read; no element
+        has been decoded.
+
+        Return ``None`` to take the default — a ``list``, handed to
+        :meth:`on_float32_array` / :meth:`on_float64_array` — or a writable
+        buffer of at least ``count`` **8-byte** slots (an ``array("d")``, a
+        ``memoryview`` over one, a NumPy ``float64`` array). The decoder widens
+        each element into it and does **not** call the typed hook. A buffer too
+        short is :class:`sofab.SofaArgumentError`; the decoder never grows one
+        (CORELIB_PLAN §6.6).
+
+        ``subtype`` is :attr:`sofab.FixlenSubtype.FP32` or
+        :attr:`~sofab.FixlenSubtype.FP64`, so one hook serves both and a handler
+        that only wants one returns ``None`` for the other.
+
+        Slots are 8 bytes for both subtypes because a Python ``float`` is a
+        double and that is what the values become. A consumer that needs an
+        ``fp32``'s **wire bits** intact takes :meth:`on_float32_array_bits`
+        instead (§6.5).
+
+        Called again for the same array if a chunk boundary suspends the read,
+        so return the same answer each time.
+
+        **A configured** ``max_dyn_array_count`` **does not gate this hook**, on
+        the same reasoning as :meth:`on_blob_begin`.
         """
         return None
 
