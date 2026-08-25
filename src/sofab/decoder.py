@@ -190,7 +190,6 @@ class Decoder:
     __slots__ = (
         "_buf",
         "_capped",
-        "_cur",
         "_cur_id",
         "_cur_subtype",
         "_cur_wtype_resume",
@@ -384,7 +383,6 @@ class Decoder:
         self._n = 0
         self._pos = 0
         self._depth = 0
-        self._cur: Field | None = None
         # pending unconsumed value: tuple keyed by the _* constants above
         self._pending: tuple[Any, ...] | None = None
         # Resume transaction (§5.2): the buffer offset the call in flight
@@ -769,17 +767,16 @@ class Decoder:
 
     # --- field iteration ----------------------------------------------------
 
-    def _next_wire(self, want_field: bool) -> int:
+    def _next_wire(self) -> int:
         """Parse one field header; return its wire type, or ``-1`` at clean EOF.
 
-        The header half of the walk, plus the one thing the wire cannot say:
-        whether the handler wants a :class:`Field` at all. A skipped sequence's
-        walk and a decode bound to destinations do not, and building one is
-        not free — a ``Field`` is ~250 ns here, so a 36-field message would spend
-        ~9 us on objects nobody reads. With ``want_field`` false none are built:
-        the id and fixlen subtype go to ``_cur_id`` / ``_cur_subtype`` instead
-        (and only when a binding needs them), and the size/count stay in the
-        pending tuple, where the consume paths already look for them.
+        The header half of the walk, and **no** :class:`Field` — building one is
+        not free (~250 ns, so a 36-field message would spend ~9 us on them), and
+        the walk cannot yet know whether anyone will be offered this field: a
+        field the handler's destination map names never reaches ``on_field``.
+        The one place that can know builds it, from ``_cur_id``,
+        ``_cur_subtype`` and the pending tuple, where the consume paths already
+        look for the size and count (:meth:`_build_field`).
         """
         self._keep = self._pos  # opens this field's resume transaction (§5.2)
         if self._pending is not None:
@@ -872,11 +869,6 @@ class Decoder:
                     raise SofaDecodeError("fp32 fixlen length must be 4")
             elif length != 8:
                 raise SofaDecodeError("fp64 fixlen length must be 8")
-            if want_field:
-                self._cur = Field(
-                    field_id, WireType.FIXLEN, size=length,
-                    subtype=FixlenSubtype(subtype),
-                )
             self._cur_subtype = subtype
             pending: tuple[Any, ...] = (_FIXLEN, subtype, length)
             # Receiver-configured caps (policy, not malformation): the verdict on
@@ -910,8 +902,6 @@ class Decoder:
             return wtype
 
         if wtype < _WT_FIXLEN:  # UNSIGNED (0) or SIGNED (1)
-            if want_field:
-                self._cur = Field(field_id, _WT[wtype])
             self._pending = (_SCALAR, wtype)
             return wtype
 
@@ -919,24 +909,18 @@ class Decoder:
             if self._depth <= 0:
                 raise SofaDecodeError("unbalanced sequence end")
             self._depth -= 1
-            if want_field:
-                self._cur = Field(0, WireType.SEQUENCE_END)
             return wtype
 
         if wtype == _WT_SEQUENCE_START:
             if self._depth >= MAX_DEPTH:
                 raise SofaDecodeError(f"nesting exceeds MAX_DEPTH={MAX_DEPTH}")
             self._depth += 1
-            if want_field:
-                self._cur = Field(field_id, WireType.SEQUENCE_START)
             return wtype
 
         if wtype == _WT_ARRAY_UNSIGNED or wtype == _WT_ARRAY_SIGNED:
             count = self._varint()
             if count < 0 or count > ARRAY_MAX:
                 raise SofaDecodeError(f"array count {count} out of range")
-            if want_field:
-                self._cur = Field(field_id, _WT[wtype], count=count)
             pending = (_VARRAY, wtype, count)
             # Parked, not raised — see the fixlen branch above (§6.2.1).
             if self._capped and count > self._max_dyn_array_count:
@@ -972,14 +956,6 @@ class Decoder:
             raise SofaDecodeError("fp32 fixlen-array element size must be 4")
         if subtype == _ST_FP64 and elem_size != 8:
             raise SofaDecodeError("fp64 fixlen-array element size must be 8")
-        if want_field:
-            self._cur = Field(
-                field_id,
-                WireType.ARRAY_FIXLEN,
-                count=count,
-                size=elem_size,
-                subtype=FixlenSubtype(subtype),
-            )
         self._cur_subtype = subtype
         pending = (_FARRAY, subtype, count, elem_size)
         # Parked, not raised — see the fixlen branch above (§6.2.1).
@@ -1054,7 +1030,7 @@ class Decoder:
         # before it can suspend. The field state is put back here, so a re-issued
         # skip replays the whole sequence (§5.2).
         self._keep = floor = self._pos
-        depth, cur, pending = self._depth, self._cur, self._pending
+        depth, pending = self._depth, self._pending
         try:
             target = depth - 1
             while self._depth > target:
@@ -1062,18 +1038,12 @@ class Decoder:
                 # Field objects. Defensive: at EOF with an open sequence,
                 # _next_wire itself raises "truncated: unbalanced sequence",
                 # so it never returns -1 here.
-                if self._next_wire(False) < 0:  # pragma: no cover
+                if self._next_wire() < 0:  # pragma: no cover
                     raise self._suspend("truncated sequence")
         except SofaIncompleteError:
             self._pos = self._keep = floor
-            self._depth, self._cur, self._pending = depth, cur, pending
+            self._depth, self._pending = depth, pending
             raise
-        # The walk built no Field, so ``_cur`` still names the sequence that was
-        # just consumed. Publish the end marker the walk stopped on, exactly as a
-        # Field-building walk would have left it, so a visitor that keeps the
-        # last Field does not see a stale sequence start. One object per skip,
-        # not one per field.
-        self._cur = Field(0, WireType.SEQUENCE_END)
 
     # --- push-feed driver (CORELIB_PLAN §5.2) -------------------------------
     #
@@ -1261,7 +1231,6 @@ class Decoder:
         self._pos = 0
         self._rstart = self._rend = 0
         self._depth = 0
-        self._cur = None
         self._pending = None
         self._keep = 0
         self._status = Status.COMPLETE
@@ -1377,7 +1346,7 @@ class Decoder:
         # walk asserted on the Field nobody had built).
         make_field = self._make_field
         while True:
-            t = self._next_wire(make_field)
+            t = self._next_wire()
             if t < 0:
                 return False
 
@@ -1475,11 +1444,11 @@ class Decoder:
                 continue
             if make_field:
                 # ``_make_field`` is a handler's flag, so it is only ever set
-                # where there is one.
+                # where there is one. The Field is built HERE — a field the map
+                # named has already `continue`d above, so this is the only place
+                # one can be observed, and the only place one is made.
                 assert visitor is not None
-                f = self._cur
-                assert f is not None
-                if visitor.on_field(f) is False:
+                if visitor.on_field(self._build_field(t)) is False:
                     # Skipped: the value stays pending and the next header walk
                     # discards it, which suspends in exactly the same place an
                     # explicit skip would and costs one call less. Nothing is
@@ -1652,6 +1621,37 @@ class Decoder:
         data = self._read_exact(length)
         self._pending = None  # committed only once the payload is in hand (§5.2)
         return data
+
+    def _build_field(self, t: int) -> Field:
+        """The :class:`sofab.Field` :meth:`sofab.Visitor.on_field` is handed.
+
+        Built **here**, not in the header walk, and only for a field that is
+        actually going to be offered: a field the handler's destination map
+        names never reaches ``on_field``, so building one for it was an object
+        the caller could not observe. Everything it carries is already on the
+        decoder — the id, the fixlen subtype, and the pending tuple's size or
+        count — so nothing is re-parsed to get it.
+        """
+        pending = self._pending
+        assert pending is not None  # every value field parks one at its header
+        real = pending[2] if pending[0] == _LIMIT else pending
+        kind = real[0]
+        if kind == _SCALAR:
+            return Field(self._cur_id, _WT[t])
+        if kind == _FIXLEN:
+            return Field(
+                self._cur_id, WireType.FIXLEN, size=real[2],
+                subtype=FixlenSubtype(real[1]),
+            )
+        if kind == _VARRAY:
+            return Field(self._cur_id, _WT[t], count=real[2])
+        return Field(
+            self._cur_id,
+            WireType.ARRAY_FIXLEN,
+            count=real[2],
+            size=real[3],
+            subtype=FixlenSubtype(real[1]),
+        )
 
     def _take_scalar_matched(self) -> int:
         """Consume the pending scalar. The caller has already matched the whole
