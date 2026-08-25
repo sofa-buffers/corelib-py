@@ -637,7 +637,8 @@ routes make none, and none of them is capped:
   (§7.3) — the decoder walks past the payload without building anything from it;
 * a field the visitor declines from `on_field`;
 * a field the visitor *wants*, having handed back its own buffer from
-  `on_blob_begin` or `on_array_begin`. The hook is told the announced length or
+  `on_blob_begin`, `on_string_begin`, `on_array_begin` or
+  `on_float_array_begin`. The hook is told the announced length or
   count first, and a receiver that does not want that many bytes says so there —
   the decision is the handler's, and a limit the decoder applied on its behalf
   would only take it away.
@@ -646,6 +647,10 @@ What is left is the default route, and it is the one §6.2.1 is about: with no
 destination back, the decoder itself has to build a `str`, a `bytes` or a list,
 and the only size it could build one from is the wire's. That allocation is
 refused on the count/length word, before a payload byte is read.
+
+`on_float32_array_bits` is the one route that is **not** in that list: it hands
+over the wire bytes without asking, so the handler has no place to refuse and
+the configured ceiling stays the only one.
 
 The ceiling on a buffer you supply is that buffer's own size. Too short for what
 the hook was told, and the decoder refuses it — `SofaArgumentError`
