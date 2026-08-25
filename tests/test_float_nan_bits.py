@@ -18,9 +18,11 @@ from __future__ import annotations
 import struct
 
 import pytest
+from vectors import DECODER_ENGINES as DECODERS
+from vectors import ENCODER_ENGINES as ENCODERS
 from vectors import Status, values
 
-from sofab import Decoder, Encoder, Visitor
+from sofab import Decoder, Encoder, SofaArgumentError, Visitor
 from sofab._core import _unpack_f32_bits, unpack_f32
 
 # We must feed the corelib the *literal* payload bytes: struct.unpack("<f", ...)
@@ -252,3 +254,152 @@ def test_unpack_f32_bits_matches_struct_on_ordinary_values():
         raw = bytes.fromhex(hexbits)
         via_bits = _unpack_f32_bits(int.from_bytes(raw, "little"))
         assert struct.pack("<d", via_bits) == struct.pack("<d", unpack_f32(raw)), hexbits
+
+
+# --- §6.5's raw-wire-bytes path ---------------------------------------------
+#
+# The tests above prove the *outcome*: an fp32 payload survives decode ->
+# re-encode. It holds today only because ``_core`` does the width conversion by
+# hand on the bit pattern instead of letting the hardware quiet the NaN — a
+# property of this implementation on this platform, not a mechanism.
+#
+# §6.5 requires the mechanism: a double-only target "**MUST** provide a
+# **raw-wire-bytes** path for bit-exact consumers (transcode, round-trip, any
+# re-encode) that re-emits those bytes **verbatim**" and "**MUST NOT** re-encode
+# an ``fp32`` from the widened value", at "**every** ``fp32`` position — a
+# **scalar** ``fp32`` (§4.6) **and** each element of an ``fp32`` array (§4.8)".
+# These pin that channel.
+
+
+class _BitTaker(Visitor):
+    """A bit-exact consumer: it never sees a ``float``."""
+
+    def __init__(self) -> None:
+        self.scalars: list[tuple[int, int]] = []
+        self.arrays: list[tuple[int, int, bytes]] = []
+        self.values: list[float] = []
+
+    def on_float32(self, field_id, value):  # pragma: no cover - must not fire
+        self.values.append(value)
+
+    def on_float32_array(self, field_id, values):  # pragma: no cover
+        self.values.extend(values)
+
+    def on_float32_bits(self, field_id, bits):
+        self.scalars.append((field_id, bits))
+
+    def on_float32_array_bits(self, field_id, count, payload):
+        # The bytes stop being valid when this returns (§6.7), so copy.
+        self.arrays.append((field_id, count, bytes(payload)))
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("dec_cls", DECODERS)
+@pytest.mark.parametrize("name,hexbits", list(FP32_PAYLOADS.items()), ids=list(FP32_PAYLOADS))
+def test_a_scalar_fp32_reaches_a_bit_consumer_as_wire_bits(
+    name, hexbits, dec_cls, enc_cls
+):
+    raw = bytes.fromhex(hexbits)
+    enc = enc_cls()
+    enc.write_float32(7, 0.0)
+    enc.flush()
+    wire = enc.getvalue()[:-4] + raw
+
+    taker = _BitTaker()
+    assert dec_cls(visitor=taker).feed(wire) is Status.COMPLETE
+    assert taker.values == [], "the raw channel must replace the value one"
+    assert taker.scalars == [(7, int.from_bytes(raw, "little"))]
+
+    # And back out verbatim: no float is constructed anywhere on this path.
+    out = enc_cls()
+    out.write_float32_bits(7, taker.scalars[0][1])
+    out.flush()
+    assert out.getvalue() == wire
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_every_element_of_an_fp32_array_reaches_it_as_wire_bits(dec_cls, enc_cls):
+    """§6.5 is stated over array positions too, so the scalar channel alone
+    would not meet it."""
+    payload = b"".join(bytes.fromhex(h) for h in FP32_PAYLOADS.values())
+    enc = enc_cls()
+    enc.write_float32_array(2, [0.0] * len(FP32_PAYLOADS))
+    enc.flush()
+    wire = enc.getvalue()[: -len(payload)] + payload
+
+    taker = _BitTaker()
+    assert dec_cls(visitor=taker).feed(wire) is Status.COMPLETE
+    assert taker.values == []
+    assert taker.arrays == [(2, len(FP32_PAYLOADS), payload)]
+
+    out = enc_cls()
+    out.write_float32_array_bits(2, payload)
+    out.flush()
+    assert out.getvalue() == wire
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_the_raw_array_payload_survives_a_chunk_boundary(dec_cls, enc_cls):
+    """A payload split across fed chunks reaches the handler whole, and the
+    handler still gets the same bytes."""
+    payload = b"".join(bytes.fromhex(h) for h in FP32_PAYLOADS.values())
+    enc = enc_cls()
+    enc.write_float32_array(2, [0.0] * len(FP32_PAYLOADS))
+    enc.flush()
+    wire = enc.getvalue()[: -len(payload)] + payload
+
+    taker = _BitTaker()
+    dec = dec_cls(visitor=taker, reassembly=bytearray(256))
+    for i in range(0, len(wire), 3):
+        dec.feed(wire[i : i + 3])
+    assert taker.arrays == [(2, len(FP32_PAYLOADS), payload)]
+
+
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_the_raw_array_view_does_not_outlive_the_callback(dec_cls):
+    """§6.7: "validity ends when the callback returns". The view is released on
+    the way out, so a handler that kept it holds a released one rather than a
+    window onto the decoder's buffer."""
+    kept: list = []
+
+    class Keeper(Visitor):
+        def on_float32_array_bits(self, field_id, count, payload):
+            kept.append(payload)
+
+    enc = Encoder()
+    enc.write_float32_array(2, [1.0, 2.0])
+    enc.flush()
+    assert dec_cls(visitor=Keeper()).feed(enc.getvalue()) is Status.COMPLETE
+    with pytest.raises(ValueError):
+        bytes(kept[0])
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_the_raw_writes_refuse_what_they_cannot_represent(enc_cls):
+    """§6.3: a caller mistake is ``InvalidArgument``."""
+    enc = enc_cls()
+    with pytest.raises(SofaArgumentError):
+        enc.write_float32_bits(1, 1 << 32)
+    with pytest.raises(SofaArgumentError):
+        enc.write_float32_bits(1, -1)
+    with pytest.raises(SofaArgumentError):
+        enc.write_float32_bits(1, 1.0)
+    with pytest.raises(SofaArgumentError):
+        enc.write_float32_array_bits(1, b"\x00\x00\x00")
+    with pytest.raises(SofaArgumentError):
+        enc.write_float32_array_bits(1, b"\x00\x00\x00\x00", count=2)
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_an_empty_raw_fp32_array_still_carries_its_fixlen_word(enc_cls):
+    """§4.8: the ``fixlen_word`` is present even when the array is empty, so an
+    empty fp32 and an empty fp64 array stay distinguishable."""
+    raw = enc_cls()
+    raw.write_float32_array_bits(1, b"")
+    raw.flush()
+    ordinary = enc_cls()
+    ordinary.write_float32_array(1, [])
+    ordinary.flush()
+    assert raw.getvalue() == ordinary.getvalue()

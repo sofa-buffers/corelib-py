@@ -247,7 +247,10 @@ def decode_blob(data: bytes) -> int:
     """Fed in fixed 4096-byte chunks, the same size every port streams with, so
     the payload straddles the boundary as many times as it does elsewhere."""
     sink = _BlobSink()
-    dec = Decoder(visitor=sink)
+    # The reassembly buffer is the caller's (CORELIB_PLAN §6.6.2) and this
+    # caller knows what it is streaming: a megabyte payload arriving in 4 KiB
+    # pieces has to be joined somewhere, and the decoder never grows its own.
+    dec = Decoder(visitor=sink, reassembly=len(data) + STREAM_BUFFER)
     for off in range(0, len(data), STREAM_BUFFER):
         dec.feed(data[off : off + STREAM_BUFFER])
     return sink.acc

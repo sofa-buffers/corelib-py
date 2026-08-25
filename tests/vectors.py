@@ -18,6 +18,7 @@ from typing import Callable
 import pytest
 
 from sofab import (
+    DEFAULT_REASSEMBLY,
     Binding,
     Encoder,
     Field,
@@ -171,6 +172,11 @@ def walk(dec_cls, data: bytes, chunk: int | None = None, **kw):
     with the reason on ``dec.error``.
     """
     rec = kw.pop("recorder", None) or Recorder()
+    # The reassembly buffer is the caller's (§6.6.2), and this caller knows the
+    # message: size it for the whole of it, so a chunked feed of any of these
+    # vectors has room and the tests exercise the wire rather than the buffer.
+    # Tests about the buffer itself pass their own.
+    kw.setdefault("reassembly", max(len(data) + 16, DEFAULT_REASSEMBLY))
     dec = dec_cls(visitor=rec, **kw)
     status = Status.COMPLETE
     if chunk is None:

@@ -34,7 +34,14 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from .types import ARRAY_MAX, SofaDecodeError, SofaLimitError
+from .types import (
+    ARRAY_MAX,
+    Field,
+    FixlenSubtype,
+    SofaDecodeError,
+    SofaLimitError,
+    WireType,
+)
 from .visitor import Visitor
 
 __all__ = [
@@ -103,10 +110,28 @@ class _LeafSeq(SequenceCollector):
     """
 
 
-class StringSeq(_LeafSeq):
-    """``string`` elements. ``elem_max`` is the schema's ``maxlen``, if any."""
+class _PayloadSeq(_LeafSeq):
+    """Elements whose schema bound is a **byte length**: ``string`` and ``blob``.
 
-    default = ""
+    ``maxlen`` is a bound on the payload's **wire byte length** (MESSAGE_SPEC
+    §1), and MESSAGE_SPEC §7 makes a payload longer than it INVALID. So the
+    bound is judged at the ``fixlen_word`` — in :meth:`on_field`, before a byte
+    of the element is decoded — which is where the wire length is still in hand
+    and where §7.1 wants the verdict.
+
+    Measuring the decoded element instead would be wrong for exactly one of the
+    two: ``len()`` on a ``str`` counts **code points**, so every element whose
+    UTF-8 is longer than its code-point count slipped a bound it violated. The
+    check also now fires for a payload the message truncates behind, and it
+    costs nothing where the element is over-long — the ``str``/``bytes`` is
+    never built.
+
+    ``_subtype`` names which fixlen subtype the bound belongs to, so a field of
+    the other one — which MESSAGE_SPEC §7.3 has this collector skip — is not
+    judged against a bound that is not its.
+    """
+
+    _subtype: FixlenSubtype
 
     def __init__(
         self, out: list[Any], *, elem_max: int | None = None, **kw: Any
@@ -114,32 +139,40 @@ class StringSeq(_LeafSeq):
         super().__init__(out, **kw)
         self.elem_max = elem_max
 
-    def on_string(self, field_id: int, value: str) -> None:
-        if self.elem_max is not None and len(value) > self.elem_max:
+    def on_field(self, field: Field) -> bool | None:
+        cap = self.elem_max
+        if (
+            cap is not None
+            and field.type is WireType.FIXLEN
+            and field.subtype is self._subtype
+            and field.size > cap
+        ):
             raise SofaDecodeError(
-                f"string length {len(value)} exceeds the {self.elem_max} "
-                "the schema declares"
+                f"{self._subtype.name.lower()} length {field.size} exceeds "
+                f"the {cap} the schema declares"
             )
+        return None
+
+
+class StringSeq(_PayloadSeq):
+    """``string`` elements. ``elem_max`` is the schema's ``maxlen``, if any —
+    a bound on the element's **UTF-8 byte length**, not on its character
+    count."""
+
+    default = ""
+    _subtype = FixlenSubtype.STRING
+
+    def on_string(self, field_id: int, value: str) -> None:
         self._place(field_id, value)
 
 
-class BytesSeq(_LeafSeq):
+class BytesSeq(_PayloadSeq):
     """``blob`` elements — the string twin, with no UTF-8 to check."""
 
     default = b""
-
-    def __init__(
-        self, out: list[Any], *, elem_max: int | None = None, **kw: Any
-    ) -> None:
-        super().__init__(out, **kw)
-        self.elem_max = elem_max
+    _subtype = FixlenSubtype.BLOB
 
     def on_bytes(self, field_id: int, value: bytes) -> None:
-        if self.elem_max is not None and len(value) > self.elem_max:
-            raise SofaDecodeError(
-                f"blob length {len(value)} exceeds the {self.elem_max} "
-                "the schema declares"
-            )
         self._place(field_id, value)
 
 

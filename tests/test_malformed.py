@@ -788,3 +788,84 @@ def test_fixlen_array_huge_count_is_bounded_on_the_skip_path_too(decoder_cls):
     with pytest.raises(SofaIncompleteError):
         # No binding, no visitor hook for it: the field is walked, not read.
         verdict(decoder_cls, data, recorder=Recorder(decline=lambda f: True))
+
+
+# --- §7.2 item 5b: a non-minimal varint at each of the three positions -------
+#
+# §4.1.2: "Minimality on encode, tolerance on decode." An encoder emits the
+# shortest form; a decoder accepts a longer one for the same value, because the
+# value is what the format bounds and not its spelling. The suite pinned that
+# for a sequence-end id only. §7.2 item 5b names three positions, and all three
+# behave correctly by hand — so they are pinned rather than assumed.
+
+
+def _padded(value: int, extra: int) -> list[int]:
+    """``value`` as a varint, spelled ``extra`` bytes longer than it needs."""
+    out = [b | 0x80 for b in _uvarint(value)]
+    return out + [0x80] * (extra - 1) + [0x00]
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+@pytest.mark.parametrize("extra", [1, 2, 5])
+def test_a_non_minimal_field_header_is_accepted(decoder_cls, extra):
+    """Position one: the field header itself (§4.3). Field id 1, UNSIGNED."""
+    data = bytes(_padded((1 << 3) | 0x0, extra) + _uvarint(42))
+    ev = values(decoder_cls, data)
+    assert ev == [("u", 1, 42)]
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+@pytest.mark.parametrize("extra", [1, 2, 5])
+def test_a_non_minimal_fixlen_word_is_accepted(decoder_cls, extra):
+    """Position two: the ``fixlen_word`` (§4.6). A 3-byte blob."""
+    data = bytes(
+        [(1 << 3) | 0x2]
+        + _padded((3 << 3) | int(FixlenSubtype.BLOB), extra)
+        + [0xAA, 0xBB, 0xCC]
+    )
+    ev = values(decoder_cls, data)
+    assert ev == [("blob", 1, b"\xaa\xbb\xcc")]
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+@pytest.mark.parametrize("extra", [1, 2, 5])
+def test_a_non_minimal_element_count_is_accepted(decoder_cls, extra):
+    """Position three: an array's ``element_count`` (§4.7)."""
+    data = bytes([(1 << 3) | 0x3] + _padded(2, extra) + _uvarint(7) + _uvarint(9))
+    ev = values(decoder_cls, data)
+    assert ev == [("ua", 1, (7, 9))]
+
+
+# --- §7.2 item 6: a fixlen_word cut after a first byte carrying a reserved
+# --- subtype ----------------------------------------------------------------
+#
+# The one case §7.2 says nothing else on the list exercises. The subtype lives
+# in the low 3 bits of the fixlen_word's *first* byte, so a decoder that
+# validated it as soon as it saw that byte would answer INVALID on bytes that
+# are merely truncated — and §5.2.3's precedence runs the other way: a
+# condition that is not yet decidable is INCOMPLETE until the bytes arrive.
+#
+# (There is no reserved fixlen subtype: §4.6 spends all four. The case is
+# therefore driven at the *length* half of the same word — an unfinished varint
+# whose first byte already carries a subtype — which is the same question about
+# the same byte.)
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_a_fixlen_word_cut_after_its_first_byte_is_incomplete(decoder_cls):
+    """``0x0a`` is a FIXLEN header for id 1; ``0xac`` is the first byte of an
+    unfinished length varint carrying subtype BLOB. Nothing here is malformed,
+    only unfinished."""
+    for subtype in FixlenSubtype:
+        first = 0x80 | ((0x0F << 3) | int(subtype)) & 0x7F
+        with pytest.raises(SofaIncompleteError):
+            verdict(decoder_cls, bytes([0x0A, first]))
+
+
+@pytest.mark.parametrize("decoder_cls", _DECODERS)
+def test_a_fixlen_array_word_cut_after_its_first_byte_is_incomplete(decoder_cls):
+    """The same word in its array position (§4.8), where the element width and
+    the subtype share it."""
+    data = bytes([0x0D] + _uvarint(2) + [0x80 | ((4 << 3) | int(FixlenSubtype.FP32))])
+    with pytest.raises(SofaIncompleteError):
+        verdict(decoder_cls, data)

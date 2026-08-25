@@ -7,9 +7,8 @@ other shape is a destination the caller hands back after being told the announce
 size, with the codec refusing one too short rather than growing it -- which is
 what this hook is.
 
-Strings are deliberately not offered: a string the handler reads must be
-validated (§6.7.2), and this port validates by decoding, which builds the ``str``
-a destination would exist to avoid.
+The string and fixlen-array twins are ``on_string_begin`` and
+``on_float_array_begin`` -- see ``tests/test_aggregate_destinations.py``.
 """
 
 from __future__ import annotations

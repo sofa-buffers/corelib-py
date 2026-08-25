@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 from vectors import VECTORS
 
-from sofab import Decoder, Field, Status, Visitor, WireType
+from sofab import Decoder, Field, FixlenSubtype, Status, Visitor, WireType
 
 _IDS = [v["name"] for v in VECTORS]
 
@@ -177,6 +177,8 @@ def test_the_base_control_hooks_do_not_decline():
     # destination, no declared width, so the array takes the list route.
     assert base.on_array_begin(1, WireType.ARRAY_UNSIGNED, 3) is None
     assert base.on_blob_begin(1, 3) is None
+    assert base.on_string_begin(1, 3) is None
+    assert base.on_float_array_begin(1, FixlenSubtype.FP32, 3) is None
 
 
 class _Delegating(Visitor):

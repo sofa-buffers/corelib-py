@@ -22,7 +22,7 @@ import pytest
 from vectors import DECODER_ENGINES as ENGINES
 from vectors import Recorder, Status
 
-from sofab import Encoder, SofaArgumentError
+from sofab import DEFAULT_REASSEMBLY, Encoder, SofaArgumentError
 
 BIG = "a" * 300
 
@@ -128,12 +128,62 @@ def test_the_chunk_may_be_overwritten_the_moment_feed_returns(engine):
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_only_a_bytearray_is_accepted(engine):
-    """Both engines index it directly, so there is one accepted type rather than
-    two buffer protocols with one of them slower (§5.3)."""
-    for bad in (b"\x00" * 64, memoryview(bytearray(64)), 64):
+def test_only_a_bytearray_or_a_byte_count_is_accepted(engine):
+    """One buffer type, because both engines index it directly rather than going
+    through two buffer protocols with one of them slower (§5.3) — plus an ``int``,
+    which is the caller naming a size for the decoder to take at construction.
+
+    Everything else is refused rather than adapted.
+    """
+    for bad in (b"\x00" * 64, memoryview(bytearray(64)), 64.0, "64", True):
         with pytest.raises(SofaArgumentError):
             engine(visitor=Recorder(), reassembly=bad)
+    # A count below what a single spanning construct can need is refused too:
+    # a buffer that cannot hold one is not a smaller buffer, it is a broken one.
+    with pytest.raises(SofaArgumentError):
+        engine(visitor=Recorder(), reassembly=8)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_byte_count_sizes_the_buffer_at_construction(engine):
+    """``reassembly=n`` is the same contract as passing ``bytearray(n)``: the
+    decoder takes it once, at construction, and never grows it (§6.6)."""
+    enc = Encoder()
+    enc.write_bytes(1, b"z" * 200)
+    enc.flush()
+    wire = enc.getvalue()
+
+    status, rec, _dec = _feed(engine, wire, 7, reassembly=300)
+    assert status is Status.COMPLETE
+    assert rec.events == [("blob", 1, b"z" * 200)]
+
+    # And too small is the caller's mistake, not something to accommodate.
+    with pytest.raises(SofaArgumentError):
+        _feed(engine, wire, 7, reassembly=64)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_the_default_buffer_is_bounded_and_never_grows(engine):
+    """§6.6.2: "A codec **MUST NOT** grow a private accumulator instead."
+
+    Omitting the parameter used to mean exactly that — a ``bytearray`` of the
+    decoder's own, extended to whatever the message declared, so a sender chose
+    the receiver's memory. There is now one shape: a buffer sized at
+    construction, and a construct that does not fit it is refused.
+    """
+    enc = Encoder()
+    enc.write_bytes(1, b"z" * (DEFAULT_REASSEMBLY * 2))
+    enc.flush()
+    wire = enc.getvalue()
+
+    with pytest.raises(SofaArgumentError):
+        _feed(engine, wire, 512)
+
+    # The same bytes in one call never touch the buffer at all, whatever their
+    # size: nothing spans a chunk boundary when there is only one chunk.
+    rec = Recorder()
+    assert engine(visitor=rec).feed(wire) is Status.COMPLETE
+    assert rec.events == [("blob", 1, b"z" * (DEFAULT_REASSEMBLY * 2))]
 
 
 @pytest.mark.parametrize("engine", ENGINES)

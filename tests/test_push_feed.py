@@ -227,13 +227,19 @@ def test_a_fed_chunk_may_be_overwritten_afterwards(enc_cls, dec_cls, chunk):
     dec_cls(visitor=whole).feed(msg)
 
     got = Collect()
-    dec = dec_cls(visitor=got)
+    dec = dec_cls(visitor=got, reassembly=len(msg) + 16)
     scratch = bytearray(chunk)
+    view = memoryview(scratch)
     for off in range(0, len(msg), chunk):
         piece = msg[off : off + chunk]
         scratch[: len(piece)] = piece
-        dec.feed(scratch[: len(piece)])
+        # A *view* of the scratch, not a slice of it. ``scratch[:n]`` copies —
+        # the object fed would be a fresh bytearray, the scrub below could not
+        # reach it, and the case would pass whatever the decoder did with the
+        # bytes. §7.2 item 4 wants the buffer itself fed and then overwritten.
+        dec.feed(view[: len(piece)])
         scratch[:] = b"\xa5" * len(scratch)  # the caller reuses its buffer
+    view.release()
     assert got.events == whole.events
 
 

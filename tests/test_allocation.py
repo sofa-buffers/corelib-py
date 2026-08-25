@@ -1,21 +1,27 @@
 """What the codec allocates, measured (CORELIB_PLAN §6.6.4).
 
-    Source inspection alone is still **not sufficient** [...] Conformance
-    therefore requires **both**: *read* — no allocation primitive is reachable
-    from a codec entry point, apart from the language-forced handles §6.6.2
-    allows; *measure* — an allocation count, or the heap high-water mark, over a
-    complete encode and a complete decode.
+§6.6.4 requires conformance to be checked **both** ways: *read* — no allocation
+primitive reachable from a codec entry point, apart from the language-forced
+handles §6.6.2 allows — and *measure*. It then names what "measure" means for a
+runtime that boxes the codec's values, which CPython does:
+
+    Where it does box them the count is never zero and demanding zero would
+    demand the impossible, so the measurable claim is that it **does not grow
+    with the message**: the same for a ten-byte and a ten-kilobyte payload of the
+    same field shape, and unchanged by a hostile count or length. That is the
+    property the prohibition is for, and it is what a port in such a language
+    pins with a test.
 
 The *read* half is the source and the README's itemised handle list. This file is
-the *measure* half, and it measures the property that list exists to protect:
-**no wire number sizes an allocation.** A payload a thousand times larger must
-not cost a thousand times the memory — that, not a raw byte count, is what §6.6
-is about, and it is the one thing a Python port can state honestly.
+the *measure* half, in exactly that form: a payload a thousand times larger costs
+the same, and a hostile count buys nothing. It also pins the other half of §6.6 —
+bounded working state **sized at construction**, measured with the codec built
+outside the measurement, which is the line that section draws.
 
-Two of the three paths hold. The third does not, by a decision this port has
-taken deliberately, and is measured here rather than left as an assertion —
-``test_a_visitor_that_takes_a_value_pays_for_it`` is that gap with a number on
-it.
+Every route now has a shape that does not scale.
+``test_a_visitor_that_takes_a_value_pays_for_it`` measures what the *other*
+shape costs — a handler that asks for the value rather than supplying the
+storage — so the difference between the two is a number and not a claim.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ import pytest
 from vectors import DECODER_ENGINES as DECODERS
 from vectors import ENCODER_ENGINES as ENCODERS
 
-from sofab import Binding, Status, Visitor
+from sofab import MAX_DEPTH, Binding, Status, Visitor
 
 SMALL = 1 << 10
 LARGE = 1 << 20
@@ -159,19 +165,208 @@ def test_a_binding_decode_does_not_scale_with_an_arrays_length(dec_cls, enc_cls)
     )
 
 
+# --- bounded working state is sized at construction (§6.6) -------------------
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_the_hold_back_run_is_sized_at_construction(enc_cls):
+    """§6.6: bounded working state "MUST be sized to its **full extent** when
+    the codec is constructed. Growing it afterwards is forbidden even where the
+    ceiling it grows towards is correct: a pending run that doubles as nesting
+    deepens allocates on a `write` path, and that is what this section forbids."
+
+    Both engines grew the hold-back run on demand — the pure one by appending to
+    a list, the native one by doubling a ``realloc``. The encoder is built
+    *outside* the measurement here, which is exactly the line §6.6 draws.
+    """
+
+    def run(depth, keep):
+        enc = enc_cls.over_buffer(bytearray(1 << 16), 0, lambda chunk: None)
+        close = enc.write_sequence_end_keep if keep else enc.write_sequence_end
+
+        def work():
+            for i in range(depth):
+                enc.write_sequence_begin_lazy(i)
+            if keep:
+                enc.write_unsigned(1, 7)  # content: commits the held-back run
+            for _ in range(depth):
+                close()
+
+        return _peak(work)
+
+    # Read against a control at the same depth, not against a shallower one: on
+    # a runtime that boxes every value, writing more fields costs interpreter
+    # memory whatever the codec does, and that cost differs by interpreter
+    # version. The control opens the same MAX_DEPTH sequences and closes them
+    # with the dropping closer, so the run is filled and popped but never
+    # committed; the measured leg commits it.
+    control = run(MAX_DEPTH - 1, keep=False)
+    committed = run(MAX_DEPTH - 1, keep=True)
+    assert committed - control < 1024, (
+        f"committing a {MAX_DEPTH - 1}-deep run cost {committed - control} "
+        "bytes more than filling one; the hold-back run is growing on a write "
+        "path"
+    )
+
+    # And the runs themselves are the same two lists, at the same length,
+    # afterwards. The pair is compared as a set: committing *swaps* them, so a
+    # sink that re-enters the encoder writes into the spare rather than over the
+    # run being emitted, and neither is ever replaced.
+    enc = enc_cls.over_buffer(bytearray(1 << 16), 0, lambda chunk: None)
+    if getattr(enc, "_pending", None) is not None:
+        before = {(id(enc._pending), len(enc._pending)),
+                  (id(enc._spare), len(enc._spare))}
+        for i in range(MAX_DEPTH - 1):
+            enc.write_sequence_begin_lazy(i)
+        enc.write_unsigned(1, 7)
+        for _ in range(MAX_DEPTH - 1):
+            enc.write_sequence_end_keep()
+        after = {(id(enc._pending), len(enc._pending)),
+                 (id(enc._spare), len(enc._spare))}
+        assert after == before, "a write replaced or extended the hold-back run"
+        assert len(enc._pending) == MAX_DEPTH
+
+
+def _deep_wire(enc_cls, depth):
+    enc = enc_cls()
+    for i in range(depth):
+        enc.write_sequence_begin_lazy(i)
+    enc.write_unsigned(1, 7)
+    for _ in range(depth):
+        enc.write_sequence_end_keep()
+    enc.flush()
+    return enc.getvalue()
+
+
+class _Descending(Visitor):
+    """Takes each nested scope with a handler, so the suspended-handler stack
+    is used at every level."""
+
+    def on_sequence_begin(self, field_id):
+        return self
+
+
+class _Flat(Visitor):
+    """Walks the identical bytes without ever handing a scope over, so the
+    handler stack is never touched. Everything else — the calls, the cursor
+    arithmetic, the ints the interpreter boxes on the way — is the same."""
+
+    def on_sequence_begin(self, field_id):
+        return None
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_descending_costs_no_more_than_walking_the_same_bytes(dec_cls, enc_cls):
+    """§6.6: the decoder's descent state is sized at construction, so descending
+    `MAX_DEPTH` levels must cost nothing a flat walk of the same message does
+    not. It was built on the *first descent*, which is inside ``feed``.
+
+    Read against a **control**, not against a shallower message: on a runtime
+    that boxes every value, a longer message costs interpreter memory whatever
+    the codec does, and that cost is what a depth-1-against-depth-254
+    comparison actually measures (it differs by interpreter version). The
+    control here walks the identical bytes and makes the identical calls; the
+    only difference is whether the handler stack is used at all.
+    """
+    wire = _deep_wire(enc_cls, MAX_DEPTH - 1)
+
+    def run(handler_cls):
+        dec = dec_cls(visitor=handler_cls(), reassembly=bytearray(1 << 12))
+
+        def work():
+            dec.reset()
+            assert dec.feed(wire) is Status.COMPLETE
+
+        return _peak(work)
+
+    flat = run(_Flat)
+    descending = run(_Descending)
+    assert descending - flat < 512, (
+        f"descending {MAX_DEPTH - 1} levels cost {descending - flat} bytes more "
+        "than walking the same bytes flat; the handler stack is growing inside "
+        "feed"
+    )
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_the_decoders_descent_state_is_the_same_containers_afterwards(
+    dec_cls, enc_cls
+):
+    """§6.6.4's *read* half, as an assertion rather than an inspection.
+
+    A measurement cannot separate a container that grew from an interpreter
+    that allocated; identity and length can. After a `MAX_DEPTH`-deep descent
+    the decoder must hold the **same** stack objects, at the **same** length,
+    it was constructed with. (The accelerator keeps its two stacks in one C
+    block, which no Python-level check can reach; the byte-for-byte parity
+    suite is what pins it to the engine measured here.)
+    """
+    dec = dec_cls(visitor=_Descending(), reassembly=bytearray(1 << 12))
+    stacks = [getattr(dec, n, None) for n in ("_vstack", "_bstack")]
+    if all(s is None for s in stacks):
+        pytest.skip("the native engine holds these in C memory")
+    before = [(id(s), len(s)) for s in stacks if s is not None]
+
+    assert dec.feed(_deep_wire(enc_cls, MAX_DEPTH - 1)) is Status.COMPLETE
+
+    after = [
+        (id(getattr(dec, n)), len(getattr(dec, n)))
+        for n in ("_vstack", "_bstack")
+        if getattr(dec, n, None) is not None
+    ]
+    assert after == before, "a descent replaced or extended a stack"
+    assert all(length == MAX_DEPTH for _ident, length in before)
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_a_binding_float_array_does_not_scale_with_its_length(dec_cls, enc_cls):
+    """The float twin of the unsigned case above.
+
+    It used to build a wire-sized ``list`` *and* a wire-sized ``array`` on the
+    way into slots the caller had already sized — 2.8 MB for a 65,536-element
+    ``fp32`` array on the pure engine. The payload now crosses in fixed blocks
+    (``_core.FARRAY_CHUNK``), straight out of the fed buffer.
+    """
+
+    def run(count):
+        enc = enc_cls()
+        enc.write_float32_array(1, [1.5] * count)
+        enc.flush()
+        wire = enc.getvalue()
+        binding = Binding().float32_array(1, at=0, cap=64 << 10, count_at=1)
+        words = bytearray(8 * ((64 << 10) + 8))
+
+        def work():
+            dec = dec_cls(binding=binding, words=words)
+            assert dec.feed(wire) is Status.COMPLETE
+
+        return _peak(work)
+
+    small = run(64)
+    large = run(64 << 10)
+    assert large - small < FLAT, (
+        f"a {64 << 10}-element fp32 array cost {large - small} bytes more than "
+        "a 64-element one; the wire is sizing an allocation"
+    )
+
+
 # --- the gap this port has accepted -----------------------------------------
 
 
 @pytest.mark.parametrize("enc_cls", ENCODERS)
 @pytest.mark.parametrize("dec_cls", DECODERS)
 def test_a_visitor_that_takes_a_value_pays_for_it(dec_cls, enc_cls):
-    """The accepted §6.6.3 gap, with a number on it rather than a claim.
+    """What asking for the value costs, with a number on it rather than a claim.
 
     ``on_bytes`` receives a whole ``bytes``, and the only size the codec can
     build one from is the wire's -- which is exactly what §6.6.3 says a callback
     delivering a materialized aggregate obliges. This port ships that callback
-    anyway, alongside the ``on_blob_begin`` route that does not; the README says
-    so. The measurement pins the shape: the cost tracks the payload, once.
+    anyway, beside the ``on_blob_begin`` route that does not, because it is the
+    convenient way to read a message. The measurement pins the shape: the cost
+    tracks the payload, **once** -- not twice, and not more.
     """
 
     class Taker(Visitor):

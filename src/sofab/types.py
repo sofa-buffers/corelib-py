@@ -43,6 +43,25 @@ MAX_DEPTH = 255
 #: ``MAX_SIZE`` gets an exact fit.
 MIN_OUTPUT_BUFFER = 1
 
+#: Bytes of reassembly space a :class:`sofab.Decoder` takes when the caller
+#: names no size (see ``Decoder(reassembly=…)``).
+#:
+#: A construct split across fed chunks has to be joined somewhere, and
+#: CORELIB_PLAN §6.6.2 puts that somewhere in the caller's hands: "A codec
+#: **MUST NOT** grow a private accumulator instead." So the decoder holds one
+#: buffer, sized **once at construction** and never grown — a sender cannot make
+#: it bigger by sending different bytes, which is the property §6.6 protects —
+#: and a construct that does not fit it is refused with
+#: :class:`SofaArgumentError` rather than accommodated.
+#:
+#: This number is the corelib's, not the specification's: §6.6.2 names no
+#: default because the storage is meant to be the caller's outright. It is a
+#: size that lets ordinary messages stream without configuration; a receiver
+#: that takes larger `string`/`blob`/array payloads **across chunk boundaries**
+#: passes its own buffer, or a byte count for the decoder to size one from.
+#: (Whole messages fed in one call never touch it, whatever their size.)
+DEFAULT_REASSEMBLY = 4096
+
 #: 64-bit mask used by varint/zigzag wrap-around to match the C ``uint64_t``.
 MASK64 = (1 << 64) - 1
 
@@ -160,10 +179,13 @@ class SofaLimitError(SofaError):
     not see a limit rejection as a conformance divergence from another engine.
 
     It is raised only for a field the **schema** leaves unbounded: where the
-    schema states a ``count:``/``maxlen:`` the caller says so with
-    :meth:`sofab.Decoder.schema_bounded` and that bound governs instead, an
+    schema states a ``count:``/``maxlen:`` the handler says so — by declaring
+    that bound on its :class:`sofab.Binding` entry, or by answering
+    :meth:`sofab.Visitor.on_schema_bound` — and that bound governs instead, an
     over-bound value being :class:`SofaDecodeError` (CORELIB_PLAN §6.2.1/§6.3,
-    MESSAGE_SPEC §7.1).
+    MESSAGE_SPEC §7.1). Nor is it raised for a field nothing materializes — a
+    skipped one, or one read into storage the handler returned from
+    :meth:`sofab.Visitor.on_blob_begin` / :meth:`sofab.Visitor.on_array_begin`.
     """
 
 
@@ -189,10 +211,8 @@ class SofaArgumentError(SofaError):
     :meth:`~sofab.Encoder.getvalue` on a caller-owned fixed buffer, and a
     sequence end without a matching begin.
 
-    On decode it covers two caller mistakes. One is having **no value pending at
-    all** — a typed read issued before :meth:`~sofab.Decoder.next`, twice for one
-    field, or on a sequence start/end. The other is a **destination that cannot
-    hold what was announced**: a buffer handed back from
+    On decode it covers the caller's own storage not fitting what the message
+    announced — a **destination that cannot hold what was announced**: a buffer handed back from
     :meth:`sofab.Visitor.on_blob_begin` or :meth:`sofab.Visitor.on_array_begin`
     shorter than the size those hooks were told, or a ``reassembly=`` buffer too
     small for a construct spanning a chunk. The handler was given the count or
@@ -206,9 +226,9 @@ class SofaArgumentError(SofaError):
     and a handler that returns a buffer has sized that buffer itself
     (:class:`SofaLimitError`).
 
-    It is *not* raised when a pending value's wire type merely contradicts the
-    read: that is MESSAGE_SPEC §7.3, which the typed reads answer with ``None``
-    instead (see :class:`sofab.Decoder`).
+    It is *not* raised when a field's wire type merely contradicts the type a
+    binding declares for it: that is MESSAGE_SPEC §7.3, which the decoder answers
+    by skipping the field (see :class:`sofab.Decoder`).
     """
 
 

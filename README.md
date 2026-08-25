@@ -43,7 +43,10 @@ and never imported at runtime.
 
 ### Packaging
 
-Distribution `sofa-buffers-corelib` on PyPI; import package `sofab`.
+Distribution `sofa-buffers-corelib` on PyPI; import package `sofab`. The
+namespace is the fixed half (CORELIB_PLAN §6: `sofab`, in every target); the
+registry name is derived — the organization slug `sofa-buffers` plus `corelib`,
+in PyPI's own convention.
 
 ```bash
 pip install sofa-buffers-corelib
@@ -258,8 +261,8 @@ freeing Python integers. On the pure-Python engine there is nothing to save (it
 has to box either way) and the destination route costs 7–18% more, so use it
 there for the bound and the storage, not for speed.
 
-`on_array_begin` is not called for float arrays: they carry no declared width and
-are already moved in one piece.
+`on_array_begin` is not called for float arrays: they carry no declared width to
+state. Their destination hook is `on_float_array_begin`, below.
 
 #### Blobs: `on_blob_begin`
 
@@ -280,38 +283,105 @@ class Handler(Visitor):
 ```
 
 A buffer too short is `SofaArgumentError` — refused at the length word, before a
-byte is written, and never grown. Strings are not offered: a string you read must
-be validated (§6.7.2), and this port validates by decoding, which builds the
-`str` a destination would exist to avoid.
+byte is written, and never grown.
+
+#### Strings: `on_string_begin`
+
+The same bargain for a `string`. The hook is told the payload's **wire byte
+length** — what a schema `maxlen` bounds (MESSAGE_SPEC §1), not a character
+count — and what lands in your buffer is the payload's own UTF-8:
+
+```python
+class Handler(Visitor):
+    def __init__(self):
+        self.name = bytearray(256)
+
+    def on_string_begin(self, field_id, size):
+        if field_id == 3:
+            return self.name                # filled; on_string is not called
+        return None                         # anything else: a str as before
+```
+
+The bytes are still **validated** — §6.7.2 makes a field you read both
+materialized and validated — by a byte walk (§6.4.3's `utf8_valid`), so the
+check does not build the `str` the destination exists to avoid. Invalid UTF-8 is
+`INVALID` and your buffer is left untouched. The verdict is CPython's own on
+every payload: `tests/test_aggregate_destinations.py` pins both engines to
+`bytes.decode("utf-8")` over the whole RFC 3629 boundary set.
+
+#### Float arrays: `on_float_array_begin`
+
+One hook for both fixlen subtypes, naming which it is, taking `count` **8-byte**
+slots — a Python `float` is a double, and that is what the values become:
+
+```python
+from array import array
+
+class Handler(Visitor):
+    def __init__(self):
+        self.samples = array("d", [0.0] * 4096)
+
+    def on_float_array_begin(self, field_id, subtype, count):
+        return self.samples if field_id == 5 else None
+```
+
+An `array("f")` is refused rather than silently narrowed. A consumer that needs
+an `fp32`'s **wire bits** intact takes `on_float32_array_bits` instead — see
+*Bit-exact floats* below.
+
+#### Bit-exact floats: `on_float32_bits` and `write_float32_bits`
+
+Python's only float is a double, and widening an `fp32` to one **sets the quiet
+bit**: a signaling NaN's payload is destroyed the instant the value passes
+through the wider float, and no later code can recover it. CORELIB_PLAN §6.5
+therefore requires a double-only target to carry an `fp32` to a bit-exact
+consumer as wire bits:
+
+```python
+class Transcoder(Visitor):
+    def on_float32_bits(self, field_id, bits):        # instead of on_float32
+        out.write_float32_bits(field_id, bits)        # verbatim, no float
+
+    def on_float32_array_bits(self, field_id, count, payload):
+        out.write_float32_array_bits(field_id, payload)
+```
+
+Both hooks are opt-in by override, and both replace their value-carrying twin
+for every `fp32` the message holds. `payload` is a read-only view of the bytes
+you fed; it is released when the callback returns, so copy what you need to keep.
+A producer that has a value rather than bytes writes `write_float32` as before.
 
 #### Bounding what a decode holds: `reassembly`
 
-A construct split across two fed chunks has to be joined somewhere. By default
-the decoder joins it in a `bytearray` of its own, which grows to whatever the
-message says — convenient, and not what CORELIB_PLAN §6.6.2 asks for:
+A construct split across two fed chunks has to be joined somewhere. CORELIB_PLAN
+§6.6.2 says where:
 
 > A payload split across fed chunks has to be joined somewhere. That somewhere is
 > storage the caller supplied [...] A codec **MUST NOT** grow a private
 > accumulator instead.
 
-Pass one and it does not:
+So there is one buffer, sized once and never grown. Name its size, or hand over
+the storage:
 
 ```python
-dec = Decoder(visitor=handler, reassembly=bytearray(64 * 1024))
+dec = Decoder(visitor=handler, reassembly=64 * 1024)          # decoder sizes it
+dec = Decoder(visitor=handler, reassembly=bytearray(1 << 20))  # or you do
+dec = Decoder(visitor=handler)                     # sofab.DEFAULT_REASSEMBLY
 ```
 
-The pieces are copied into your buffer as they arrive, and a construct that does
+The pieces are copied into that buffer as they arrive, and a construct that does
 not fit is `SofaArgumentError` — **refused, never accommodated**. That is what lets
 you bound a decode's memory by construction instead of by measurement: whatever
-the sender claims, this decoder holds your 64 KiB and nothing more.
+the sender claims, this decoder holds what you named and nothing more.
 
-It also makes §6's chunk-lifetime promise literal. Without a reassembly buffer a
-`bytes` chunk is read where it lies and kept until the next `feed`; with one, the
-unconsumed tail is copied out before `feed` returns, so the chunk is yours again
-the moment it does — overwrite it in place if you like.
+It is also what makes §6's chunk-lifetime promise literal: the unconsumed tail is
+copied out before `feed` returns, so the chunk is yours again the moment it does
+— overwrite it in place if you like.
 
-Nothing else changes: same verdicts, same values, same chunking-independence. A
-message that arrives in one piece never touches the buffer at all.
+A message that arrives in one piece never touches the buffer at all, whatever its
+size. It is a chunked reader that has to size it for the largest `string`, `blob`
+or array payload it will take **across a chunk boundary** — including one it only
+means to skip, which is still buffered while it is walked.
 
 #### Arrays of strings, blobs or structs: `sofab.collectors`
 
@@ -360,14 +430,23 @@ allocate a container of its own. What the codec does allocate is listed under
 
 ### Decode into your own storage (`Binding`)
 
-A `Visitor` costs one Python call per field. A **`Binding`** costs none: declare
-once where every field id belongs, and the decoder writes there itself.
+A **`Binding`** declares once where every field id belongs, so a decode fills
+your slots without a handler written by hand.
 
-Both drive the same `feed`, the same header walk and the same verdicts — a
-`Binding` is not a second decoder but a second way to say where a field goes.
-CORELIB_PLAN §5.3.1 allows one decode surface and this port ships two; the second
-is kept for what it costs, since a bound decode crosses into Python zero times
-per field.
+It is not a second decoder. CORELIB_PLAN §5.3.1 allows exactly one decode
+surface, and a table is reached **through** it: a handler declares its slots once
+from `Visitor.destinations()`, and `Decoder(binding=…, words=…, objects=…)` is
+the constructor shorthand for a handler that declares exactly that. Same `feed`,
+same header walk, same verdicts.
+
+What makes that one surface is where the *rules* live, not where the value
+lands. The receiver cap, the schema bound, the §7.3 tag test, the UTF-8 check,
+the declared element width and the resume transaction each exist **once** and run
+for every field alike — a field the table names and a field it does not run the
+same code right up to the assignment itself. It is the same bargain
+`on_string_begin` and `on_array_begin` already strike per field — name a
+destination and the codec writes there instead of calling you back — made once
+for the whole message.
 
 ```python
 from sofab import Binding, Decoder
@@ -410,12 +489,42 @@ What follows from the caller owning the storage:
 * **Nested messages share the same storage.** `b.sequence(id, child)` descends
   into a child table in the same two buffers, so a whole tree decodes into one
   flat pair. A sequence with no binding is skipped whole.
-* **A binding is build-once.** Building a decoder freezes the table; the decoder
-  caches what it derives, including a compiled lookup table shared by every
-  decoder over that binding in the native engine.
+* **A binding is build-once.** Building a decoder freezes the table and derives
+  its destination map, so a table changed afterwards cannot leave a decoder
+  reading a stale copy. The map is cached on the `Binding`, so building a decoder
+  per message costs no recompilation.
 
 A `Binding` and a `Visitor` compose: bind the fields you know, the visitor gets
-the rest.
+the rest — every hook, including the *begin* destinations and the raw `fp32`
+channel. A declaration is about *its own* field, so the two never collide: an
+`fp32` the table names lands in its slot as the widened `double` the table asked
+for, and one it does not name reaches `on_float32_bits` if the visitor overrides
+it.
+
+Declaring the slots on the handler instead is the same thing without the
+constructor keywords, and is what generated code should emit:
+
+```python
+from sofab import Visitor
+
+class Telemetry(Visitor):
+    def __init__(self):
+        self.words = bytearray(b.tree_words_required * 8)
+        self.objects = [None] * b.tree_objects_required
+
+    def destinations(self):                  # asked once, when the decoder is built
+        return (b, self.words, self.objects)
+
+t = Telemetry()
+Decoder(visitor=t).feed(payload)             # one handler argument, nothing else
+assert memoryview(t.words).cast("Q")[0] == u[0]
+```
+
+Anything a `Binding` declares, a hand-written `Visitor` can declare too:
+`on_schema_bound` is where a handler names the `count`/`maxlen` the *schema*
+puts on a field, which is what makes a receiver-side `max_dyn_*` cap stop
+applying to it (§6.2.1) and makes exceeding it `INVALID` rather than a policy
+rejection.
 
 ### Code generator
 
@@ -547,29 +656,36 @@ instead and an over-bound value is malformed input, so §6.2.1 forbids the cap
 there ("MUST NOT be applied to a field the schema already bounds") and §6.3
 forbids `SofaLimitError` on such a field.
 
-Only the schema knows which fields those are, and the binding is where it says
-so — `cap` on an array and `maxlen` on a string or blob **are** the schema's
-bound:
+Only the schema knows which fields those are, so the **handler** is where it says
+so. A `Binding` declares it in the table — `cap` on an array and `maxlen` on a
+string or blob **are** the schema's bound — and a hand-written visitor declares
+it with `on_schema_bound`:
 
 ```python
 b = Binding().string(1, at=0, maxlen=4194304)   # `name: { string, maxlen: 4194304 }`
+
+class Names(Visitor):                           # the same statement, by hand
+    def on_schema_bound(self, field):
+        return 4194304 if field.id == 1 else -1
 ```
 
 Declaring it does two things at once: the receiver-side cap stops applying to
 that field, and the decoder enforces the declared bound itself — an over-bound
 length is `INVALID` (`SofaDecodeError`, MESSAGE_SPEC §7.1), never
-`SofaLimitError`.
+`SofaLimitError`. `on_schema_bound` is asked at the count/length header, for a
+`string`, a `blob` or an array the handler has accepted, and for nothing else.
 
 #### So is a field nobody materializes
 
-A cap prevents an allocation, so it applies where there is one to prevent. Three
-routes make none, and none of them is capped:
+A cap prevents an allocation, so it applies where there is one to prevent. Two
+routes make none, and neither is capped:
 
-* a field the binding does not name, or names with a contradicting wire tag
-  (§7.3) — the decoder walks past the payload without building anything from it;
-* a field the visitor declines from `on_field`;
-* a field the visitor *wants*, having handed back its own buffer from
-  `on_blob_begin` or `on_array_begin`. The hook is told the announced length or
+* a field the handler declines at `on_field` — including one a binding does not
+  name, or names with a contradicting wire tag (§7.3) — the decoder walks past
+  the payload without building anything from it;
+* a field the handler *wants*, having handed back its own buffer from
+  `on_blob_begin`, `on_string_begin`, `on_array_begin` or
+  `on_float_array_begin`. The hook is told the announced length or
   count first, and a receiver that does not want that many bytes says so there —
   the decision is the handler's, and a limit the decoder applied on its behalf
   would only take it away.
@@ -578,6 +694,10 @@ What is left is the default route, and it is the one §6.2.1 is about: with no
 destination back, the decoder itself has to build a `str`, a `bytes` or a list,
 and the only size it could build one from is the wire's. That allocation is
 refused on the count/length word, before a payload byte is read.
+
+`on_float32_array_bits` is the one route that is **not** in that list: it hands
+over the wire bytes without asking, so the handler has no place to refuse and
+the configured ceiling stays the only one.
 
 The ceiling on a buffer you supply is that buffer's own size. Too short for what
 the hook was told, and the decoder refuses it — `SofaArgumentError`
@@ -604,40 +724,64 @@ followed it or on which engine read it (MESSAGE_SPEC §7.1). Omit them for
 
 The key point for Python: **decoding allocates results for you unless you ask it
 not to.** The visitor's typed hooks hand back fresh `int`/`str`/`bytes`/`list`
-objects; a `Binding`, `on_array_begin` or `on_blob_begin` writes into storage you
+objects; a `Binding`, or one of the five *begin* hooks, writes into storage you
 supplied and sized instead. Encoding never allocates an output buffer at all
 (§5.1).
 
+**Every aggregate has a route that does not size an allocation from the wire**
+(§6.6.3). Each hook is told the announced count or byte length first, before a
+byte is decoded, and refuses a destination too short rather than growing one:
+
+| aggregate | destination route | returns |
+|---|---|---|
+| `blob` | `on_blob_begin(id, size)` | a writable buffer of `size` bytes |
+| `string` | `on_string_begin(id, size)` | a writable buffer of `size` **bytes** — the payload's UTF-8, validated on the way in |
+| unsigned / signed array | `on_array_begin(id, wtype, count)` | `(dst, elem_min, elem_max)` |
+| `fp32` / `fp64` array | `on_float_array_begin(id, subtype, count)` | a writable buffer of `count` 8-byte slots |
+| `fp32` / `fp64` scalar | — | a value; a scalar is not storage (§6.6.3) |
+
+`fp32` additionally has §6.5's raw channel — `on_float32_bits` and
+`on_float32_array_bits`, paired with `Encoder.write_float32_bits` /
+`write_float32_array_bits` — for a consumer that has to reproduce the wire bytes
+rather than the value.
+
 **Where this port stands against CORELIB_PLAN §6.6, stated plainly.** The codec
-allocates nothing a wire number sizes on three paths — encode, a `Binding`
+allocates nothing a wire number sizes on the paths above — encode, a `Binding`
 decode, and a visitor decode that takes the destination routes — and
-`tests/test_allocation.py` measures exactly that: a payload a thousand times
-larger costs the same. It does not hold on the fourth: `on_string`, `on_bytes`,
-`on_unsigned_array` and the float-array hooks each hand back a whole value, and
+`tests/test_allocation.py` and `tests/test_aggregate_destinations.py` measure
+exactly that: a payload a thousand times larger costs the same. It does not hold
+where a handler asks for the **value**: `on_string`, `on_bytes`,
+`on_unsigned_array` and the float-array hooks each hand back a whole object, and
 the only size available to build one from is the wire's, which is what §6.6.3
 says such a callback obliges. Those hooks are kept because they are the
-convenient way to read a message, and the routes that avoid them are documented
-above. Beneath both, CPython allocates for every object a handler is given, so a
+convenient way to read a message, and every one of them now has an opt-out.
+Beneath both, CPython allocates for every object a handler is given, so a
 literal zero is not reachable in this language whatever the API looks like.
 
-* **Decode: the library owns the input buffer.** `Decoder` keeps a single
-  internal buffer, extended by `feed` and never handed out, so there is **no
-  zero-copy aliasing**: a handler receives a fresh `str`, independent `bytes`, a
-  fresh `int`/`float` or a new `list`, and every one of them stays valid after
-  the decoder advances.
-* **Decode: where a chunk-straddling construct is joined is yours to decide.**
-  By default the decoder joins it in a `bytearray` of its own, extended to
-  whatever the message declares. Pass `reassembly=bytearray(n)` and it joins in
-  **your** buffer instead, refusing a construct that does not fit rather than
-  growing one — which is what bounds a decode's memory by construction, and what
-  CORELIB_PLAN §6.6.2 asks of a codec. The default is the convenience; the
-  parameter is the conformant path, and generated code should take it.
-* **Decode: a decoded value can land in your storage too.** `Binding` writes the
-  numeric fields straight into slots you supply; `on_array_begin` takes a buffer
-  for an integer array's elements and `on_blob_begin` one for a blob's payload,
-  and neither builds a Python object on the way. What is left materialising is a
-  `str` (which must be validated, and this port validates by decoding), a float
-  array, and the scalars — those are values, not storage.
+* **Decode: no value outlives the callback, and nothing is aliased.** A handler
+  receives a fresh `str`, independent `bytes`, a fresh `int`/`float` or a new
+  `list`, and every one of them stays valid after the decoder advances. The one
+  exception is `on_float32_array_bits`, which is §6.7's pass-through route: it is
+  handed a read-only view of the bytes *you* fed, and the view is **released**
+  when the callback returns, so it cannot be kept by accident.
+* **Decode: a chunk-straddling construct is joined in one bounded buffer.**
+  `Decoder(reassembly=…)` takes a `bytearray` you supply, or an `int` for the
+  decoder to size one from at construction; omit it and it takes
+  `sofab.DEFAULT_REASSEMBLY` (4096) bytes. There is no other shape and it never
+  grows: a construct that does not fit is `SofaArgumentError`, which is what
+  bounds a decode's memory by construction. CORELIB_PLAN §6.6.2 requires exactly
+  that — no sender can enlarge this buffer by sending different bytes. The 4096
+  is this port's number and not the specification's; raise it for a reader that
+  streams larger `string`/`blob`/array payloads **across chunk boundaries**.
+  A message fed in one call never touches the buffer, whatever its size.
+* **Decode: a decoded value can land in your storage too.** `Binding` writes
+  every field into slots you supply, and the five *begin* hooks above take a
+  buffer for every aggregate — so an array of any length costs no list and no
+  object per element. A `string` is still **validated** when it goes into your buffer (§6.7.2:
+  a field the handler reads is materialized *and* validated); the check runs over
+  the bytes in fixed windows, so it does not build the `str` the destination
+  exists to avoid. What is left materialising is the scalars, and those are
+  values, not storage.
 * **Decode: a suspended construct keeps its bytes, and only its bytes.**
   Everything fed is retained until it is consumed, so a field split across chunks
   is never half-decoded; the consumed prefix is dropped on the next `feed`, down
@@ -660,7 +804,11 @@ literal zero is not reachable in this language whatever the API looks like.
   blob or fixlen-array payload by advancing the cursor, so nothing is allocated
   for bytes that are being discarded: skipping a 1 MiB blob already in the
   buffer is a pointer bump. The bytes are still **buffered** when the payload
-  straddles a chunk boundary, so what a skip saves is the copy, not the window.
+  straddles a chunk boundary, so what a skip saves is the copy, not the window —
+  and a skipped construct larger than the reassembly buffer is therefore refused
+  where a port that skips by advancing a cursor would walk past it. That is the
+  resume contract's doing: a suspended skip replays from the construct's first
+  byte, so the bytes cannot be dropped as they arrive.
 * **Encode: one ownership model — the output buffer is fixed, and never grows.**
   CORELIB_PLAN §5.1 forbids a corelib to allocate an output buffer or to grow
   one, so there is a single mechanism here with three ways to reach it:
@@ -675,14 +823,23 @@ literal zero is not reachable in this language whatever the API looks like.
     `flush()`. Nothing is retained, so `getvalue()` raises `SofaArgumentError`.
   * `Encoder()` is the same scratch buffer with the sink appending into the
     *result* — the message `getvalue()` hands back, joined from the drained
-    chunks (a message that fits in the scratch is never chunked at all, and a
-    `string`/`blob` run longer than the buffer becomes one chunk rather than
-    being copied through it). What grows is the message being returned, not a
-    buffer being written into: `bytes_used()` never exceeds 1 KiB.
+    chunks (a message that fits in the scratch is never chunked at all). What
+    grows is the message being returned, not a buffer being written into:
+    `bytes_used()` never exceeds 1 KiB. **One deviation, on this shape only:** a
+    `string`/`blob` run at least a bufferful long is appended to the result
+    directly instead of being copied through the scratch. §5.1.6 says every byte
+    a sink receives lies inside the installed buffer, and here it does not. The
+    run is the encoder's own immutable copy, the output bytes are identical, and
+    no caller buffer and no caller sink exist on this path — `Encoder(writer)`
+    and `over_buffer(…, flush)`, which have both, copy everything through the
+    buffer. `tests/test_encode_buffer_ownership.py` pins all three.
 
   The scratch is one allocation per encoder, made at construction and never
-  resized. A caller who wants zero library allocation supplies the buffer with
-  `over_buffer`.
+  resized — §6.6.1's first row, the convenience "the caller … then calls the
+  corelib", whose storage the codec keeps nothing of. §5.1.2 puts even that in
+  the generated layer, which knows the schema: a caller who wants zero library
+  allocation supplies the buffer with `over_buffer`, and generated code that can
+  bound its message from `MAX_SIZE` should.
 * **`MIN_OUTPUT_BUFFER` is `1`, and it applies to a buffer installed *with* a
   sink.** `sofab.MIN_OUTPUT_BUFFER` is the smallest output buffer this port
   accepts for **streaming**: one byte, because the encoder splits every atomic
@@ -693,10 +850,13 @@ literal zero is not reachable in this language whatever the API looks like.
   there — where the buffer is handed over, never partway through a message.
   A buffer installed **without** a sink is subject to no minimum: no flush can
   occur, so the buffer simply holds the message or reports `SofaBufferError`, and
-  sizing it from a generated `MAX_SIZE` stays exact. There is no pass-through: a
-  `string`/`blob` run is copied into the output buffer like any other output, and
-  every flush hands the sink a `memoryview` **over that buffer** — the installed
-  buffer itself, never a copy of it and never any other memory. A sink that only
+  sizing it from a generated `MAX_SIZE` stays exact. **Nothing but the installed
+  buffer reaches a caller's sink**: a `string`/`blob` run is copied into the
+  output buffer like any other output, and every flush hands the sink a
+  `memoryview` **over that buffer** — the installed buffer itself, never a copy
+  of it and never any other memory (§5.1.6). The one exception is the in-memory
+  `Encoder()`, which has no caller sink; it is stated with that constructor
+  above. A sink that only
   reads or copies during the call may let the view go; one that keeps it has
   *taken* the buffer and must install a replacement before it returns (below).
 * **The handles this codec allocates, in full.** CORELIB_PLAN §6.6.2 lets a
@@ -710,7 +870,7 @@ literal zero is not reachable in this language whatever the API looks like.
   | over the output buffer | one per installation (`buffer_set`), plus one full-buffer slice kept for the installation and handed to the sink at every flush of it; a short final flush builds and drops one |
   | over the input buffer | one per `bytes` taken out of an accumulating `bytearray`, so the payload is copied once instead of twice |
   | over a decode destination | one per `on_array_begin` / `on_blob_begin` that returns a buffer |
-  | over the words buffer | one per `Binding` decoder, at construction |
+  | over the words buffer | three per `Binding` handler, at construction, plus one per array row |
 
   None of them holds a decoded value, and each costs the same whatever the
   payload's size. Everything else the codec touches after construction is the
@@ -726,9 +886,9 @@ literal zero is not reachable in this language whatever the API looks like.
   flushed packet, including when it passes the **same** buffer back.
 * **Lazy sequence framing holds no buffer.** The ids
   `write_sequence_begin_lazy` holds back are encoder state, never buffer content:
-  the pending run is allocated on the first hold-back — an encoder that never
-  opens a sequence never pays for it — and grows on demand to the full
-  `MAX_DEPTH`. A flush therefore cannot split a held-back run, and a tiny output
+  the pending run is `MAX_DEPTH` slots wide, sized at construction and never
+  grown (§6.6), so the hold-back reaches the full depth and every depth is
+  canonical. A flush therefore cannot split a held-back run, and a tiny output
   buffer yields exactly the one-shot bytes.
 
 ## Build & test
@@ -745,12 +905,16 @@ mypy --strict src/sofab      # type-check
 from `corelib-c-cpp`. Its `sequence_growth` block describes a **wrapper array's
 container** growing as elements arrive — a length no wire word announces, since
 MESSAGE_SPEC §5.1 makes it *highest present id + 1*. That container belongs to
-the layer above the codec, and this port ships no such layer, so the suite
-supplies one and asserts what the codec owes it: each element's index surfaced
-unrenumbered before anything is extended, and a rejection at an index that is
-terminal. Growth **geometry** — extending to at least `id + 1` so a sparse array
-does not cost O(n²) copies — is therefore not a property of anything here to
-measure.
+the layer above the codec, and this port ships that layer: `sofab.collectors`
+(`StringSeq`, `BytesSeq`, `UnsignedSeq`, `SignedSeq`, `Float32Seq`,
+`Float64Seq`, `NestedSeq`). **It allocates, on the generated layer's behalf**
+(CORELIB_PLAN §6.6.1) — its lists are not a §6.6 breach, because the codec never
+calls into it: a collector is reached only from inside a visitor callback the
+codec made, and the codec keeps no reference to anything it takes.
+`tests/test_sequence_growth.py` replays every case in the block against it, and
+`tests/test_collectors.py` measures the growth **geometry** with `tracemalloc`
+— extending to at least `id + 1` in one pass, so a sparse array costs O(n) and
+not O(n²).
 
 If the compile fails or no compiler is available, the install falls back to
 pure-Python (the extension is marked *optional* in `setup.py`). Both engines
@@ -825,9 +989,12 @@ less work. Every other row is `Ir/op`'s to tell.
 The native accelerator is worth roughly an order of magnitude over the pure
 engine on the message-shaped rows and two on the array-heavy ones, and it beats
 protobuf everywhere except the smallest decode, where the two are level. That
-last workload is where the streaming decode costs the most: it crosses the
-Python↔C boundary once per field when a visitor handles it — and not at all when
-a `Binding` does — whereas protobuf parses the whole message in one C call.
+last workload is where the streaming decode costs the most: a visitor crosses the
+Python↔C boundary once per field, whereas protobuf parses the whole message in
+one C call. What a **declared destination** buys is that crossing: a field the
+handler's table names is written into its slot without one, and an array of any
+length costs no crossing at all rather than one per element. Every rule still
+runs on the one path either way (§5.3.1).
 `bench/compare_protobuf.py` runs that comparison.
 
 Measured figures are not reproduced here — they belong to the cross-language

@@ -4,15 +4,21 @@ CORELIB_PLAN §5.3 recommends the visitor pattern "because the primary consumer
 of this library is *generated code* … those objects already exist at decode
 time; the visitor pattern lets the decoder write each field straight into the
 waiting member without an intermediate representation". A :class:`Binding` is
-that idea with the last Python call taken out of it: instead of calling back per
-field so the handler can store the value, the handler declares **once** where
-every field belongs, and the decoder writes there itself.
+that idea written down once instead of by hand: rather than a handler with a
+branch per field id, the table says where every field belongs, and
+:func:`handler` compiles it into the :class:`sofab.Visitor` the decoder drives.
 
-What that buys is not a micro-optimisation. Measured on a 36-field / 12-array /
-51-element message (issue #109), parsing costs ~220 instructions per field while
-*every value made visible to Python* costs ~750–1100 — so the number of times a
-decode crosses the Python boundary, not the parser, is what a Python port's
-decode speed is made of. A bound decode crosses it zero times.
+It is **not** a second decode surface, and CORELIB_PLAN §5.3.1 does not allow
+one: "no convenience wrapper that decodes by another route", because "every
+additional surface is a second implementation of every rule in this document".
+So a table is a way of *saying where a field goes*, never a way of getting it
+there — the same `feed`, the same header walk, the same hooks and the same
+verdicts as any other handler.
+
+What it still buys over a hand-written visitor is the *elements*: an array of any
+length lands in the caller's slots through
+:meth:`sofab.Visitor.on_array_begin` / :meth:`~sofab.Visitor.on_float_array_begin`
+without a list and without a Python object per element.
 
 Two pieces of storage, both **supplied and sized by the caller** — the decoder
 allocates neither and never sizes anything from the wire (documentation#54 §6.6,
@@ -35,7 +41,7 @@ A field the table does not name is not an error: it is dispatched to the
 :class:`sofab.Visitor` the decoder was given, or skipped. So a binding covers
 the schema's hot fields and everything else keeps working.
 
-Example — the shape generated code would emit::
+Example::
 
     b = Binding()
     b.unsigned(1, at=0).signed(2, at=1).string(3, at=0, count_at=2)
@@ -55,7 +61,7 @@ Example — the shape generated code would emit::
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any
 
 from .types import (
     ARRAY_MAX,
@@ -68,9 +74,6 @@ from .types import (
     SofaArgumentError,
     WireType,
 )
-
-if TYPE_CHECKING:
-    from typing import Any
 
 # --- entry kinds -------------------------------------------------------------
 #
@@ -121,7 +124,7 @@ class Entry:
 
     __slots__ = (
         "kind", "field_id", "at", "cap", "count_at", "child", "wt", "st",
-        "elem_lo", "elem_hi", "elem_bounded",
+        "elem_lo", "elem_hi", "elem_bounded", "declared",
     )
 
     def __init__(
@@ -150,6 +153,15 @@ class Entry:
         self.elem_bounded = elem_bounded
         # Precomputed so the §7.3 tag test on the hot path is two int compares.
         self.wt, self.st = KIND_TAG[kind]
+        # What this row declares to Visitor.on_schema_bound: an array's ``cap``
+        # is always the schema's element count, a string/blob's ``maxlen`` only
+        # when one was given, and a scalar or a sequence declares nothing.
+        if kind in _ARRAY_KINDS:
+            self.declared = cap
+        elif kind in _OBJECT_KINDS and cap:
+            self.declared = cap
+        else:
+            self.declared = -1
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
@@ -169,6 +181,12 @@ class Binding:
     occurrences for a sequence. Slots the decoder never writes are left exactly
     as the caller prepared them, which is how a decode reports absence without
     inventing a sentinel.
+
+    An array's ``count_at`` is written when the array's **count header** is read,
+    not when its last element lands — that is where the destination is settled
+    (§6.6.3). On a decode that completes the value is the same either way; a
+    decode that ends INCOMPLETE or INVALID inside an array may already have
+    written it.
     """
 
     __slots__ = (
@@ -182,9 +200,12 @@ class Binding:
         self._words_required = 0
         self._objects_required = 0
         # Derived once and reused: a Decoder is built per message in the
-        # one-shot path, and walking the tree (or recompiling the native table)
-        # per decode would cost more than the decode.
+        # one-shot path, and walking the tree per decode would cost more than
+        # the decode.
         self._tree: tuple[int, int] | None = None
+        # The native engine's compiled destination map, built on first use and
+        # cached here: a Binding is build-once, so every Decoder over it reuses
+        # the same map instead of recompiling per message.
         self._compiled: Any = None
         self._frozen = False
 
@@ -238,11 +259,11 @@ class Binding:
         reachable set.
 
         A binding is a build-once artifact: a :class:`sofab.Decoder` derives its
-        storage requirements and (in the native engine) a compiled lookup table
-        from it, and caches both, so a table that changed afterwards would decode
-        against a stale copy. Freezing at first use makes that a clear error
-        instead. Called for you — building the decoder is what freezes the table
-        — and idempotent, so calling it yourself is harmless.
+        storage requirements and one handler per table from it and holds them,
+        so a table that changed afterwards would decode against a stale copy.
+        Freezing at first use makes that a clear error instead. Called for you —
+        building the decoder is what freezes the table — and idempotent, so
+        calling it yourself is harmless.
 
         It is deliberately the *whole tree*: a child bound into a parent is
         reachable only downwards, so freezing the root is the only moment at
@@ -458,3 +479,11 @@ def _index(value: Any, what: str) -> int:
             f"{what} must be an integer, got {type(value).__name__}"
         ) from exc
     return index
+
+
+# A Binding is reached through the handler that declares it -- see
+# :meth:`sofab.Visitor.destinations`. There is no adapter here and no second
+# decode path anywhere: the decoder consults the table at the point a value is
+# stored, and every rule that decides *whether* and *how* the value is decoded
+# runs in the one place both engines already had. §5.3.1 asks for one surface,
+# and one surface is what a destination map leaves.

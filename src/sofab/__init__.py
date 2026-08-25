@@ -29,6 +29,7 @@ from .collectors import (
 from .types import (
     API_VERSION,
     ARRAY_MAX,
+    DEFAULT_REASSEMBLY,
     FIXLEN_MAX,
     ID_MAX,
     MAX_DEPTH,
@@ -60,7 +61,8 @@ from .visitor import Visitor
 # instead. Both are byte-for-byte compatible and validated by the same shared
 # conformance vectors, so callers and generated code never need to care which
 # one is active. ``Field`` is re-exported from the active engine so that
-# ``isinstance(decoder.next(), sofab.Field)`` holds in both modes.
+# ``isinstance(field, sofab.Field)`` holds in both modes for the ``Field`` a
+# handler's ``on_field`` is given.
 if TYPE_CHECKING:
     # For static analysis the pure-Python classes are the reference definitions;
     # the native accelerator mirrors their public API exactly.
@@ -125,6 +127,7 @@ __all__ = [
     "ARRAY_MAX",
     "FIXLEN_MAX",
     "MAX_DEPTH",
+    "DEFAULT_REASSEMBLY",
     "MIN_OUTPUT_BUFFER",
     "UNSIGNED_MAX",
     "SIGNED_MIN",

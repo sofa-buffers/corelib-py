@@ -335,3 +335,136 @@ def test_reset_puts_the_callers_handler_back(engine):
     tail.flush()
     assert dec.feed(tail.getvalue()) is Status.COMPLETE
     assert seen == [42], "the caller's handler must be back in charge"
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_string_elements_maxlen_is_a_byte_length_not_a_character_count(engine):
+    """MESSAGE_SPEC §1 makes ``maxlen`` a bound on the payload's **wire byte
+    length**, and §7 makes a longer payload INVALID.
+
+    ``'hél'`` is three code points and **four** UTF-8 bytes, so a collector that
+    measured the decoded ``str`` accepted it against ``elem_max=3`` — a bound it
+    violates. The sibling ``BytesSeq`` never had the bug, because ``len()`` on
+    ``bytes`` is already the wire length; this pins the two to the same rule.
+    """
+    out: list = []
+    wire = _wrap(lambda e: e.write_string(0, "hél"))
+    dec = engine(visitor=root(lambda: StringSeq(out, elem_max=3)))
+    assert dec.feed(wire) is Status.INVALID
+    assert isinstance(dec.error, SofaDecodeError)
+    assert not isinstance(dec.error, SofaLimitError)
+    assert out == []
+
+    # Four is the byte length, so four is what the bound has to accept.
+    ok: list = []
+    assert engine(visitor=root(lambda: StringSeq(ok, elem_max=4))).feed(wire) is (
+        Status.COMPLETE
+    )
+    assert ok == ["hél"]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("cls,write", [(StringSeq, "write_string"), (BytesSeq, "write_bytes")])
+def test_an_over_long_element_is_refused_at_the_fixlen_word(engine, cls, write):
+    """The verdict comes from the length header, not from the built element, so
+    a payload the message truncates behind is still INVALID (§7.1, §5.2.3)."""
+    out: list = []
+    payload = "y" * 40 if cls is StringSeq else b"y" * 40
+    wire = _wrap(lambda e: getattr(e, write)(0, payload))
+    # Cut the message inside the payload: the length word has arrived, the
+    # bytes it announces have not.
+    dec = engine(visitor=root(lambda: cls(out, elem_max=8)))
+    assert dec.feed(wire[:6]) is Status.INVALID
+    assert isinstance(dec.error, SofaDecodeError)
+    assert out == []
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_an_elements_bound_does_not_judge_the_other_subtype(engine):
+    """A ``blob`` reaching a ``StringSeq`` is a MESSAGE_SPEC §7.3 type mismatch:
+    it is skipped, so it is never judged against a bound that is not its."""
+    out: list = []
+    wire = _wrap(lambda e: e.write_bytes(0, b"y" * 40))
+    assert engine(visitor=root(lambda: StringSeq(out, elem_max=8))).feed(wire) is (
+        Status.COMPLETE
+    )
+    assert out == []
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_child_handler_gets_its_own_on_field(engine):
+    """The hook flags belong to the **handler**, not to the decode.
+
+    A root that does not override ``on_field`` handing a scope to a child that
+    does used to leave the pure engine's per-loop flag stale — the child was
+    never asked, and the walk asserted on the ``Field`` nobody had built. The
+    collectors' own ``elem_max`` rides on exactly this, so it is pinned here as
+    well as through them.
+    """
+
+    seen: list = []
+
+    class Child(Visitor):
+        def on_field(self, field):
+            seen.append((field.id, field.type, field.size))
+            return None
+
+    class Root(Visitor):
+        def on_sequence_begin(self, field_id):
+            return Child() if field_id == WRAPPER else None
+
+    wire = _wrap(lambda e: (e.write_string(0, "ab"), e.write_unsigned(1, 7)))
+    dec = engine(visitor=Root())
+    assert dec.feed(wire) is Status.COMPLETE
+    assert [(i, s) for i, _t, s in seen] == [(0, 2), (1, 0)]
+
+
+# --- growth geometry (§7.2 item 8) -------------------------------------------
+
+
+def test_the_container_extends_to_the_index_in_one_pass():
+    """§7.2 item 8: "Test it where the language offers [an allocation-counting
+    facility]; where it does not, say so in the port's README rather than
+    reporting the case as passed." Python offers ``tracemalloc``, so it is
+    tested.
+
+    The property is that a **sparse** wrapper array does not cost O(n²): placing
+    at a far index extends the container to at least ``index + 1`` in one pass,
+    rather than re-copying the whole list per element. CPython's ``list`` gives
+    that for free — appending is amortised O(1) — and the point of the case is
+    to notice if the collector ever stops using it.
+    """
+    import tracemalloc
+
+    span = 1 << 14
+
+    def place(step):
+        out: list = []
+        coll = UnsignedSeq(out, cap=span)
+        tracemalloc.start()
+        try:
+            base = tracemalloc.get_traced_memory()[0]
+            for index in range(0, span, step):
+                coll.on_unsigned(index, index)
+            return tracemalloc.get_traced_memory()[1] - base, out
+        finally:
+            tracemalloc.stop()
+
+    dense, out_dense = place(1)
+    sparse, out_sparse = place(1 << 8)
+
+    # Both reach the same length: the gap is filled, not skipped (MESSAGE_SPEC §2).
+    assert len(out_dense) == span
+    assert len(out_sparse) == span - (1 << 8) + 1
+    assert out_sparse[0] == 0 and out_sparse[1] == 0 and out_sparse[1 << 8] == 1 << 8
+
+    # And the sparse walk costs no more than the dense one: if the container were
+    # rebuilt per element rather than extended, 64 far placements over 16,384
+    # slots would peak at many times a single list of that size.
+    assert sparse <= dense * 2, (
+        f"a sparse array peaked at {sparse} bytes against {dense} for the dense "
+        "one; the container is being rebuilt rather than extended"
+    )
+    # One list of `span` slots is ~8 bytes per slot; anything near a multiple of
+    # that is a copy per element.
+    assert sparse < span * 8 * 3, f"{sparse} bytes for {span} slots"
