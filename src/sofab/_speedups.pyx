@@ -728,6 +728,10 @@ cdef object _INT64_MAX_OBJ = INT64_MAX
 cdef tuple _ST = tuple(FixlenSubtype)
 cdef object _FP32_OBJ = FixlenSubtype.FP32
 cdef object _FP64_OBJ = FixlenSubtype.FP64
+# The two wire types on_schema_bound names outright: the pending kind already
+# says which it is, so there is nothing to index.
+cdef object _WTM_FIXLEN = WireType.FIXLEN
+cdef object _WTM_ARRAY_FIXLEN = WireType.ARRAY_FIXLEN
 
 
 # Pending-value kinds (mirror the pure decoder's _SCALAR/_FIXLEN/_VARRAY/_FARRAY).
@@ -2317,8 +2321,10 @@ cdef class Decoder:
         self._wants_bound = (
             type(visitor).on_schema_bound is not _BASE_ON_SCHEMA_BOUND)
         # A Field is built for the ONE hook that takes one. Every other hook --
-        # on_schema_bound included -- takes integers, so declaring a schema
-        # bound costs no object per field.
+        # on_schema_bound included -- takes integers and interned enum members,
+        # so declaring a schema bound costs no object per field. That is what
+        # lets generated code drop on_field entirely: with the wire's tag on
+        # this hook, there is nothing left for on_field to pre-filter (#133).
         self._make_field = self._wants_field
         self._wants_seq_begin = (
             type(visitor).on_sequence_begin is not _BASE_ON_SEQUENCE_BEGIN)
@@ -3458,21 +3464,44 @@ cdef class Decoder:
 
     cdef int _schema_bound(self, object visitor, object fid) except -1:
         # The hook half: ask the handler, then hand the answer to the one site
-        # that owns the rule. The map path calls _settle_bound directly. Both
-        # arguments are integers, so overriding the hook costs no object per
-        # field -- which is the whole reason it does not take a Field.
+        # that owns the rule. The map path calls _settle_bound directly.
+        #
+        # The wire's tag goes with the id, and that is what keeps this route
+        # level with the table one (#133). Every other hook is reached only for
+        # the kind it names, so the tag is already matched for it; this one
+        # spans string, blob and both array kinds, so an id the handler bounds
+        # can arrive under a tag it never declared -- which MESSAGE_SPEC S7.3
+        # skips like an unknown id. Told the tag, the handler answers -1 for it
+        # instead of applying a bound to someone else's length.
+        #
+        # Everything passed is an integer or an interned enum member, so
+        # overriding the hook still costs no object per field -- which is the
+        # whole reason it does not take a Field.
         cdef int pk = self._pk
         cdef int real = self._pk_real if pk == _PEND_LIMIT else pk
         cdef object n
+        cdef object wt
+        cdef object sub
         if real == _PEND_FIXLEN:
             if self._pend_subtype < _ST_STRING:
                 return 0   # an fp32/fp64 payload: a fixed width, nothing to bound
             n = PyLong_FromUnsignedLongLong(self._pend_size)
-        elif real == _PEND_VARRAY or real == _PEND_FARRAY:
+            wt = _WTM_FIXLEN
+            sub = _ST[self._pend_subtype]
+        elif real == _PEND_VARRAY:
+            # The wire type IS the element signedness here, and an integer
+            # array carries no subtype word at all.
             n = PyLong_FromUnsignedLongLong(self._pend_count)
+            wt = _WT[self._pend_wtype]
+            sub = _NONE
+        elif real == _PEND_FARRAY:
+            n = PyLong_FromUnsignedLongLong(self._pend_count)
+            wt = _WTM_ARRAY_FIXLEN
+            sub = _ST[self._pend_subtype]
         else:
             return 0
-        return self._settle_bound(<Py_ssize_t>visitor.on_schema_bound(fid, n))
+        return self._settle_bound(
+            <Py_ssize_t>visitor.on_schema_bound(fid, n, wt, sub))
 
     cdef int _settle_bound(self, Py_ssize_t bound) except -1:
         # THE site. What the schema declares does two things (S6.2.1,

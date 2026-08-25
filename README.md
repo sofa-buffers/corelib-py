@@ -524,7 +524,8 @@ Anything a `Binding` declares, a hand-written `Visitor` can declare too:
 `on_schema_bound` is where a handler names the `count`/`maxlen` the *schema*
 puts on a field, which is what makes a receiver-side `max_dyn_*` cap stop
 applying to it (§6.2.1) and makes exceeding it `INVALID` rather than a policy
-rejection.
+rejection. It is told the wire's tag alongside the id, so it can apply §7.3 to
+its own declaration exactly as the table route does.
 
 ### Code generator
 
@@ -662,11 +663,15 @@ string or blob **are** the schema's bound — and a hand-written visitor declare
 it with `on_schema_bound`:
 
 ```python
+from sofab import Binding, FixlenSubtype, Visitor, WireType
+
 b = Binding().string(1, at=0, maxlen=4194304)   # `name: { string, maxlen: 4194304 }`
 
 class Names(Visitor):                           # the same statement, by hand
-    def on_schema_bound(self, field_id, n):
-        return 4194304 if field_id == 1 else -1
+    def on_schema_bound(self, field_id, n, wtype, subtype):
+        if field_id == 1 and wtype is WireType.FIXLEN and subtype is FixlenSubtype.STRING:
+            return 4194304
+        return -1                               # not the field the schema declared
 ```
 
 Declaring it does two things at once: the receiver-side cap stops applying to
@@ -675,9 +680,20 @@ length is `INVALID` (`SofaDecodeError`, MESSAGE_SPEC §7.1), never
 `SofaLimitError`. `on_schema_bound` is asked at the count/length header, for a
 `string`, a `blob` or an array the handler has accepted, and for nothing else.
 
-Both arguments are plain integers — the id, and the count or length the *sender*
-announced — and that is deliberate: it is the one hook generated code overrides
-on every message, so overriding it must cost nothing per field. `on_field` is the
+The tag is passed with the id because this is the only hook that spans more than
+one kind. `on_string_begin` fires for a `string` and nothing else, `on_array_begin`
+for an integer array and nothing else — the decoder has already matched the wire's
+tag before calling them. Here it has not, and an id the schema bounds can arrive
+under a tag the schema never declared for it. MESSAGE_SPEC §7.3 skips such a field
+like an unknown id, so **answer `-1` for a tag you did not declare**: a bound
+answered for someone else's field turns a §7.3 skip into an `INVALID`. A `Binding`
+entry gets that same test run for it by the decoder, which is why the two routes
+agree. `subtype` is `None` for an integer array, which carries none on the wire.
+
+Nothing here costs an allocation — two plain integers and two interned enum
+members — and that is deliberate: it is the one hook generated code overrides on
+every message, so overriding it must cost nothing per field. It is also why
+generated code needs no `on_field` to pre-filter the tag for it. `on_field` is the
 only hook that takes a `Field`, and therefore the only one that makes the decoder
 build one.
 
