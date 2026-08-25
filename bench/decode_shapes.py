@@ -3,7 +3,7 @@
 
 A **supplementary, language-native view** (BENCH_SPEC): not one of the shared
 comparison rows, because the shapes it compares are Python's. It exists because
-corelib-py has two ways to hand a decoded field to Python and the difference
+corelib-py has two ways to *say where a decoded field goes*, and the difference
 between them is large enough to be an architecture decision rather than a
 preference:
 
@@ -12,9 +12,12 @@ preference:
                     this row carries that chain — leaving it out is what made an
                     earlier version of this harness read ~40% too favourably
                     (see #116).
-  ``feed_bound``    a :class:`sofab.Binding`: the decoder resolves each field to
-                    its destination in C and writes there. Nothing crosses into
-                    Python during the decode.
+  ``feed_bound``    a :class:`sofab.Binding`: a table of field id → destination,
+                    compiled into a ``Visitor`` (CORELIB_PLAN §5.3.1 allows one
+                    decode surface, so that is what a table is). It costs the
+                    generic dispatch a hand-written visitor does not — a
+                    ``Field`` and an ``on_field`` per field — and buys array
+                    elements that never become Python objects.
   ``feed_bound_read``  ``feed_bound`` plus the caller reading all 36 values back
                     out, one slot at a time — what a generated object with 36
                     typed attributes costs, as opposed to a consumer that reads
@@ -29,8 +32,9 @@ preference:
 The message is shaped after the ``vehicle_telemetry.yaml`` of issue #109 —
 **36 fields, 12 arrays, 51 elements** — and every driver decodes the same bytes.
 
-The gap between ``feed_bound`` and ``feed_bound_read`` is the point: the decode
-itself is cheap, and what it costs to make 36 values visible to Python is not.
+The gap between ``feed_bound`` and ``feed_bound_read`` is the point: what it
+costs to make 36 values visible to Python is most of a Python decode, whichever
+shape asks for them.
 
 Usage:
     python bench/decode_shapes.py <driver> [reps]     # for run_shapes_callgrind.sh

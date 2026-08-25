@@ -430,14 +430,14 @@ allocate a container of its own. What the codec does allocate is listed under
 
 ### Decode into your own storage (`Binding`)
 
-A `Visitor` costs one Python call per field. A **`Binding`** costs none: declare
-once where every field id belongs, and the decoder writes there itself.
+A **`Binding`** declares once where every field id belongs, so a decode fills
+your slots without a handler written by hand.
 
-Both drive the same `feed`, the same header walk and the same verdicts — a
-`Binding` is not a second decoder but a second way to say where a field goes.
-CORELIB_PLAN §5.3.1 allows one decode surface and this port ships two; the second
-is kept for what it costs, since a bound decode crosses into Python zero times
-per field.
+It is not a second decoder. CORELIB_PLAN §5.3.1 allows exactly one decode
+surface, and a `Binding` is compiled into a `Visitor` over that table — the same
+`feed`, the same header walk, the same hooks and the same verdicts as any other
+handler. One implementation, so nothing can be right on one route and wrong on
+the other.
 
 ```python
 from sofab import Binding, Decoder
@@ -480,12 +480,23 @@ What follows from the caller owning the storage:
 * **Nested messages share the same storage.** `b.sequence(id, child)` descends
   into a child table in the same two buffers, so a whole tree decodes into one
   flat pair. A sequence with no binding is skipped whole.
-* **A binding is build-once.** Building a decoder freezes the table; the decoder
-  caches what it derives, including a compiled lookup table shared by every
-  decoder over that binding in the native engine.
+* **A binding is build-once.** Building a decoder freezes the table and compiles
+  it into the handler that decodes through it, so a table changed afterwards
+  cannot leave a decoder reading a stale copy.
 
 A `Binding` and a `Visitor` compose: bind the fields you know, the visitor gets
-the rest.
+the rest — every hook, including the *begin* destinations. The one exception is
+the raw `fp32` channel (`on_float32_bits` / `on_float32_array_bits`): a table
+delivers the widened `double`, and which route an `fp32` takes is a property of
+the handler rather than of the field, so the combination is refused instead of
+silently delivering one route's value to the other's hook. Decode through the
+visitor alone for bit-exact `fp32`.
+
+Anything a `Binding` declares, a hand-written `Visitor` can declare too:
+`on_schema_bound` is where a handler names the `count`/`maxlen` the *schema*
+puts on a field, which is what makes a receiver-side `max_dyn_*` cap stop
+applying to it (§6.2.1) and makes exceeding it `INVALID` rather than a policy
+rejection.
 
 ### Code generator
 
@@ -617,28 +628,34 @@ instead and an over-bound value is malformed input, so §6.2.1 forbids the cap
 there ("MUST NOT be applied to a field the schema already bounds") and §6.3
 forbids `SofaLimitError` on such a field.
 
-Only the schema knows which fields those are, and the binding is where it says
-so — `cap` on an array and `maxlen` on a string or blob **are** the schema's
-bound:
+Only the schema knows which fields those are, so the **handler** is where it says
+so. A `Binding` declares it in the table — `cap` on an array and `maxlen` on a
+string or blob **are** the schema's bound — and a hand-written visitor declares
+it with `on_schema_bound`:
 
 ```python
 b = Binding().string(1, at=0, maxlen=4194304)   # `name: { string, maxlen: 4194304 }`
+
+class Names(Visitor):                           # the same statement, by hand
+    def on_schema_bound(self, field):
+        return 4194304 if field.id == 1 else -1
 ```
 
 Declaring it does two things at once: the receiver-side cap stops applying to
 that field, and the decoder enforces the declared bound itself — an over-bound
 length is `INVALID` (`SofaDecodeError`, MESSAGE_SPEC §7.1), never
-`SofaLimitError`.
+`SofaLimitError`. `on_schema_bound` is asked at the count/length header, for a
+`string`, a `blob` or an array the handler has accepted, and for nothing else.
 
 #### So is a field nobody materializes
 
-A cap prevents an allocation, so it applies where there is one to prevent. Three
-routes make none, and none of them is capped:
+A cap prevents an allocation, so it applies where there is one to prevent. Two
+routes make none, and neither is capped:
 
-* a field the binding does not name, or names with a contradicting wire tag
-  (§7.3) — the decoder walks past the payload without building anything from it;
-* a field the visitor declines from `on_field`;
-* a field the visitor *wants*, having handed back its own buffer from
+* a field the handler declines at `on_field` — including one a binding does not
+  name, or names with a contradicting wire tag (§7.3) — the decoder walks past
+  the payload without building anything from it;
+* a field the handler *wants*, having handed back its own buffer from
   `on_blob_begin`, `on_string_begin`, `on_array_begin` or
   `on_float_array_begin`. The hook is told the announced length or
   count first, and a receiver that does not want that many bytes says so there —
@@ -729,10 +746,10 @@ literal zero is not reachable in this language whatever the API looks like.
   is this port's number and not the specification's; raise it for a reader that
   streams larger `string`/`blob`/array payloads **across chunk boundaries**.
   A message fed in one call never touches the buffer, whatever its size.
-* **Decode: a decoded value can land in your storage too.** `Binding` writes the
-  numeric fields straight into slots you supply, and the five *begin* hooks above
-  take a buffer for every aggregate — none of them builds a Python object on the
-  way. A `string` is still **validated** when it goes into your buffer (§6.7.2:
+* **Decode: a decoded value can land in your storage too.** `Binding` writes
+  every field into slots you supply, and the five *begin* hooks above take a
+  buffer for every aggregate — so an array of any length costs no list and no
+  object per element. A `string` is still **validated** when it goes into your buffer (§6.7.2:
   a field the handler reads is materialized *and* validated); the check runs over
   the bytes in fixed windows, so it does not build the `str` the destination
   exists to avoid. What is left materialising is the scalars, and those are
@@ -825,7 +842,7 @@ literal zero is not reachable in this language whatever the API looks like.
   | over the output buffer | one per installation (`buffer_set`), plus one full-buffer slice kept for the installation and handed to the sink at every flush of it; a short final flush builds and drops one |
   | over the input buffer | one per `bytes` taken out of an accumulating `bytearray`, so the payload is copied once instead of twice |
   | over a decode destination | one per `on_array_begin` / `on_blob_begin` that returns a buffer |
-  | over the words buffer | one per `Binding` decoder, at construction |
+  | over the words buffer | three per `Binding` handler, at construction, plus one per array row |
 
   None of them holds a decoded value, and each costs the same whatever the
   payload's size. Everything else the codec touches after construction is the
@@ -945,8 +962,10 @@ The native accelerator is worth roughly an order of magnitude over the pure
 engine on the message-shaped rows and two on the array-heavy ones, and it beats
 protobuf everywhere except the smallest decode, where the two are level. That
 last workload is where the streaming decode costs the most: it crosses the
-Python↔C boundary once per field when a visitor handles it — and not at all when
-a `Binding` does — whereas protobuf parses the whole message in one C call.
+Python↔C boundary once per field, a `Binding` included — §5.3.1 allows one decode
+surface and that surface is a callback — whereas protobuf parses the whole
+message in one C call. What a destination still buys is the *elements*: an array
+of any length crosses once, not once per element.
 `bench/compare_protobuf.py` runs that comparison.
 
 Measured figures are not reproduced here — they belong to the cross-language

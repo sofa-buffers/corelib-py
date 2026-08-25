@@ -19,6 +19,15 @@ skipping a 10k-element array or a deep sub-tree costs nothing:
   nested sequence (its matching end is consumed too, so ``on_sequence_end`` is
   *not* called for a skipped sequence).
 
+A third hook carries the one fact the codec cannot know and the schema does:
+:meth:`Visitor.on_schema_bound` names the ``count``/``maxlen`` the schema puts
+on a field, which is what takes the receiver-side ``max_dyn_*`` cap off it
+(§6.2.1) and makes exceeding it ``INVALID`` rather than a policy rejection.
+
+Because this is the *only* decode surface (§5.3.1), it is also what a
+:class:`sofab.Binding` is: the table is compiled into a visitor over it, so
+nothing can be right on one route and wrong on another.
+
 Which hooks a handler overrides is read off its **type**, once, when the
 decoder binds it — so a hook nobody overrides costs nothing per field, and a
 child handler returned from :meth:`Visitor.on_sequence_begin` is measured on its
@@ -46,6 +55,36 @@ class Visitor:
         Return ``False`` to skip the value entirely; any other return proceeds
         to decode it and dispatch to the typed hook below."""
         return None
+
+    def on_schema_bound(self, field: Field) -> int:
+        """The count or length the **schema** declares for this field, or ``-1``.
+
+        Asked once, at the count/length header, for a ``string``, a ``blob`` or
+        an array this handler has accepted — after :meth:`on_field`, before a
+        byte of the payload is read or any storage is written. It is the one
+        place the schema's own ceiling reaches the codec, and it changes two
+        things about the field:
+
+        * a wire count/length **above** the declared bound is ``INVALID``
+          (:class:`sofab.SofaDecodeError`, MESSAGE_SPEC §7.1) — the message
+          contradicts the schema it claims to speak;
+        * the receiver-side ``max_dyn_*`` cap **stops applying** to the field.
+          CORELIB_PLAN §6.2.1: those limits "**MUST NOT** be applied to a field
+          the schema already bounds. There the schema bound governs and its
+          violation is `INVALID` … a schema bound is a statement about
+          *validity*, a receiver limit about *capacity*."
+
+        Return ``-1`` (the default) for a field the schema leaves unbounded;
+        the cap then governs it as usual. Only the handler can answer this —
+        §6.2.1 puts the numbers in generated code, and "the corelib cannot know
+        the schema" — which is why it is a hook rather than a decoder setting.
+
+        The verdict lands at the header, so a bound is enforced whether the
+        payload behind it arrives or not, and before anything is allocated for
+        it. A field this handler skips is never asked, and never bound-checked:
+        it is walked, not read (§6.7.2).
+        """
+        return -1
 
     def on_sequence_begin(self, field_id: int) -> bool | Visitor | None:
         """A nested sequence is opening; nothing inside it has been decoded.

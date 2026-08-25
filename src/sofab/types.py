@@ -179,9 +179,10 @@ class SofaLimitError(SofaError):
     not see a limit rejection as a conformance divergence from another engine.
 
     It is raised only for a field the **schema** leaves unbounded: where the
-    schema states a ``count:``/``maxlen:`` the caller says so by declaring that
-    bound on its :class:`sofab.Binding` entry, and that bound governs instead,
-    an over-bound value being :class:`SofaDecodeError` (CORELIB_PLAN §6.2.1/§6.3,
+    schema states a ``count:``/``maxlen:`` the handler says so — by declaring
+    that bound on its :class:`sofab.Binding` entry, or by answering
+    :meth:`sofab.Visitor.on_schema_bound` — and that bound governs instead, an
+    over-bound value being :class:`SofaDecodeError` (CORELIB_PLAN §6.2.1/§6.3,
     MESSAGE_SPEC §7.1). Nor is it raised for a field nothing materializes — a
     skipped one, or one read into storage the handler returned from
     :meth:`sofab.Visitor.on_blob_begin` / :meth:`sofab.Visitor.on_array_begin`.

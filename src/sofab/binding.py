@@ -4,15 +4,21 @@ CORELIB_PLAN §5.3 recommends the visitor pattern "because the primary consumer
 of this library is *generated code* … those objects already exist at decode
 time; the visitor pattern lets the decoder write each field straight into the
 waiting member without an intermediate representation". A :class:`Binding` is
-that idea with the last Python call taken out of it: instead of calling back per
-field so the handler can store the value, the handler declares **once** where
-every field belongs, and the decoder writes there itself.
+that idea written down once instead of by hand: rather than a handler with a
+branch per field id, the table says where every field belongs, and
+:func:`handler` compiles it into the :class:`sofab.Visitor` the decoder drives.
 
-What that buys is not a micro-optimisation. Measured on a 36-field / 12-array /
-51-element message (issue #109), parsing costs ~220 instructions per field while
-*every value made visible to Python* costs ~750–1100 — so the number of times a
-decode crosses the Python boundary, not the parser, is what a Python port's
-decode speed is made of. A bound decode crosses it zero times.
+It is **not** a second decode surface, and CORELIB_PLAN §5.3.1 does not allow
+one: "no convenience wrapper that decodes by another route", because "every
+additional surface is a second implementation of every rule in this document".
+So a table is a way of *saying where a field goes*, never a way of getting it
+there — the same `feed`, the same header walk, the same hooks and the same
+verdicts as any other handler.
+
+What it still buys over a hand-written visitor is the *elements*: an array of any
+length lands in the caller's slots through
+:meth:`sofab.Visitor.on_array_begin` / :meth:`~sofab.Visitor.on_float_array_begin`
+without a list and without a Python object per element.
 
 Two pieces of storage, both **supplied and sized by the caller** — the decoder
 allocates neither and never sizes anything from the wire (documentation#54 §6.6,
@@ -35,7 +41,7 @@ A field the table does not name is not an error: it is dispatched to the
 :class:`sofab.Visitor` the decoder was given, or skipped. So a binding covers
 the schema's hot fields and everything else keeps working.
 
-Example — the shape generated code would emit::
+Example::
 
     b = Binding()
     b.unsigned(1, at=0).signed(2, at=1).string(3, at=0, count_at=2)
@@ -55,7 +61,7 @@ Example — the shape generated code would emit::
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any
 
 from .types import (
     ARRAY_MAX,
@@ -64,13 +70,12 @@ from .types import (
     SIGNED_MAX,
     SIGNED_MIN,
     UNSIGNED_MAX,
+    Field,
     FixlenSubtype,
     SofaArgumentError,
     WireType,
 )
-
-if TYPE_CHECKING:
-    from typing import Any
+from .visitor import Visitor
 
 # --- entry kinds -------------------------------------------------------------
 #
@@ -121,7 +126,7 @@ class Entry:
 
     __slots__ = (
         "kind", "field_id", "at", "cap", "count_at", "child", "wt", "st",
-        "elem_lo", "elem_hi", "elem_bounded",
+        "elem_lo", "elem_hi", "elem_bounded", "declared",
     )
 
     def __init__(
@@ -150,6 +155,15 @@ class Entry:
         self.elem_bounded = elem_bounded
         # Precomputed so the §7.3 tag test on the hot path is two int compares.
         self.wt, self.st = KIND_TAG[kind]
+        # What this row declares to Visitor.on_schema_bound: an array's ``cap``
+        # is always the schema's element count, a string/blob's ``maxlen`` only
+        # when one was given, and a scalar or a sequence declares nothing.
+        if kind in _ARRAY_KINDS:
+            self.declared = cap
+        elif kind in _OBJECT_KINDS and cap:
+            self.declared = cap
+        else:
+            self.declared = -1
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
@@ -169,11 +183,17 @@ class Binding:
     occurrences for a sequence. Slots the decoder never writes are left exactly
     as the caller prepared them, which is how a decode reports absence without
     inventing a sentinel.
+
+    An array's ``count_at`` is written when the array's **count header** is read,
+    not when its last element lands — that is where the destination is settled
+    (§6.6.3). On a decode that completes the value is the same either way; a
+    decode that ends INCOMPLETE or INVALID inside an array may already have
+    written it.
     """
 
     __slots__ = (
         "_entries", "_by_id", "_words_required", "_objects_required",
-        "_tree", "_compiled", "_frozen",
+        "_tree", "_frozen",
     )
 
     def __init__(self) -> None:
@@ -182,10 +202,9 @@ class Binding:
         self._words_required = 0
         self._objects_required = 0
         # Derived once and reused: a Decoder is built per message in the
-        # one-shot path, and walking the tree (or recompiling the native table)
-        # per decode would cost more than the decode.
+        # one-shot path, and walking the tree per decode would cost more than
+        # the decode.
         self._tree: tuple[int, int] | None = None
-        self._compiled: Any = None
         self._frozen = False
 
     # --- introspection ------------------------------------------------------
@@ -238,11 +257,11 @@ class Binding:
         reachable set.
 
         A binding is a build-once artifact: a :class:`sofab.Decoder` derives its
-        storage requirements and (in the native engine) a compiled lookup table
-        from it, and caches both, so a table that changed afterwards would decode
-        against a stale copy. Freezing at first use makes that a clear error
-        instead. Called for you — building the decoder is what freezes the table
-        — and idempotent, so calling it yourself is harmless.
+        storage requirements and one handler per table from it and holds them,
+        so a table that changed afterwards would decode against a stale copy.
+        Freezing at first use makes that a clear error instead. Called for you —
+        building the decoder is what freezes the table — and idempotent, so
+        calling it yourself is harmless.
 
         It is deliberately the *whole tree*: a child bound into a parent is
         reachable only downwards, so freezing the root is the only moment at
@@ -458,3 +477,311 @@ def _index(value: Any, what: str) -> int:
             f"{what} must be an integer, got {type(value).__name__}"
         ) from exc
     return index
+
+
+# --- the one thing a Binding is: a Visitor -----------------------------------
+#
+# CORELIB_PLAN §5.3.1 permits **one** decode surface, "no convenience wrapper
+# that decodes by another route", and gives the reason: "every additional
+# surface is a second implementation of every rule in this document." This port
+# had two — the visitor, and a `binding=` path of its own inside each engine —
+# and they had already drifted apart: with `max_dyn_string_len=4`, a 10-byte
+# string at a field declared `maxlen=10` decoded COMPLETE through the binding
+# and raised SofaLimitError through the visitor, because the §6.2.1
+# schema-bound exemption had been implemented on one route only.
+#
+# So a Binding decodes through the visitor and nothing else. `_BoundVisitor` is
+# the whole of it: a Visitor that resolves each field id in the table and writes
+# the value the decoder handed it into the slot the table names. Every rule --
+# the UTF-8 decode, the fp32 widening, the receiver cap, the schema bound, the
+# §7.3 tag mismatch, the element-width check -- stays in the one decode path,
+# where there is one place to be correct.
+
+
+class _BoundVisitor(Visitor):
+    """A :class:`Binding` table, as a :class:`sofab.Visitor`.
+
+    One instance per table in the tree (a nested sequence's child table gets its
+    own, returned from :meth:`on_sequence_begin`), all sharing the caller's
+    ``words`` / ``objects`` storage and the fallback visitor. It holds no state
+    that outlives a field: ``_e`` is the row :meth:`on_field` matched, read by
+    the typed hook that follows it and by nothing else.
+    """
+
+    def __init__(
+        self,
+        table: dict[int, Entry],
+        wu: Any,
+        wq: Any,
+        wd: Any,
+        objects: list[Any] | None,
+        fallback: Visitor | None,
+    ) -> None:
+        self._map = table
+        self._wu = wu
+        self._wq = wq
+        self._wd = wd
+        self._objects = objects
+        self._fallback = fallback
+        # The row on_field matched, for the one typed hook that follows it.
+        self._e: Entry | None = None
+        # Per-entry destinations, sliced once here rather than per array field:
+        # §6.6 makes construction the place a decode's storage is settled, and a
+        # memoryview slice per array per message would be an allocation the wire
+        # picks the *number* of.
+        self._dst: dict[int, Any] = {}
+        # field id -> the handler for the child table a sequence descends into.
+        self._kids: dict[int, _BoundVisitor] = {}
+        for e in table.values():
+            k = e.kind
+            if k == K_ARRAY_UNSIGNED:
+                self._dst[e.field_id] = wu[e.at : e.at + e.cap]
+            elif k == K_ARRAY_SIGNED:
+                self._dst[e.field_id] = wq[e.at : e.at + e.cap]
+            elif k in (K_ARRAY_FLOAT32, K_ARRAY_FLOAT64):
+                self._dst[e.field_id] = wd[e.at : e.at + e.cap]
+
+    # --- the field walk -----------------------------------------------------
+
+    def on_field(self, field: Field) -> bool | None:
+        e = self._map.get(field.id)
+        if e is None:
+            # Not in the table: the fallback visitor's field, or nobody's.
+            self._e = None
+            fb = self._fallback
+            return False if fb is None else fb.on_field(field)
+        if field.type != e.wt or (e.st is not None and field.subtype != e.st):
+            # §7.3: the wire tag contradicts what the schema declared for this
+            # id. Not an error — the field is skipped, its slot left as the
+            # caller prepared it, and the decode stays COMPLETE. Skipped means
+            # skipped: nothing is materialized and nothing is validated
+            # (§6.7.2), so the fallback is not offered it either.
+            self._e = None
+            return False
+        self._e = e
+        return None
+
+    def on_schema_bound(self, field: Field) -> int:
+        e = self._e
+        if e is None:
+            fb = self._fallback
+            return -1 if fb is None else fb.on_schema_bound(field)
+        return e.declared
+
+    def on_sequence_begin(self, field_id: int) -> bool | Visitor | None:
+        e = self._map.get(field_id)
+        if e is not None and e.kind == K_SEQUENCE:
+            c = e.count_at
+            if c >= 0:
+                self._wu[c] = self._wu[c] + 1
+            return self._kids[field_id]
+        # Either the id is unbound, or the table declares something else for it
+        # (§7.3). Both are the fallback's to answer; with no fallback the
+        # sub-tree is skipped whole.
+        fb = self._fallback
+        if fb is None:
+            return False
+        answer = fb.on_sequence_begin(field_id)
+        if answer is False or isinstance(answer, Visitor):
+            return answer
+        # The fallback wants the sub-tree flat: hand it the scope, and this
+        # table resumes when the scope closes.
+        return fb
+
+    def on_sequence_end(self) -> None:
+        # A bound sequence is descended into without asking the fallback, but
+        # the fallback still hears every scope close, exactly as it did when the
+        # table lived inside the decoder.
+        fb = self._fallback
+        if fb is not None:
+            fb.on_sequence_end()
+
+    # --- destinations (§6.6.3) ----------------------------------------------
+
+    def on_array_begin(
+        self, field_id: int, wtype: WireType, count: int
+    ) -> tuple[Any, int | None, int | None] | None:
+        e = self._e
+        if e is None:
+            return self._fallback.on_array_begin(field_id, wtype, count)  # type: ignore[union-attr]
+        c = e.count_at
+        if c >= 0:
+            self._wu[c] = count
+        if e.elem_bounded:
+            return (self._dst[field_id], e.elem_lo, e.elem_hi)
+        return (self._dst[field_id], None, None)
+
+    def on_float_array_begin(
+        self, field_id: int, subtype: FixlenSubtype, count: int
+    ) -> Any:
+        e = self._e
+        if e is None:
+            return self._fallback.on_float_array_begin(field_id, subtype, count)  # type: ignore[union-attr]
+        c = e.count_at
+        if c >= 0:
+            self._wu[c] = count
+        return self._dst[field_id]
+
+    def on_blob_begin(self, field_id: int, size: int) -> Any:
+        # A bound blob lands in ``objects`` as a ``bytes``, so the decoder keeps
+        # the field: a destination here would hand back raw storage instead.
+        e = self._e
+        if e is None:
+            return self._fallback.on_blob_begin(field_id, size)  # type: ignore[union-attr]
+        return None
+
+    def on_string_begin(self, field_id: int, size: int) -> Any:
+        e = self._e
+        if e is None:
+            return self._fallback.on_string_begin(field_id, size)  # type: ignore[union-attr]
+        return None
+
+    # --- typed values -------------------------------------------------------
+
+    def on_unsigned(self, field_id: int, value: int) -> None:
+        e = self._e
+        if e is None:
+            self._fallback.on_unsigned(field_id, value)  # type: ignore[union-attr]
+            return
+        self._wu[e.at] = value
+        c = e.count_at
+        if c >= 0:
+            self._wu[c] = 1
+
+    def on_signed(self, field_id: int, value: int) -> None:
+        e = self._e
+        if e is None:
+            self._fallback.on_signed(field_id, value)  # type: ignore[union-attr]
+            return
+        self._wq[e.at] = value
+        c = e.count_at
+        if c >= 0:
+            self._wu[c] = 1
+
+    def on_float32(self, field_id: int, value: float) -> None:
+        e = self._e
+        if e is None:
+            self._fallback.on_float32(field_id, value)  # type: ignore[union-attr]
+            return
+        self._wd[e.at] = value
+        c = e.count_at
+        if c >= 0:
+            self._wu[c] = 1
+
+    def on_float64(self, field_id: int, value: float) -> None:
+        e = self._e
+        if e is None:
+            self._fallback.on_float64(field_id, value)  # type: ignore[union-attr]
+            return
+        self._wd[e.at] = value
+        c = e.count_at
+        if c >= 0:
+            self._wu[c] = 1
+
+    def on_string(self, field_id: int, value: str) -> None:
+        e = self._e
+        if e is None:
+            self._fallback.on_string(field_id, value)  # type: ignore[union-attr]
+            return
+        self._objects[e.at] = value  # type: ignore[index]
+        c = e.count_at
+        if c >= 0:
+            self._wu[c] = 1
+
+    def on_bytes(self, field_id: int, value: bytes) -> None:
+        e = self._e
+        if e is None:
+            self._fallback.on_bytes(field_id, value)  # type: ignore[union-attr]
+            return
+        self._objects[e.at] = value  # type: ignore[index]
+        c = e.count_at
+        if c >= 0:
+            self._wu[c] = 1
+
+    # A bound array always answers its *begin* hook with a destination, so these
+    # four are reached only for a field the table does not name.
+
+    def on_unsigned_array(self, field_id: int, values: list[int]) -> None:
+        if self._e is None:
+            self._fallback.on_unsigned_array(field_id, values)  # type: ignore[union-attr]
+
+    def on_signed_array(self, field_id: int, values: list[int]) -> None:
+        if self._e is None:
+            self._fallback.on_signed_array(field_id, values)  # type: ignore[union-attr]
+
+    def on_float32_array(self, field_id: int, values: list[float]) -> None:
+        if self._e is None:
+            self._fallback.on_float32_array(field_id, values)  # type: ignore[union-attr]
+
+    def on_float64_array(self, field_id: int, values: list[float]) -> None:
+        if self._e is None:
+            self._fallback.on_float64_array(field_id, values)  # type: ignore[union-attr]
+
+
+def handler(
+    binding: Binding,
+    words: Any,
+    objects: list[Any] | None,
+    fallback: Visitor | None,
+) -> _BoundVisitor:
+    """The handler a ``Decoder(binding=…)`` decodes through.
+
+    Checks the caller's storage against what the table needs, then builds one
+    :class:`_BoundVisitor` per table in the tree and links the sequence rows to
+    their children. Both engines call this: the table is compiled to a handler
+    in exactly one place, so neither engine can grow a decode path of its own
+    (§5.3.1).
+    """
+    if words is None:
+        raise SofaArgumentError("a binding needs a words buffer")
+    raw = memoryview(words)
+    if raw.readonly:
+        raise SofaArgumentError("the words buffer must be writable")
+    raw = raw.cast("B")
+    if raw.nbytes % 8:
+        raise SofaArgumentError("the words buffer must be a multiple of 8 bytes")
+    if raw.nbytes < binding.tree_words_required * 8:
+        raise SofaArgumentError(
+            f"words buffer holds {raw.nbytes // 8} slots, "
+            f"the binding needs {binding.tree_words_required}"
+        )
+    if fallback is not None and (
+        type(fallback).on_float32_bits is not Visitor.on_float32_bits
+        or type(fallback).on_float32_array_bits is not Visitor.on_float32_array_bits
+    ):
+        # One decode surface means one handler, and which fp32 route a handler
+        # takes is a property of the handler, not of the field (§6.5's channel
+        # is chosen by overriding the hook). A table delivers the widened
+        # ``double`` §6.5 permits a value consumer, so it cannot also carry a
+        # fallback that wants the raw bits: the flag is read off one type and
+        # would govern both. Refused here rather than silently delivering the
+        # widened value to a handler that overrode only the bit hook.
+        raise SofaArgumentError(
+            "a binding delivers fp32 as the widened double, so it cannot be "
+            "combined with a visitor that overrides on_float32_bits or "
+            "on_float32_array_bits; decode through the visitor alone for the "
+            "raw-wire-bytes channel (§6.5)"
+        )
+    if objects is None:
+        if binding.tree_objects_required:
+            raise SofaArgumentError("a binding with string/blob fields needs objects")
+    elif len(objects) < binding.tree_objects_required:
+        raise SofaArgumentError(
+            f"objects holds {len(objects)} entries, "
+            f"the binding needs {binding.tree_objects_required}"
+        )
+    # One buffer, three views over the same bytes: the wire says which to use
+    # per field, and the casts are made here, once.
+    wu = raw.cast("Q")
+    wq = raw.cast("q")
+    wd = raw.cast("d")
+    tables = binding.freeze()
+    made = {
+        id(b): _BoundVisitor(b._by_id, wu, wq, wd, objects, fallback) for b in tables
+    }
+    for b in tables:
+        h = made[id(b)]
+        for e in b._entries:
+            if e.child is not None:
+                h._kids[e.field_id] = made[id(e.child)]
+    return made[id(binding)]
