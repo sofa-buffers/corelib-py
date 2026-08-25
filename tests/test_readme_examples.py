@@ -170,3 +170,72 @@ def test_array_begin_example_fills_the_destination(readme: str) -> None:
 
     assert list(handler.ports[:3]) == [1, 2, 0xFFFF]
     assert got == [(8, [1 << 20])], "id 7 went to the destination, not the hook"
+
+
+def test_string_begin_example_fills_the_destination(readme: str) -> None:
+    """The ``on_string_begin`` example: the handler's own bytearray takes the
+    payload's UTF-8, and ``on_string`` is not called for that field."""
+    from sofab import Decoder, Status, Visitor
+
+    ns: dict = {"Visitor": Visitor}
+    _run_readme_block(readme, "#### Strings: `on_string_begin`", ns)
+    handler = ns["Handler"]()
+
+    got: list = []
+    handler.on_string = lambda fid, value: got.append((fid, value))
+
+    enc = Encoder()
+    enc.write_string(3, "grüß dich")
+    enc.write_string(4, "elsewhere")
+    enc.flush()
+    assert Decoder(visitor=handler).feed(enc.getvalue()) is Status.COMPLETE
+
+    utf8 = "grüß dich".encode()
+    assert bytes(handler.name[: len(utf8)]) == utf8
+    assert got == [(4, "elsewhere")], "id 3 went to the destination, not the hook"
+
+
+def test_float_array_begin_example_fills_the_destination(readme: str) -> None:
+    from sofab import Decoder, Status, Visitor
+
+    ns: dict = {"Visitor": Visitor}
+    _run_readme_block(readme, "#### Float arrays: `on_float_array_begin`", ns)
+    handler = ns["Handler"]()
+
+    got: list = []
+    handler.on_float64_array = lambda fid, vals: got.append((fid, list(vals)))
+
+    enc = Encoder()
+    enc.write_float64_array(5, [0.5, 1.5, 2.5])
+    enc.write_float64_array(6, [9.0])
+    enc.flush()
+    assert Decoder(visitor=handler).feed(enc.getvalue()) is Status.COMPLETE
+
+    assert list(handler.samples[:3]) == [0.5, 1.5, 2.5]
+    assert got == [(6, [9.0])], "id 5 went to the destination, not the hook"
+
+
+def test_bit_exact_float_example_round_trips_a_signaling_nan(readme: str) -> None:
+    """The transcoder in the README must reproduce the wire bytes exactly —
+    which is the whole reason §6.5 requires the channel it uses."""
+    from sofab import Decoder, Status, Visitor
+
+    out = Encoder()
+    ns: dict = {"Visitor": Visitor, "out": out}
+    _run_readme_block(
+        readme, "#### Bit-exact floats: `on_float32_bits` and `write_float32_bits`", ns
+    )
+
+    # A signaling NaN, which a widening conversion would quiet.
+    snan = bytes.fromhex("0100807f")
+    one = Encoder()
+    one.write_float32(7, 0.0)
+    one.flush()
+    other = Encoder()
+    other.write_float32_array(8, [0.0])
+    other.flush()
+    wire = one.getvalue()[:-4] + snan + other.getvalue()[:-4] + snan
+
+    assert Decoder(visitor=ns["Transcoder"]()).feed(wire) is Status.COMPLETE
+    out.flush()
+    assert out.getvalue() == wire

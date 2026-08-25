@@ -2040,18 +2040,22 @@ cdef class Decoder:
     # Active table, and the enclosing ones: a sequence opens a fresh id scope
     # (§4.9), so descending REPLACES the table rather than layering onto it.
     cdef int _tab
-    # Inline, not heap: S6.6 wants this state sized at construction, and a
-    # member array is sized *before* it -- there is no allocator call to time
-    # wrongly, and no free() on the way out. 1 KiB per decoder, which is what
-    # the malloc it replaces cost anyway.
-    cdef int _tstack[_MAX_DEPTH_C + 1]
+    # The enclosing tables a descent replaced, and the handlers it suspended.
+    # Both are sized in __cinit__ from MAX_DEPTH and never grown, which is what
+    # S6.6 asks of the codec's bounded working state.
+    #
+    # One heap block for the pair, not two member arrays: an inline array is
+    # part of the object, and tp_alloc zeroes the whole object -- 3 KiB of
+    # memset per decoder, on a path that builds one per message. A single
+    # malloc costs a fraction of that and is freed in __dealloc__. (A Python
+    # list is dearer still: `[None] * 255` alone was ~565 ns of a ~990 ns
+    # construction.)
+    cdef void* _stackmem
+    cdef int* _tstack               # _MAX_DEPTH+1 ints
     cdef int _tsp
-    # The handlers a descent suspended, as borrowed-then-owned pointers rather
-    # than a Python list: `[None] * 255` cost ~565 ns of a ~990 ns decoder
-    # construction, and a decoder is built per message on the one-shot path.
-    # Each slot holds one strong reference, dropped when it is popped, when the
-    # decoder is reset, and in __dealloc__.
-    cdef PyObject* _vstack[_MAX_DEPTH_C]
+    # Each occupied slot holds one strong reference, dropped when it is popped,
+    # when the decoder is reset, and in __dealloc__.
+    cdef PyObject** _vstack         # _MAX_DEPTH borrowed-then-owned pointers
     cdef int _vsp
     cdef int _status
     cdef object _err
@@ -2065,6 +2069,9 @@ cdef class Decoder:
                   max_dyn_blob_len=_FIXLEN_MAX_OBJ,
                   reassembly=None):
         self._tables = None
+        self._stackmem = NULL
+        self._tstack = NULL
+        self._vstack = NULL
         self._bent = NULL
         self._btab = NULL
         self._words = NULL
@@ -2073,6 +2080,14 @@ cdef class Decoder:
         self._tab = -1
         self._tsp = 0
         self._vsp = 0
+        self._stackmem = malloc(
+            <size_t>(_MAX_DEPTH_C + 1) * sizeof(int)
+            + <size_t>_MAX_DEPTH_C * sizeof(PyObject*))
+        if self._stackmem == NULL:
+            raise MemoryError()
+        self._tstack = <int*>self._stackmem
+        self._vstack = <PyObject**>(
+            <char*>self._stackmem + (_MAX_DEPTH_C + 1) * sizeof(int))
         self._status = <int>Status.COMPLETE
         self._err = None
         self._limit = None
@@ -2153,10 +2168,14 @@ cdef class Decoder:
         # _tstack / _vstack are member arrays; only the references the latter
         # holds have to be dropped.
         cdef int i
-        for i in range(self._vsp):
-            Py_XDECREF(self._vstack[i])
-            self._vstack[i] = NULL
-        self._vsp = 0
+        if self._stackmem != NULL:
+            for i in range(self._vsp):
+                Py_XDECREF(self._vstack[i])
+            self._vsp = 0
+            free(self._stackmem)
+            self._stackmem = NULL
+            self._tstack = NULL
+            self._vstack = NULL
         if self._wview != NULL:
             PyBuffer_Release(self._wview)
             free(self._wview)
