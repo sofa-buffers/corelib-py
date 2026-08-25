@@ -37,18 +37,19 @@ occupies no buffer space, and the buffer only fills through a write — which
 commits the whole run before its first byte goes out. A tiny output buffer
 therefore produces exactly the one-shot bytes.
 
-The run itself has no fixed window: it grows on demand, so the hold-back reaches
-the full :data:`sofab.MAX_DEPTH` and every depth is canonical (CORELIB_PLAN §6 —
-only a heap-free profile may bound the run and frame eagerly beyond the bound).
-It is allocated on the first hold-back, so an encoder that never opens a sequence
-never pays for it.
+The run itself has no fixed window: it is :data:`sofab.MAX_DEPTH` slots wide, so
+the hold-back reaches the full depth and every depth is canonical (CORELIB_PLAN
+§6.0.1 — only a heap-free profile may bound the run and frame eagerly beyond the
+bound). It is sized at construction and never grows, which §6.6 requires of every
+piece of the codec's bounded working state.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
 from operator import index as _index
-from typing import Callable, SupportsIndex
+from struct import Struct as _Struct
+from typing import Any, Callable, SupportsIndex
 
 from . import _core
 from ._varint import encode_varint, zigzag_encode
@@ -101,6 +102,11 @@ _VARINT_MAX = 10
 
 FlushSink = Callable[[bytes], None]
 Writer = object  # anything with .write(bytes)
+
+
+#: The raw fp32 wire form: four little-endian bytes, written from the bits and
+#: never from a float (§6.5).
+_U32_LE = _Struct("<I")
 
 
 def _as_int(value: object, what: str) -> int:
@@ -579,6 +585,36 @@ class Encoder:
         """Write a 32-bit IEEE-754 float as a little-endian fixlen field."""
         self._write_fixlen(field_id, _core.pack_f32(value), _ST_FP32)
 
+    def write_float32_bits(self, field_id: SupportsIndex, bits: SupportsIndex) -> None:
+        """Write a 32-bit float from its **raw wire bits**, verbatim.
+
+        ``bits`` is an unsigned 32-bit integer — the little-endian payload as it
+        lay on the wire, which is what :meth:`sofab.Visitor.on_float32_bits`
+        hands back. The four bytes go out unchanged: no float is constructed and
+        no conversion happens, so nothing can quiet a signaling NaN on the way.
+
+        This is CORELIB_PLAN §6.5's other half. A double-only target "**MUST
+        NOT** re-encode an ``fp32`` from the widened value", because the IEEE
+        widening a Python ``float`` performs sets the quiet bit and destroys a
+        signaling NaN's payload. A transcoder, a round-trip or any re-encode
+        pairs this with ``on_float32_bits``; a producer that has a value rather
+        than bytes writes :meth:`write_float32` as before.
+
+        Out of ``0..0xFFFFFFFF`` is :class:`SofaArgumentError` (§6.3).
+        """
+        if not self._begin():
+            return
+        try:
+            raw = _as_int(bits, "fp32 bits") if not isinstance(bits, int) else bits
+            if raw < 0 or raw > 0xFFFFFFFF:
+                raise SofaArgumentError(
+                    f"fp32 bits {raw} out of range 0..{0xFFFFFFFF}"
+                )
+        except SofaError as exc:
+            self._fail(exc)
+            return
+        self._write_fixlen(field_id, _U32_LE.pack(raw), _ST_FP32)
+
     def write_float64(self, field_id: SupportsIndex, value: float) -> None:
         """Write a 64-bit IEEE-754 float as a little-endian fixlen field."""
         self._write_fixlen(field_id, _core.pack_f64(value), _ST_FP64)
@@ -793,6 +829,47 @@ class Encoder:
         distinguishable) but there is no payload (§4.8).
         """
         self._write_float_array(field_id, values, _ST_FP32, _core.pack_f32_array, 4)
+
+    def write_float32_array_bits(
+        self, field_id: SupportsIndex, payload: Any, count: int | None = None
+    ) -> None:
+        """Write an ``fp32`` array from its **raw wire bytes**, verbatim.
+
+        ``payload`` is any bytes-like object holding the array's little-endian
+        payload — ``4 * count`` bytes, which is what
+        :meth:`sofab.Visitor.on_float32_array_bits` hands back. Pass ``count``
+        to state it, or leave it out and it is ``len(payload) // 4``; a length
+        that is not a multiple of four is :class:`SofaArgumentError`.
+
+        The array half of :meth:`write_float32_bits`, and for the same reason:
+        §6.5's bit-exactness requirement is stated over "**every** ``fp32``
+        position … **and** each element of an ``fp32`` array".
+        """
+        if not self._begin():
+            return
+        try:
+            view = memoryview(payload).cast("B")
+            try:
+                n = view.nbytes
+                if n % 4:
+                    raise SofaArgumentError(
+                        f"an fp32 array payload of {n} bytes is not a whole "
+                        "number of 4-byte elements"
+                    )
+                have = n // 4
+                if count is not None and count != have:
+                    raise SofaArgumentError(
+                        f"count={count} does not match the {have} elements "
+                        f"{n} payload bytes carry"
+                    )
+                self._array_header(field_id, _WT_ARRAY_FIXLEN, have)
+                # §4.8: the fixlen_word is always present, empty array included.
+                self._emit_varint((4 << 3) | _ST_FP32)
+                self._put(bytes(view))
+            finally:
+                view.release()
+        except SofaError as exc:
+            self._fail(exc)
 
     def write_float64_array(self, field_id: SupportsIndex, values: Iterable[float]) -> None:
         """Write an array of 64-bit floats as a packed little-endian fixlen array.

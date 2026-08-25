@@ -113,6 +113,18 @@ def unpack_f32(data: bytes) -> float:
     return value
 
 
+def unpack_u32(data: Any) -> int:
+    """The raw little-endian 32 bits of an ``fp32`` payload, untouched.
+
+    CORELIB_PLAN §6.5 requires a double-only target to carry an ``fp32`` to a
+    bit-exact consumer as **wire bits**, never as the widened value: the IEEE
+    widening sets the quiet bit, and a signaling NaN's payload is gone the
+    instant it passes through a wider float. This is that channel.
+    """
+    bits: int = _U32.unpack(data)[0]
+    return bits
+
+
 def unpack_f64(data: bytes) -> float:
     """Decode a single little-endian fp64 value from 8 bytes."""
     value: float = _F64.unpack(data)[0]

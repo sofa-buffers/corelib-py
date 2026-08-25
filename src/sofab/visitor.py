@@ -159,7 +159,39 @@ class Visitor:
         """Handle a decoded signed-integer field."""
 
     def on_float32(self, field_id: int, value: float) -> None:
-        """Handle a decoded 32-bit float field."""
+        """Handle a decoded 32-bit float field.
+
+        The value is a Python ``float`` — a C ``double`` — because Python has no
+        other float. CORELIB_PLAN §6.5 permits that for a **value** consumer;
+        a consumer that has to reproduce the wire bytes takes
+        :meth:`on_float32_bits` instead.
+        """
+
+    def on_float32_bits(self, field_id: int, bits: int) -> None:
+        """The **raw wire bits** of a 32-bit float field, as an ``int``.
+
+        Override this and the decoder calls it *instead of* :meth:`on_float32`
+        for every scalar ``fp32``. ``bits`` is the little-endian payload read as
+        an unsigned 32-bit integer, exactly as it lay on the wire, and
+        :meth:`sofab.Encoder.write_float32_bits` puts it back verbatim.
+
+        This is CORELIB_PLAN §6.5's required channel for a **double-only**
+        target, which Python is. IEEE widening ``fp32`` to a double **sets the
+        quiet bit**, so a signaling NaN's payload is destroyed the instant the
+        value passes through the wider float — and no later code can recover it.
+        A port on such a target therefore "**MUST** provide a raw-wire-bytes
+        path for bit-exact consumers (transcode, round-trip, any re-encode) that
+        re-emits those bytes **verbatim**" and "**MUST NOT** re-encode an
+        ``fp32`` from the widened value".
+
+        (This port *also* preserves an sNaN through the widened ``float``, by
+        doing the conversion on the bit pattern by hand rather than letting the
+        hardware quiet it — so :meth:`on_float32` is bit-exact here today. That
+        is a property of this implementation on this platform; the raw channel
+        is the guarantee.)
+
+        The array twin is :meth:`on_float32_array_bits`.
+        """
 
     def on_float64(self, field_id: int, value: float) -> None:
         """Handle a decoded 64-bit float field."""
@@ -178,6 +210,28 @@ class Visitor:
 
     def on_float32_array(self, field_id: int, values: list[float]) -> None:
         """Handle a decoded 32-bit float array field."""
+
+    def on_float32_array_bits(self, field_id: int, count: int, payload: Any) -> None:
+        """The **raw wire bytes** of a 32-bit float array, undecoded.
+
+        Override this and the decoder calls it *instead of*
+        :meth:`on_float32_array`. ``payload`` is a read-only ``memoryview`` of
+        exactly ``4 * count`` little-endian bytes — the array's payload as it
+        lay on the wire — and :meth:`sofab.Encoder.write_float32_array_bits`
+        puts it back verbatim.
+
+        §6.5's requirement is stated over "**every** ``fp32`` position — a
+        **scalar** ``fp32`` (§4.6) **and** each element of an ``fp32`` array
+        (§4.8)", so the scalar channel alone would not meet it.
+
+        **The bytes do not outlive the call.** They are the caller's own input,
+        borrowed for the duration of this callback exactly as a fed chunk is
+        (§6, chunk lifetime), and a handler that still needs them afterwards
+        copies them. That is §6.7's second route — "the codec passes the value
+        through the callback … and the caller copies it. The second route is not
+        a view" — and it is why nothing is allocated to deliver an array of any
+        length.
+        """
 
     def on_float64_array(self, field_id: int, values: list[float]) -> None:
         """Handle a decoded 64-bit float array field."""

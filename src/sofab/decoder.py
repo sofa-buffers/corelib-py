@@ -220,6 +220,8 @@ class Decoder:
         "_vsp",
         "_wants_array_begin",
         "_wants_blob_begin",
+        "_wants_f32_bits",
+        "_wants_f32_array_bits",
         "_wants_field",
         "_wants_seq_begin",
         "_wd",
@@ -385,6 +387,8 @@ class Decoder:
         self._wants_seq_begin = False
         self._wants_array_begin = False
         self._wants_blob_begin = False
+        self._wants_f32_bits = False
+        self._wants_f32_array_bits = False
         if visitor is not None:
             self._bind_visitor(visitor)
         # The active table and the stack of enclosing ones. A sequence opens a
@@ -1609,7 +1613,12 @@ class Decoder:
             elif subtype == _ST_FP32:
                 # _next_wire already refused any other width for these two, so
                 # the payload is exactly 4 or 8 bytes.
-                visitor.on_float32(fid, _core.unpack_f32(data))
+                if self._wants_f32_bits:
+                    # §6.5: a bit-exact consumer takes the wire bits, never the
+                    # widened value.
+                    visitor.on_float32_bits(fid, _core.unpack_u32(data))
+                else:
+                    visitor.on_float32(fid, _core.unpack_f32(data))
             else:
                 visitor.on_float64(fid, _core.unpack_f64(data))
         else:
@@ -1624,7 +1633,10 @@ class Decoder:
             elif t == _WT_ARRAY_SIGNED:
                 self._visit_varints(visitor, fid, t, real[2], True)
             elif real[1] == _ST_FP32:
-                visitor.on_float32_array(fid, self._take_farray_values(pending, 4))
+                if self._wants_f32_array_bits:
+                    self._visit_farray_bits(visitor, fid, pending)
+                else:
+                    visitor.on_float32_array(fid, self._take_farray_values(pending, 4))
             else:
                 visitor.on_float64_array(fid, self._take_farray_values(pending, 8))
 
@@ -1664,6 +1676,13 @@ class Decoder:
         self._wants_seq_begin = cls.on_sequence_begin is not Visitor.on_sequence_begin
         self._wants_array_begin = cls.on_array_begin is not Visitor.on_array_begin
         self._wants_blob_begin = cls.on_blob_begin is not Visitor.on_blob_begin
+        # §6.5's raw fp32 channel, opt-in by override: a handler that overrides
+        # it is a bit-exact consumer and gets the wire bits instead of the
+        # widened value.
+        self._wants_f32_bits = cls.on_float32_bits is not Visitor.on_float32_bits
+        self._wants_f32_array_bits = (
+            cls.on_float32_array_bits is not Visitor.on_float32_array_bits
+        )
 
     def _visit_varints(
         self, visitor: Visitor, fid: int, wtype: int, count: int, zigzag: bool
@@ -1741,6 +1760,36 @@ class Decoder:
             )
         self._read_varints(count, lo, hi, zigzag, view, 0)
         self._pending = None
+
+    def _visit_farray_bits(
+        self, visitor: Visitor, fid: int, pending: tuple[Any, ...]
+    ) -> None:
+        """Hand an ``fp32`` array's payload to the handler as raw wire bytes.
+
+        §6.5's array half. Nothing is decoded and nothing is allocated: the
+        payload is claimed in place and passed through the callback, which is
+        §6.7's second route — the bytes are the caller's own input and their
+        validity ends when the callback returns.
+        """
+        if pending[0] == _LIMIT:
+            # No storage of the decoder's is at stake, but the handler has not
+            # been asked and the wire still chose the length. The cap governs
+            # the same route it always did.
+            raise SofaLimitError(pending[1])
+        count = pending[2]
+        self._keep = self._pos
+        buf, off = self._span_exact(self._farray_nbytes(count, pending[3]))
+        self._pending = None  # committed only once the payload is in hand (§5.2)
+        raw = memoryview(buf)[off : off + count * 4]
+        view = raw.toreadonly()
+        try:
+            visitor.on_float32_array_bits(fid, count, view)
+        finally:
+            # Released, not merely dropped: §6.7 ends the value's validity with
+            # the callback, and releasing the view the handler was handed makes
+            # that true rather than merely documented.
+            view.release()
+            raw.release()
 
     def _take_farray_values(self, pending: tuple[Any, ...], width: int) -> list[float]:
         if pending[0] == _LIMIT:

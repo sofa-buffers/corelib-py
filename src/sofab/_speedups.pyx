@@ -59,7 +59,7 @@ cdef extern from "Python.h":
     object PyMemoryView_FromMemory(char* mem, Py_ssize_t size, int flags)
     int PyBUF_READ
 from cpython.long cimport PyLong_FromUnsignedLongLong, PyLong_FromLongLong
-from cpython.ref cimport PyObject, Py_INCREF
+from cpython.ref cimport PyObject, Py_INCREF, Py_XDECREF
 from libc.stdint cimport (uint8_t, uint16_t, uint32_t, uint64_t,
                           int8_t, int16_t, int32_t, int64_t)
 from libc.stdlib cimport malloc, realloc, free
@@ -642,6 +642,8 @@ cdef object _BASE_ON_FIELD = _Visitor.on_field
 cdef object _BASE_ON_SEQUENCE_BEGIN = _Visitor.on_sequence_begin
 cdef object _BASE_ON_ARRAY_BEGIN = _Visitor.on_array_begin
 cdef object _BASE_ON_BLOB_BEGIN = _Visitor.on_blob_begin
+cdef object _BASE_ON_F32_BITS = _Visitor.on_float32_bits
+cdef object _BASE_ON_F32_ARRAY_BITS = _Visitor.on_float32_array_bits
 cdef object _ARRAY_MAX_OBJ = _ARRAY_MAX
 cdef object _FIXLEN_MAX_OBJ = _FIXLEN_MAX
 cdef object _INT64_MAX_OBJ = INT64_MAX
@@ -1356,6 +1358,31 @@ cdef class Encoder:
         _pack_f32(value, buf)
         self._write_fixlen_raw(field_id, buf, 4, _ST_FP32)
 
+    @cython.always_allow_keywords(True)
+    def write_float32_bits(self, object field_id, object bits):
+        # S6.5: an fp32 written from its raw wire bits, verbatim -- no float is
+        # constructed, so nothing can quiet a signaling NaN on the way out.
+        # Mirrors sofab.encoder.Encoder.write_float32_bits.
+        cdef unsigned char buf[4]
+        cdef uint64_t raw
+        cdef object value
+        if not self._begin():
+            return
+        try:
+            value = bits if type(bits) is int else _index_arg(bits, _WHAT_U)
+            if value < 0 or value > 0xFFFFFFFF:
+                raise SofaArgumentError(
+                    "fp32 bits %s out of range 0..4294967295" % value)
+            raw = <uint64_t>value
+        except SofaError as exc:
+            self._fail(exc)
+            return
+        buf[0] = <unsigned char>(raw & 0xFF)
+        buf[1] = <unsigned char>((raw >> 8) & 0xFF)
+        buf[2] = <unsigned char>((raw >> 16) & 0xFF)
+        buf[3] = <unsigned char>((raw >> 24) & 0xFF)
+        self._write_fixlen_raw(field_id, buf, 4, _ST_FP32)
+
     def write_float64(self, object field_id, double value):
         cdef unsigned char buf[8]
         _pack_f64(value, buf)
@@ -1469,6 +1496,37 @@ cdef class Encoder:
 
     def write_float64_array(self, object field_id, values):
         self._write_float_array(field_id, values, _ST_FP64, 8)
+
+    @cython.always_allow_keywords(True)
+    def write_float32_array_bits(self, object field_id, object payload, count=None):
+        # The array half of write_float32_bits (S6.5): the payload goes out
+        # exactly as it came off the wire. Mirrors the pure engine.
+        cdef Py_buffer view
+        cdef Py_ssize_t n, have
+        if not self._begin():
+            return
+        try:
+            PyObject_GetBuffer(payload, &view, PyBUF_SIMPLE)
+            try:
+                n = view.len
+                if n % 4:
+                    raise SofaArgumentError(
+                        "an fp32 array payload of %d bytes is not a whole "
+                        "number of 4-byte elements" % n)
+                have = n // 4
+                if count is not None and <Py_ssize_t>count != have:
+                    raise SofaArgumentError(
+                        "count=%s does not match the %d elements %d payload "
+                        "bytes carry" % (count, have, n))
+                self._array_header(field_id, _WT_ARRAY_FIXLEN, have)
+                # S4.8: the fixlen_word is always present, empty array included.
+                self._emit_varint((<uint64_t>4 << 3) | <uint64_t>_ST_FP32)
+                if n:
+                    self._put(<const unsigned char*>view.buf, <size_t>n)
+            finally:
+                PyBuffer_Release(&view)
+        except SofaError as exc:
+            self._fail(exc)
 
     cdef int _write_float_array(self, object field_id, values, int subtype,
                                 int elem_size) except -1:
@@ -1893,8 +1951,6 @@ cdef class Decoder:
     cdef object _binding             # the Binding this table was compiled from
     cdef object _visitor
     # Visitors suspended by a descent -- see the pure engine.
-    cdef list _vstack               # _MAX_DEPTH slots, filled at construction
-    cdef int _vsp
     # Whether the visitor overrides the two control hooks. Both default to a
     # no-op on the base class, and calling one that was never overridden costs a
     # Python call per field for nothing. ``_wants_field`` also decides whether a
@@ -1903,6 +1959,8 @@ cdef class Decoder:
     cdef bint _wants_seq_begin
     cdef bint _wants_array_begin
     cdef bint _wants_blob_begin
+    cdef bint _wants_f32_bits
+    cdef bint _wants_f32_array_bits
     cdef object _objects             # list destination for string/blob fields
     cdef _Compiled _tables          # keeps the compiled table alive
     cdef _BEntry* _bent
@@ -1916,8 +1974,19 @@ cdef class Decoder:
     # Active table, and the enclosing ones: a sequence opens a fresh id scope
     # (§4.9), so descending REPLACES the table rather than layering onto it.
     cdef int _tab
-    cdef int* _tstack               # _MAX_DEPTH+1 entries, allocated at construction
+    # Inline, not heap: S6.6 wants this state sized at construction, and a
+    # member array is sized *before* it -- there is no allocator call to time
+    # wrongly, and no free() on the way out. 1 KiB per decoder, which is what
+    # the malloc it replaces cost anyway.
+    cdef int _tstack[_MAX_DEPTH_C + 1]
     cdef int _tsp
+    # The handlers a descent suspended, as borrowed-then-owned pointers rather
+    # than a Python list: `[None] * 255` cost ~565 ns of a ~990 ns decoder
+    # construction, and a decoder is built per message on the one-shot path.
+    # Each slot holds one strong reference, dropped when it is popped, when the
+    # decoder is reset, and in __dealloc__.
+    cdef PyObject* _vstack[_MAX_DEPTH_C]
+    cdef int _vsp
     cdef int _status
     cdef object _err
     cdef int _resume_kind
@@ -1936,13 +2005,8 @@ cdef class Decoder:
         self._wview = NULL
         self._nwords = 0
         self._tab = -1
-        # MAX_DEPTH bounds nesting (checked in _next_wire), so one allocation of
-        # that size covers every message that can be decoded -- and S6.6 has it
-        # made here rather than on the first descent, which is a `feed` path.
-        self._tstack = <int*>malloc(<size_t>(_MAX_DEPTH_C + 1) * sizeof(int))
-        if self._tstack == NULL:
-            raise MemoryError()
         self._tsp = 0
+        self._vsp = 0
         self._status = <int>Status.COMPLETE
         self._err = None
         self._limit = None
@@ -1956,12 +2020,7 @@ cdef class Decoder:
             if type(reassembly) is not bytearray:
                 raise SofaArgumentError("reassembly must be a bytearray")
             self._rbuf = reassembly
-        # Sized at construction, like every other piece of working state
-        # (S6.6); the pure engine does the same. _next_wire refuses a message
-        # nesting past MAX_DEPTH before any slot is written, so the slots are
-        # the ceiling and the index is the depth.
-        self._vstack = [None] * _MAX_DEPTH_C
-        self._vsp = 0
+
         self._binding = binding
         self._visitor = visitor
         self._wants_field = False
@@ -2016,9 +2075,13 @@ cdef class Decoder:
 
     def __dealloc__(self):
         # _bent / _btab belong to the cached _Compiled, not to this decoder.
-        if self._tstack != NULL:
-            free(self._tstack)
-            self._tstack = NULL
+        # _tstack / _vstack are member arrays; only the references the latter
+        # holds have to be dropped.
+        cdef int i
+        for i in range(self._vsp):
+            Py_XDECREF(self._vstack[i])
+            self._vstack[i] = NULL
+        self._vsp = 0
         if self._wview != NULL:
             PyBuffer_Release(self._wview)
             free(self._wview)
@@ -2043,6 +2106,11 @@ cdef class Decoder:
             type(visitor).on_array_begin is not _BASE_ON_ARRAY_BEGIN)
         self._wants_blob_begin = (
             type(visitor).on_blob_begin is not _BASE_ON_BLOB_BEGIN)
+        # S6.5's raw fp32 channel, opt-in by override -- see the pure engine.
+        self._wants_f32_bits = (
+            type(visitor).on_float32_bits is not _BASE_ON_F32_BITS)
+        self._wants_f32_array_bits = (
+            type(visitor).on_float32_array_bits is not _BASE_ON_F32_ARRAY_BITS)
         return 0
 
     cdef inline void _rebind(self, object newbuf):
@@ -2636,6 +2704,18 @@ cdef class Decoder:
             return self._mismatch()
         return _unpack_f32(self._take_fixlen_ptr(4))
 
+    def _float32_bits(self):
+        # The raw little-endian wire bits of the pending fp32, as an int -- no
+        # float on the way, so nothing can quiet a signaling NaN (S6.5).
+        cdef const unsigned char* p
+        cdef uint32_t bits
+        if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_FP32:
+            return self._mismatch()
+        p = self._take_fixlen_ptr(4)
+        bits = (<uint32_t>p[0] | (<uint32_t>p[1] << 8)
+                | (<uint32_t>p[2] << 16) | (<uint32_t>p[3] << 24))
+        return PyLong_FromUnsignedLongLong(<uint64_t>bits)
+
     def _float64(self):
         if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_FP64:
             return self._mismatch()
@@ -2774,6 +2854,39 @@ cdef class Decoder:
             for i in range(count):
                 _SetItemSteal(out, i, _NewF64(_unpack_f64(p + i * 8)))
         return out
+
+    cdef int _visit_farray_bits(self, object visitor, object fid) except -1:
+        # Hand an fp32 array's payload over as raw wire bytes (S6.5's array
+        # half). Nothing is decoded and nothing sized by the wire is allocated:
+        # the payload is passed through the callback, which is S6.7's second
+        # route -- the bytes are the caller's own input and stop being valid
+        # when the callback returns. The view is *released* on the way out, so
+        # that is enforced rather than merely documented.
+        cdef Py_ssize_t count = <Py_ssize_t>self._pend_count
+        cdef Py_ssize_t nbytes = self._farray_nbytes(self._pend_count,
+                                                     self._pend_size)
+        cdef object view
+        cdef bytes data
+        if self._n - self._pos >= nbytes:
+            # Already buffered, which is the ordinary case: the view is made
+            # straight over the fed bytes, so an array of any length costs one
+            # handle and no copy.
+            view = PyMemoryView_FromMemory(<char*>(self._p + self._pos),
+                                           nbytes, PyBUF_READ)
+            self._pos += nbytes
+            self._pk = _PEND_NONE
+        else:
+            # Mid-payload on a chunk-fed reader: the pieces have to be joined
+            # before the handler can see them whole, which is what
+            # _take_farray_payload does (and it suspends if they have not all
+            # arrived).
+            data = self._take_farray_payload()
+            view = memoryview(data).toreadonly()
+        try:
+            visitor.on_float32_array_bits(fid, count, view)
+        finally:
+            view.release()
+        return 0
 
     def _read_float32_array(self):
         return self._read_farray(_ST_FP32, 4)
@@ -2999,10 +3112,14 @@ cdef class Decoder:
         self._limit = None
         if self._vsp:
             # A descent left mid-message: the handler the caller gave us is the
-            # one at the bottom of the stack. The slots are kept -- they are
-            # construction-time state (S6.6), so reset rewinds the index.
-            self._bind_visitor(self._vstack[0])
-            self._vsp = 0
+            # one at the bottom of the stack. The slots are the decoder's own
+            # storage (S6.6), so reset drops their references and rewinds the
+            # index rather than releasing anything.
+            self._bind_visitor(<object>self._vstack[0])
+            while self._vsp > 0:
+                self._vsp -= 1
+                Py_XDECREF(self._vstack[self._vsp])
+                self._vstack[self._vsp] = NULL
         self._resume_kind = _R_NONE
         self._resume_entry = -1
         self._tsp = 0
@@ -3068,7 +3185,9 @@ cdef class Decoder:
                     visitor.on_sequence_end()
                     if self._vsp:
                         self._vsp -= 1
-                        visitor = self._vstack[self._vsp]
+                        visitor = <object>self._vstack[self._vsp]
+                        Py_XDECREF(self._vstack[self._vsp])
+                        self._vstack[self._vsp] = NULL
                         self._bind_visitor(visitor)
                         want_field = self._wants_field
                 continue
@@ -3101,7 +3220,8 @@ cdef class Decoder:
                         self._push_table(-1)
                         if isinstance(answer, _Visitor):
                             # The handler named someone else for this sub-tree.
-                            self._vstack[self._vsp] = visitor
+                            Py_INCREF(visitor)
+                            self._vstack[self._vsp] = <PyObject*>visitor
                             self._vsp += 1
                             visitor = answer
                             self._bind_visitor(answer)
@@ -3447,7 +3567,12 @@ cdef class Decoder:
             visitor.on_signed(fid, self._signed())
         elif t == _WT_FIXLEN:
             if st == _ST_FP32:
-                visitor.on_float32(fid, self._float32())
+                if self._wants_f32_bits:
+                    # S6.5: a bit-exact consumer takes the wire bits, never the
+                    # widened value.
+                    visitor.on_float32_bits(fid, self._float32_bits())
+                else:
+                    visitor.on_float32(fid, self._float32())
             elif st == _ST_FP64:
                 visitor.on_float64(fid, self._float64())
             elif st == _ST_STRING:
@@ -3478,7 +3603,10 @@ cdef class Decoder:
         elif t == _WT_ARRAY_SIGNED:
             self._visit_varints(visitor, fid, t, True)
         elif st == _ST_FP32:
-            visitor.on_float32_array(fid, self._read_float32_array())
+            if self._wants_f32_array_bits:
+                self._visit_farray_bits(visitor, fid)
+            else:
+                visitor.on_float32_array(fid, self._read_float32_array())
         else:
             visitor.on_float64_array(fid, self._read_float64_array())
         return 0
