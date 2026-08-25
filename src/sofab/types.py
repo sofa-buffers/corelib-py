@@ -43,6 +43,25 @@ MAX_DEPTH = 255
 #: ``MAX_SIZE`` gets an exact fit.
 MIN_OUTPUT_BUFFER = 1
 
+#: Bytes of reassembly space a :class:`sofab.Decoder` takes when the caller
+#: names no size (see ``Decoder(reassembly=…)``).
+#:
+#: A construct split across fed chunks has to be joined somewhere, and
+#: CORELIB_PLAN §6.6.2 puts that somewhere in the caller's hands: "A codec
+#: **MUST NOT** grow a private accumulator instead." So the decoder holds one
+#: buffer, sized **once at construction** and never grown — a sender cannot make
+#: it bigger by sending different bytes, which is the property §6.6 protects —
+#: and a construct that does not fit it is refused with
+#: :class:`SofaArgumentError` rather than accommodated.
+#:
+#: This number is the corelib's, not the specification's: §6.6.2 names no
+#: default because the storage is meant to be the caller's outright. It is a
+#: size that lets ordinary messages stream without configuration; a receiver
+#: that takes larger `string`/`blob`/array payloads **across chunk boundaries**
+#: passes its own buffer, or a byte count for the decoder to size one from.
+#: (Whole messages fed in one call never touch it, whatever their size.)
+DEFAULT_REASSEMBLY = 4096
+
 #: 64-bit mask used by varint/zigzag wrap-around to match the C ``uint64_t``.
 MASK64 = (1 << 64) - 1
 

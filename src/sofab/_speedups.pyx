@@ -500,6 +500,7 @@ cdef extern from "Python.h":
 # enum objects the pure path does.
 from .types import (
     ARRAY_MAX,
+    DEFAULT_REASSEMBLY,
     FIXLEN_MAX,
     ID_MAX,
     MAX_DEPTH,
@@ -600,6 +601,9 @@ cdef int _MAX_DEPTH = _MAX_DEPTH_C
 # _put splits every atomic unit at any byte boundary; it binds only a buffer
 # installed together with a flush sink. Mirrors types.MIN_OUTPUT_BUFFER.
 cdef Py_ssize_t _MIN_OUTPUT_BUFFER = MIN_OUTPUT_BUFFER
+# Reassembly space a decoder takes when the caller names no size. Mirrors
+# sofab.types.DEFAULT_REASSEMBLY; both engines bound memory the same way.
+cdef Py_ssize_t _DEFAULT_REASSEMBLY = DEFAULT_REASSEMBLY
 # Size of the scratch buffer the convenience constructors install (S5.1
 # "unbounded schema" shape). One allocation per encoder, made at construction and
 # never resized -- the encoder drains it through its sink whenever it fills, so
@@ -2013,13 +2017,22 @@ cdef class Decoder:
         self._resume_kind = _R_NONE
         self._resume_entry = -1
         self._running = False
-        self._rbuf = None
         self._rstart = 0
         self._rend = 0
-        if reassembly is not None:
-            if type(reassembly) is not bytearray:
-                raise SofaArgumentError("reassembly must be a bytearray")
+        # One reassembly shape, never grown (S6.6.2) -- see the pure engine.
+        if reassembly is None:
+            self._rbuf = bytearray(_DEFAULT_REASSEMBLY)
+        elif type(reassembly) is bytearray:
             self._rbuf = reassembly
+        elif type(reassembly) is int:
+            if reassembly < 16:
+                raise SofaArgumentError(
+                    "reassembly=%d is too small; 16 bytes is the least that "
+                    "can hold a construct spanning a chunk" % reassembly)
+            self._rbuf = bytearray(<Py_ssize_t>reassembly)
+        else:
+            raise SofaArgumentError(
+                "reassembly must be a bytearray, a byte count, or omitted")
 
         self._binding = binding
         self._visitor = visitor
@@ -2992,21 +3005,8 @@ cdef class Decoder:
         # extends, at amortised O(len(chunk)). Rebuilding ``carry + chunk``
         # instead would copy the whole carry per chunk — a 1 MB blob fed in
         # 4 KiB pieces costs ~122 MB of copying that way.
-        if self._rbuf is not None:
-            # Sets _pos itself -- see the pure engine.
-            self._reassemble(data)
-        else:
-            buf = self._buf
-            if self._pos >= self._n:
-                self._rebind(data if type(data) is bytes else bytes(data))
-            else:
-                if type(buf) is not bytearray:
-                    buf = bytearray(buf)
-                if self._pos:
-                    del buf[:self._pos]
-                buf += data
-                self._rebind(buf)      # += may have moved the storage
-            self._pos = 0
+        # Sets _pos itself -- see the pure engine.
+        self._reassemble(data)
         self._keep = self._pos
         self._running = True
         try:
@@ -3029,8 +3029,7 @@ cdef class Decoder:
             return Status.INVALID
         finally:
             self._running = False
-            if self._rbuf is not None:
-                self._retain()
+            self._retain()
         self._status = <int>Status.COMPLETE
         return Status.COMPLETE
 
@@ -3069,7 +3068,16 @@ cdef class Decoder:
         # Keep what this feed did not consume and let the chunk go, so §6's
         # chunk-lifetime promise holds. Mirrors Decoder._retain.
         cdef object r = self._rbuf
-        cdef Py_ssize_t carry = self._n - self._pos
+        cdef Py_ssize_t carry
+        if self._status == <int>Status.INVALID or self._limit is not None:
+            # Terminal (S5.2.3, S6.3): nothing resumes, so nothing is kept --
+            # see the pure engine.
+            self._rstart = 0
+            self._rend = 0
+            self._rebind(b"")
+            self._pos = 0
+            return 0
+        carry = self._n - self._pos
         if not carry:
             self._rstart = 0
             self._rend = 0

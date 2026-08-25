@@ -53,6 +53,7 @@ from .binding import (
 )
 from .types import (
     ARRAY_MAX,
+    DEFAULT_REASSEMBLY,
     FIXLEN_MAX,
     ID_MAX,
     MASK64,
@@ -288,6 +289,23 @@ class Decoder:
         They never apply to a field a binding declares a bound for: that
         declaration *is* the schema bound, and exceeding it is INVALID rather
         than a policy rejection (§6.2.1).
+
+        ``reassembly`` is where a construct split across fed chunks is joined.
+        Pass a ``bytearray`` to supply the storage, an ``int`` to have the
+        decoder take that many bytes **at construction**, or leave it out for
+        :data:`sofab.DEFAULT_REASSEMBLY` bytes. There is no other shape: §6.6.2
+        says a codec "**MUST NOT** grow a private accumulator instead", so the
+        buffer is sized once and never extended, and a construct that does not
+        fit it is :class:`SofaArgumentError` — the §6.3 tier for a well-formed
+        message that does not fit the storage this caller offered. What that
+        buys is §6.6's whole point: a caller bounds a decode's memory **by
+        construction**, and no sender can change the answer by sending different
+        bytes.
+
+        A message fed in **one** call never touches the buffer, whatever its
+        size — nothing spans a chunk boundary when there is only one chunk. It
+        is a chunked reader that has to size it for the largest ``string``,
+        ``blob`` or array payload it will take across a boundary.
         """
         if binding is None and visitor is None:
             raise SofaArgumentError("a decoder needs a field handler (binding / visitor)")
@@ -317,10 +335,8 @@ class Decoder:
             or max_dyn_string_len < FIXLEN_MAX
             or max_dyn_blob_len < FIXLEN_MAX
         )
-        # The caller's reassembly buffer, and the span of it currently holding a
-        # construct that spans a chunk boundary. Optional: without one the
-        # decoder joins the pieces in a bytearray of its own, which is
-        # convenient and is NOT what §6.6 asks for -- see the parameter's note.
+        # The reassembly buffer, and the span of it currently holding a
+        # construct that spans a chunk boundary.
         # A receiver-limit rejection, latched. §6.3 calls LimitExceeded "a
         # terminal, receiver-local policy rejection", so once one is reached the
         # decode is over: every later feed re-raises it and consumes nothing.
@@ -328,17 +344,28 @@ class Decoder:
         # looser limit -- so it rides the error channel rather than the status,
         # which §6.3 names as one of the two permitted ways to surface it.
         self._limit: SofaLimitError | None = None
-        self._rbuf: Any = None
         self._rstart = 0
         self._rend = 0
-        if reassembly is not None:
-            # A bytearray, not any writable buffer: both engines index it
-            # directly, and the accelerator reaches its bytes through
-            # PyByteArray_AS_STRING. Widening this would mean two buffer
-            # protocols where §5.3 wants one behaviour.
-            if not isinstance(reassembly, bytearray):
-                raise SofaArgumentError("reassembly must be a bytearray")
+        # There is exactly one reassembly shape, and it never grows (§6.6.2).
+        # A bytearray, not any writable buffer: both engines index it directly,
+        # and the accelerator reaches its bytes through PyByteArray_AS_STRING.
+        # Widening this would mean two buffer protocols where §5.3 wants one
+        # behaviour.
+        if reassembly is None:
+            self._rbuf: Any = bytearray(DEFAULT_REASSEMBLY)
+        elif isinstance(reassembly, bytearray):
             self._rbuf = reassembly
+        elif isinstance(reassembly, int) and not isinstance(reassembly, bool):
+            if reassembly < 16:
+                raise SofaArgumentError(
+                    f"reassembly={reassembly} is too small; 16 bytes is the "
+                    "least that can hold a construct spanning a chunk"
+                )
+            self._rbuf = bytearray(reassembly)
+        else:
+            raise SofaArgumentError(
+                "reassembly must be a bytearray, a byte count, or omitted"
+            )
         self._buf: bytes | bytearray = b""
         # len(self._buf), kept in step with it. The buffer only ever changes in
         # feed() and reset(), while the walk asks for its length constantly —
@@ -1113,24 +1140,9 @@ class Decoder:
         # Rebuilding ``carry + chunk`` instead would copy the whole carry per
         # chunk — a 1 MB blob fed in 4 KiB pieces costs ~122 MB of copying that
         # way.
-        if self._rbuf is not None:
-            # Sets _pos itself: with a carry the walk resumes where the held
-            # bytes start, which is not the front of the buffer.
-            self._reassemble(data)
-        else:
-            buf = self._buf
-            if self._pos >= self._n:
-                buf = data if isinstance(data, bytes) else bytes(data)
-                self._buf = buf
-            else:
-                if not isinstance(buf, bytearray):
-                    buf = bytearray(buf)
-                    self._buf = buf
-                if self._pos:
-                    del buf[: self._pos]
-                buf += data
-            self._n = len(buf)
-            self._pos = 0
+        # Sets _pos itself: with a carry the walk resumes where the held bytes
+        # start, which is not the front of the buffer.
+        self._reassemble(data)
         self._keep = self._pos
         self._running = True
         try:
@@ -1152,8 +1164,7 @@ class Decoder:
             return Status.INVALID
         finally:
             self._running = False
-            if self._rbuf is not None:
-                self._retain()
+            self._retain()
         self._status = Status.COMPLETE
         return Status.COMPLETE
 
@@ -1176,7 +1187,6 @@ class Decoder:
             self._pos = 0
             return
         r = self._rbuf
-        assert r is not None
         n = len(data)
         if self._rend + n > len(r):
             # Slide what is held back to the front and try again; only then is
@@ -1203,8 +1213,17 @@ class Decoder:
         is what makes §6's chunk-lifetime promise true: once ``feed`` returns,
         the decoder holds nothing of what was handed to it.
         """
+        if self._status is Status.INVALID or self._limit is not None:
+            # Terminal (§5.2.3, §6.3): nothing will resume, so there is nothing
+            # to keep. Dropping also keeps the real verdict on the error channel
+            # — a reassembly buffer complaining about the tail of a message the
+            # decoder has already refused would bury it.
+            self._rstart = self._rend = 0
+            self._buf = b""
+            self._n = 0
+            self._pos = 0
+            return
         r = self._rbuf
-        assert r is not None
         carry = self._n - self._pos
         if not carry:
             self._rstart = self._rend = 0

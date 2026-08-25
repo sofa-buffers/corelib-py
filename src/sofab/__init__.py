@@ -29,6 +29,7 @@ from .collectors import (
 from .types import (
     API_VERSION,
     ARRAY_MAX,
+    DEFAULT_REASSEMBLY,
     FIXLEN_MAX,
     ID_MAX,
     MAX_DEPTH,
@@ -125,6 +126,7 @@ __all__ = [
     "ARRAY_MAX",
     "FIXLEN_MAX",
     "MAX_DEPTH",
+    "DEFAULT_REASSEMBLY",
     "MIN_OUTPUT_BUFFER",
     "UNSIGNED_MAX",
     "SIGNED_MIN",
