@@ -45,8 +45,19 @@ import sys
 from typing import Any
 
 from . import _core
-from .binding import Binding
-from .binding import handler as _binding_handler
+from .binding import (
+    K_ARRAY_FLOAT32,
+    K_ARRAY_SIGNED,
+    K_ARRAY_UNSIGNED,
+    K_BYTES,
+    K_FLOAT32,
+    K_FLOAT64,
+    K_SIGNED,
+    K_STRING,
+    K_UNSIGNED,
+    Binding,
+    Entry,
+)
 from .types import (
     ARRAY_MAX,
     DEFAULT_REASSEMBLY,
@@ -202,6 +213,18 @@ class Decoder:
         "_visitor",
         "_vstack",
         "_vsp",
+        # --- the destination map (§6.6.3) ------------------------------------
+        # Where a mapped field's value goes, and what the schema declares for
+        # it. Both are the *caller's* answers, settled once at construction;
+        # neither is a decode rule, and no rule below branches on them.
+        "_bmap",
+        "_bstack",
+        "_bsp",
+        "_objects",
+        "_wu",
+        "_wq",
+        "_wd",
+        "_resume_entry",
         "_make_field",
         "_wants_array_begin",
         "_wants_bound",
@@ -375,15 +398,35 @@ class Decoder:
         # picks up the same dispatch without a Field to read it off.
         self._cur_wtype_resume = -1
 
-        # §5.3.1: one decode surface. A ``binding`` is not a second one — it is
-        # compiled to a Visitor here (sofab.binding.handler) and decoded through
-        # the same path as any other, so every rule below has one implementation
-        # and the two cannot drift apart. Where a ``visitor`` is given too, it is
-        # the fallback the table hands every field it does not name.
-        if binding is not None:
-            visitor = _binding_handler(binding, words, objects, visitor)
-        assert visitor is not None  # the constructor refused a decoder with neither
-        self._visitor: Visitor = visitor
+        # §5.3.1: one decode surface, and the table is reached *through* it.
+        # A handler declares its destinations once, from
+        # :meth:`sofab.Visitor.destinations`; ``binding=`` is the constructor
+        # shorthand for a handler that declares exactly that and nothing else.
+        # Either way there is one handler object, one walk and one set of rules
+        # — the map only says *where* a value goes, never how it is decoded.
+        table: Binding | None = binding
+        if (
+            table is None
+            and visitor is not None
+            and type(visitor).destinations is not Visitor.destinations
+        ):
+            # Asked once, and only of a handler that overrides it — a decoder is
+            # built per message on the one-shot path, and a call that always
+            # answers None is a call for nothing.
+            declared = visitor.destinations()
+            if declared is not None:
+                table, words, objects = declared
+        self._visitor: Visitor | None = visitor
+        self._bmap: dict[int, Entry] | None = None
+        self._bstack: list[Any] = [None] * MAX_DEPTH
+        self._bsp = 0
+        self._objects = objects
+        self._wu: Any = None
+        self._wq: Any = None
+        self._wd: Any = None
+        self._resume_entry: Entry | None = None
+        if table is not None:
+            self._bind_words(table, words, objects)
         # Whether the visitor overrides the two control hooks. Both default to a
         # no-op on the base class, and calling one that was never overridden
         # costs a Python call per field for nothing. ``_wants_field`` also
@@ -411,7 +454,8 @@ class Decoder:
         self._wants_farray_begin = False
         self._wants_f32_bits = False
         self._wants_f32_array_bits = False
-        self._bind_visitor(visitor)
+        if visitor is not None:
+            self._bind_visitor(visitor)
         self._status = Status.COMPLETE
         self._error: SofaError | None = None
         self._resume_kind = _R_NONE
@@ -1232,6 +1276,47 @@ class Decoder:
             self._vsp = 0
             self._bind_visitor(self._visitor)
         self._resume_kind = _R_NONE
+        self._resume_entry = None
+        if self._wu is not None:
+            # A descent left mid-message: the map the caller declared is the one
+            # at the bottom. The slots stay — they are construction-time state
+            # (§6.6) — so reset rewinds the index rather than dropping the list.
+            self._bmap = self._bstack[0] if self._bsp else self._bmap
+            while self._bsp:
+                self._bsp -= 1
+                self._bmap = self._bstack[self._bsp]
+                self._bstack[self._bsp] = None
+
+    def _bind_words(self, table: Binding, words: Any, objects: Any) -> None:
+        """Check the caller's storage against the map and take three views over
+        it — done once, at construction, because §6.6 makes construction the one
+        place a decode's storage is settled."""
+        if words is None:
+            raise SofaArgumentError("a binding needs a words buffer")
+        raw = memoryview(words)
+        if raw.readonly:
+            raise SofaArgumentError("the words buffer must be writable")
+        raw = raw.cast("B")
+        if raw.nbytes % 8:
+            raise SofaArgumentError("the words buffer must be a multiple of 8 bytes")
+        if raw.nbytes < table.tree_words_required * 8:
+            raise SofaArgumentError(
+                f"words buffer holds {raw.nbytes // 8} slots, "
+                f"the binding needs {table.tree_words_required}"
+            )
+        if objects is None:
+            if table.tree_objects_required:
+                raise SofaArgumentError("a binding with string/blob fields needs objects")
+        elif len(objects) < table.tree_objects_required:
+            raise SofaArgumentError(
+                f"objects holds {len(objects)} entries, "
+                f"the binding needs {table.tree_objects_required}"
+            )
+        table.freeze()
+        self._wu = raw.cast("Q")
+        self._wq = raw.cast("q")
+        self._wd = raw.cast("d")
+        self._bmap = table._by_id
 
     def _value_ready(self) -> bool:
         """Are all of the pending value's bytes buffered?
@@ -1270,7 +1355,11 @@ class Decoder:
             self._resume_kind = _R_NONE
             try:
                 if rk == _R_VISIT:
-                    self._visit_value(visitor, self._cur_wtype_resume)
+                    if self._resume_entry is not None:
+                        self._mapped_field(self._resume_entry)
+                    else:
+                        assert visitor is not None
+                        self._visit_value(visitor, self._cur_wtype_resume)
                 else:
                     self._skip_sequence()
             except SofaIncompleteError:
@@ -1293,9 +1382,14 @@ class Decoder:
                 return False
 
             if t == _WT_SEQUENCE_END:
+                if self._bsp:
+                    self._bsp -= 1
+                    self._bmap = self._bstack[self._bsp]
+                    self._bstack[self._bsp] = None
                 # The end belongs to whoever was handling the scope, so a child
                 # hears its own scope close before it is popped.
-                visitor.on_sequence_end()
+                if visitor is not None:
+                    visitor.on_sequence_end()
                 if self._vsp:
                     self._vsp -= 1
                     visitor = self._visitor = self._vstack[self._vsp]
@@ -1304,13 +1398,56 @@ class Decoder:
                     make_field = self._make_field
                 continue
 
+            # --- the destination map, consulted once per field ---------------
+            # Two questions, both of them the caller's: where does this value go,
+            # and what does the schema declare for it. No rule below branches on
+            # the answer — the walk, the cap, the bound, the §7.3 test, the UTF-8
+            # check, the element width and the resume transaction are the same
+            # code for a mapped field and an unmapped one, which is what makes
+            # this one surface rather than two (§5.3.1).
+            bmap = self._bmap
+            entry = bmap.get(self._cur_id) if bmap is not None else None
+            if entry is not None and (
+                t != entry.wt
+                or (entry.st is not None and self._cur_subtype != entry.st)
+            ):
+                # §7.3: the wire tag contradicts what the schema declared for
+                # this id. Treated exactly like an unknown id — skipped, slot
+                # untouched, decode stays COMPLETE.
+                entry = None
+                if t != _WT_SEQUENCE_START:
+                    continue
+
             if t == _WT_SEQUENCE_START:
+                if entry is not None:
+                    child = entry.child
+                    assert child is not None
+                    self._bstack[self._bsp] = bmap
+                    self._bsp += 1
+                    self._bmap = child._by_id
+                    c = entry.count_at
+                    if c >= 0:
+                        self._wu[c] = self._wu[c] + 1
+                    continue
+                if visitor is None:
+                    try:
+                        self._skip_sequence()
+                    except SofaIncompleteError:
+                        self._resume_kind = _R_SKIP
+                        raise
+                    continue
                 answer = (
                     visitor.on_sequence_begin(self._cur_id)
                     if self._wants_seq_begin
                     else None
                 )
                 if answer is not False:
+                    if bmap is not None:
+                        # §4.9 opens a fresh id scope, so the enclosing map must
+                        # not match inside it.
+                        self._bstack[self._bsp] = bmap
+                        self._bsp += 1
+                        self._bmap = None
                     if isinstance(answer, Visitor):
                         # The handler named someone else for this sub-tree.
                         self._vstack[self._vsp] = visitor
@@ -1326,7 +1463,20 @@ class Decoder:
                     raise
                 continue
 
+            if entry is not None:
+                # One call, so the walk keeps the shape it has for every other
+                # field: a mapped field's bound and store live in _mapped_field.
+                try:
+                    self._mapped_field(entry)
+                except SofaIncompleteError:
+                    self._resume_kind = _R_VISIT
+                    self._resume_entry = entry
+                    raise
+                continue
             if make_field:
+                # ``_make_field`` is a handler's flag, so it is only ever set
+                # where there is one.
+                assert visitor is not None
                 f = self._cur
                 assert f is not None
                 if self._wants_field and visitor.on_field(f) is False:
@@ -1338,10 +1488,15 @@ class Decoder:
                     continue
                 if self._wants_bound:
                     self._schema_bound(visitor, f)
+            if visitor is None:
+                # Nobody wants it: the value stays pending and the next header
+                # walk discards it.
+                continue
             try:
                 self._visit_value(visitor, t)
             except SofaIncompleteError:
                 self._resume_kind = _R_VISIT
+                self._resume_entry = None
                 raise
 
     def _schema_bound(self, visitor: Visitor, f: Field) -> None:
@@ -1362,20 +1517,43 @@ class Decoder:
         """
         pending = self._pending
         assert pending is not None  # every value field parks one at its header
-        capped = pending[0] == _LIMIT
-        real = pending[2] if capped else pending
+        real = pending[2] if pending[0] == _LIMIT else pending
         kind = real[0]
-        if kind == _FIXLEN:
-            if real[1] < _ST_STRING:
-                return  # an fp32/fp64 payload: a fixed width, nothing to bound
-            what = "fixlen length"
-        elif kind == _SCALAR:
+        if kind == _SCALAR:
             return
-        else:
-            what = "array count"
-        declared = visitor.on_schema_bound(f)
+        if kind == _FIXLEN and real[1] < _ST_STRING:
+            return  # an fp32/fp64 payload: a fixed width, nothing to bound
+        self._settle_bound(visitor.on_schema_bound(f))
+
+    def _settle_bound(self, declared: int) -> None:
+        """**The** site the schema bound is applied at — the one place in this
+        file that knows what a declared count/length means.
+
+        Both sources reach it: a destination map's entry, and a handler's
+        :meth:`sofab.Visitor.on_schema_bound`. That is what keeps the two from
+        disagreeing about a field, which is exactly the defect §5.3.1's rationale
+        names and the one `A2-0147` measured.
+
+        A declared bound does two things, both here, at the count/length header,
+        before a payload byte is read or any storage is written:
+
+        * a wire count/length above it is INVALID (MESSAGE_SPEC §7.1) — the
+          message contradicts the schema, which is a statement about validity;
+        * the receiver-side cap stops applying, because §6.2.1 forbids applying
+          one "to a field the schema already bounds".
+        """
         if declared < 0:
             return
+        pending = self._pending
+        assert pending is not None
+        capped = pending[0] == _LIMIT
+        real = pending[2] if capped else pending
+        # Only a count- or length-bearing field can reach here with a bound: the
+        # hook half returns early for a scalar and for an fp32/fp64 payload, and
+        # a table entry declares one only for an array, a string or a blob (see
+        # ``Entry.declared``) — with the §7.3 tag test ahead of it, so the kind
+        # on the wire is the kind the entry declared.
+        what = "fixlen length" if real[0] == _FIXLEN else "array count"
         n = real[2]
         if n > declared:
             raise SofaDecodeError(
@@ -1384,6 +1562,90 @@ class Decoder:
         if capped:
             # Spent: the schema bounds this field, so the cap never governed it.
             self._pending = real
+
+    def _mapped_field(self, e: Entry) -> None:
+        """A field the handler's declared destination map names.
+
+        **Nothing is decided here that is not decided for every other field.**
+        The schema bound comes off the map instead of off a hook, but it is the
+        same number reaching the same rule (:meth:`_settle_bound`) — which is
+        why a mapped field and a hooked one cannot disagree about it, the
+        divergence ``A2-0147`` measured. The receiver cap, the §7.3 tag test,
+        the element width and the resume transaction were settled before this is
+        reached, by the code an unmapped field runs too. What is left is the
+        assignment a typed hook would otherwise have made:
+        ``words[at] = value`` instead of ``visitor.on_unsigned(id, value)``.
+
+        Consumes nothing on the suspension path, like every other read, so the
+        retry redoes the whole value — including refilling a partly written
+        array from element zero (§5.2).
+        """
+        self._settle_bound(e.declared)
+        k = e.kind
+        at = e.at
+        got = 1
+        if k == K_UNSIGNED:
+            self._wu[at] = self._take_scalar_matched()
+        elif k == K_SIGNED:
+            raw = self._take_scalar_matched()
+            self._wq[at] = (raw >> 1) ^ -(raw & 1)
+        elif k == K_FLOAT64:
+            self._wd[at] = _core.unpack_f64(self._take_fixlen_matched(8))
+        elif k == K_FLOAT32:
+            self._wd[at] = _core.unpack_f32(self._take_fixlen_matched(4))
+        elif k == K_STRING or k == K_BYTES:
+            pending = self._pending
+            assert pending is not None
+            if pending[0] == _LIMIT:
+                # The schema left this field unbounded, so the cap still governs
+                # it and has already rejected it (§6.2.1). The hook path reaches
+                # the same verdict on its way past the parked tuple; the store
+                # goes straight to the payload, so it is raised here.
+                raise SofaLimitError(pending[1])
+            data = self._take_fixlen_matched(pending[2])
+            if k == K_BYTES:
+                self._objects[at] = data  # type: ignore[index]
+            else:
+                try:
+                    self._objects[at] = data.decode("utf-8")  # type: ignore[index]
+                except UnicodeDecodeError as exc:
+                    raise SofaDecodeError("invalid UTF-8 in string field") from exc
+        else:
+            pending = self._pending
+            assert pending is not None
+            got = pending[2]
+            self._keep = self._pos
+            bounded = e.elem_bounded
+            if k == K_ARRAY_UNSIGNED:
+                # Straight into the caller's slots: no list, and no second pass
+                # over one.
+                self._read_varints(
+                    got, None, e.elem_hi if bounded else None, False, self._wu, at
+                )
+            elif k == K_ARRAY_SIGNED:
+                self._read_varints(
+                    got,
+                    e.elem_lo if bounded else None,
+                    e.elem_hi if bounded else None,
+                    True,
+                    self._wq,
+                    at,
+                )
+            else:
+                width = 4 if k == K_ARRAY_FLOAT32 else 8
+                buf, off = self._span_exact(self._farray_nbytes(got, pending[3]))
+                _core.unpack_farray_into(self._wd, at, buf, got, width, off)
+            self._pending = None  # committed only once the payload is in hand
+        c = e.count_at
+        if c >= 0:
+            self._wu[c] = got
+
+    def _take_fixlen_matched(self, length: int) -> bytes:
+        """:meth:`_take_scalar_matched` for a fixlen payload."""
+        self._keep = self._pos
+        data = self._read_exact(length)
+        self._pending = None  # committed only once the payload is in hand (§5.2)
+        return data
 
     def _take_scalar_matched(self) -> int:
         """Consume the pending scalar. The caller has already matched the whole

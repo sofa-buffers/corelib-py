@@ -24,9 +24,18 @@ A third hook carries the one fact the codec cannot know and the schema does:
 on a field, which is what takes the receiver-side ``max_dyn_*`` cap off it
 (§6.2.1) and makes exceeding it ``INVALID`` rather than a policy rejection.
 
-Because this is the *only* decode surface (§5.3.1), it is also what a
-:class:`sofab.Binding` is: the table is compiled into a visitor over it, so
-nothing can be right on one route and wrong on another.
+A fourth hook is asked **once**, when the decoder is built, and never again:
+:meth:`Visitor.destinations` names the slots the handler wants its fields
+written into, as a :class:`sofab.Binding` plus the storage it addresses. It is
+the same bargain :meth:`Visitor.on_array_begin`, :meth:`~Visitor.on_string_begin`
+and :meth:`~Visitor.on_blob_begin` already strike — name a destination and the
+codec writes there instead of calling you back — declared once for the whole
+message instead of per field.
+
+Because this is the *only* decode surface (§5.3.1), a table is reached *through*
+it and never beside it: there is one handler object, one walk, and one
+implementation of every rule, so nothing can be right on one route and wrong on
+another.
 
 Which hooks a handler overrides is read off its **type**, once, when the
 decoder binds it — so a hook nobody overrides costs nothing per field, and a
@@ -36,9 +45,12 @@ own type rather than its parent's.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .types import Field, FixlenSubtype, WireType
+
+if TYPE_CHECKING:
+    from .binding import Binding
 
 
 class Visitor:
@@ -47,6 +59,39 @@ class Visitor:
     Every hook is keyed by the wire type the decoder recovered. ``field_id`` is
     the decoded field id. Unhandled hooks default to a no-op, which still
     consumes the value (so unknown fields are skipped safely)."""
+
+    # --- declared once, at construction -------------------------------------
+
+    def destinations(self) -> tuple[Binding, Any, list[Any] | None] | None:
+        """The slots this handler wants its fields written into, or ``None``.
+
+        Asked **once**, when the :class:`sofab.Decoder` is built, and never
+        again — so nothing the wire says can change the answer, which is what
+        §6.6 asks of a decode's storage. Return
+        ``(binding, words, objects)``: a :class:`sofab.Binding` mapping field
+        ids to slots, a writable 8-byte-aligned buffer for the scalar and array
+        slots, and a list for ``string``/``blob`` slots (or ``None`` when the
+        table names none).
+
+        A field the table names is written straight into its slot and **no**
+        typed hook fires for it — the same bargain :meth:`on_array_begin`,
+        :meth:`on_string_begin` and :meth:`on_blob_begin` strike per field, made
+        once for the whole message. A field the table does not name reaches this
+        visitor's hooks exactly as it would have without a table, and the
+        ``count``/``maxlen`` a table entry declares is answered from the table
+        rather than from :meth:`on_schema_bound`.
+
+        This is **not** a second decode surface (§5.3.1). The decoder still
+        drives, the walk is the same walk, and every rule — the receiver cap,
+        the schema bound, the §7.3 tag test, the UTF-8 check, the declared
+        element width, the resume transaction — has one implementation that runs
+        for a mapped field and an unmapped one alike. The table says *where* a
+        value goes; it never says *how* it is decoded.
+
+        ``Decoder(binding=…, words=…, objects=…)`` is the constructor shorthand
+        for a handler that declares exactly this and nothing else.
+        """
+        return None
 
     # --- control hooks (return False to skip before decoding) ---------------
 
