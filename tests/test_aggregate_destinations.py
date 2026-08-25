@@ -336,3 +336,77 @@ def test_a_float_array_through_its_destination_does_not_scale(
         f"a {64 << 10}-element array cost {large - small} bytes more than a "
         "64-element one; the wire is still sizing an allocation"
     )
+
+
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_a_non_byte_string_destination_is_refused(dec_cls):
+    """The payload is bytes, so the destination has to be a byte buffer — a
+    wider item type would put a byte per slot and lose the rest."""
+    sink = StringSink(array.array("i", [0] * 64))
+    with pytest.raises(SofaArgumentError):
+        dec_cls(visitor=sink).feed(_string_wire(Encoder))
+
+
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_a_capped_fp32_array_still_reaches_the_raw_route_verdict(dec_cls):
+    """The raw route builds nothing of the decoder's, but the handler has not
+    been asked and the wire still chose the length, so the cap governs it the
+    way it always did (§6.2.1)."""
+
+    class Raw(Visitor):
+        def on_float32_array_bits(self, field_id, count, payload):  # pragma: no cover
+            raise AssertionError("the cap must fire before the handler is asked")
+
+    from sofab import SofaLimitError
+
+    wire = _farray_wire(Encoder, [1.0] * 8, 4)
+    with pytest.raises(SofaLimitError):
+        dec_cls(visitor=Raw(), max_dyn_array_count=4).feed(wire)
+
+
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_a_nan_survives_the_binding_float_array_path(dec_cls):
+    """The block conversion into a caller destination keeps a signaling NaN's
+    payload — it re-derives a block containing one from its raw bits rather
+    than letting the widening quiet it (§6.5)."""
+    from sofab import Binding
+    from sofab._core import FARRAY_CHUNK
+
+    snan = bytes.fromhex("0100807f")
+    ordinary = bytes.fromhex("0000803f")
+    # Both sides of the block boundary the conversion works in: a payload
+    # shorter than one block, and one where a whole block carries the NaN.
+    for count in (3, FARRAY_CHUNK + 3):
+        # A NaN in the first block *and* in the last, so both the full-block
+        # conversion and the short tail take their bit-preserving path.
+        payload = snan + ordinary * (count - 2) + snan
+        template = Encoder()
+        template.write_float32_array(1, [0.0] * count)
+        template.flush()
+        wire = template.getvalue()[: -4 * count] + payload
+
+        binding = Binding().float32_array(1, at=0, cap=count)
+        words = bytearray(binding.tree_words_required * 8)
+        dec = dec_cls(binding=binding, words=words)
+        assert dec.feed(wire) is Status.COMPLETE, count
+
+        out = Encoder()
+        out.write_float32_array(
+            1, array.array("d", memoryview(words).cast("d")[:count])
+        )
+        out.flush()
+        assert out.getvalue() == wire, count
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+def test_a_sticky_encoder_records_a_bad_raw_float_write_instead_of_raising(enc_cls):
+    """Sticky mode latches the first failure and turns every later write into a
+    no-op; the raw fp32 writes obey it like every other."""
+    enc = enc_cls(sticky=True)
+    enc.write_float32_bits(1, 1 << 32)
+    assert isinstance(enc.error, SofaArgumentError)
+    enc.write_float32_bits(1, 0)             # skipped: the failure is latched
+    enc.write_float32_array_bits(1, b"")     # skipped too
+    enc.write_unsigned(2, 7)
+    enc.flush()
+    assert enc.getvalue() == b""

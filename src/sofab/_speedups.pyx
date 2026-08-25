@@ -2979,10 +2979,18 @@ cdef class Decoder:
         # when the callback returns. The view is *released* on the way out, so
         # that is enforced rather than merely documented.
         cdef Py_ssize_t count = <Py_ssize_t>self._pend_count
-        cdef Py_ssize_t nbytes = self._farray_nbytes(self._pend_count,
-                                                     self._pend_size)
+        cdef Py_ssize_t nbytes
         cdef object view
         cdef bytes data
+        if self._pk == _PEND_LIMIT:
+            # Nothing of this decoder's is at stake here, but the handler has
+            # not been asked and cannot refuse -- unlike on_blob_begin, which is
+            # offered the length first. The wire still chose how much has to be
+            # contiguous before the callback can see it, so the configured
+            # ceiling governs the route the way it always did (S6.2.1). The pure
+            # engine does the same.
+            raise SofaLimitError(self._limit_msg)
+        nbytes = self._farray_nbytes(self._pend_count, self._pend_size)
         if self._n - self._pos >= nbytes:
             # Already buffered, which is the ordinary case: the view is made
             # straight over the fed bytes, so an array of any length costs one

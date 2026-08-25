@@ -105,8 +105,8 @@ class Visitor:
         so return the same answer each time; the decoder restarts the array from
         its first element and fills ``dst`` from the beginning.
 
-        Not called for float arrays, which carry no declared width to state and
-        are already moved into a destination in one piece.
+        Not called for float arrays, which carry no declared width to state.
+        Their destination hook is :meth:`on_float_array_begin`.
 
         **A configured** ``max_dyn_array_count`` **does not gate this hook**, on
         the same reasoning as :meth:`on_blob_begin`: it is asked first and told
