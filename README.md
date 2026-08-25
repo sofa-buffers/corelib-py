@@ -434,10 +434,19 @@ A **`Binding`** declares once where every field id belongs, so a decode fills
 your slots without a handler written by hand.
 
 It is not a second decoder. CORELIB_PLAN §5.3.1 allows exactly one decode
-surface, and a `Binding` is compiled into a `Visitor` over that table — the same
-`feed`, the same header walk, the same hooks and the same verdicts as any other
-handler. One implementation, so nothing can be right on one route and wrong on
-the other.
+surface, and a table is reached **through** it: a handler declares its slots once
+from `Visitor.destinations()`, and `Decoder(binding=…, words=…, objects=…)` is
+the constructor shorthand for a handler that declares exactly that. Same `feed`,
+same header walk, same verdicts.
+
+What makes that one surface is where the *rules* live, not where the value
+lands. The receiver cap, the schema bound, the §7.3 tag test, the UTF-8 check,
+the declared element width and the resume transaction each exist **once** and run
+for every field alike — a field the table names and a field it does not run the
+same code right up to the assignment itself. It is the same bargain
+`on_string_begin` and `on_array_begin` already strike per field — name a
+destination and the codec writes there instead of calling you back — made once
+for the whole message.
 
 ```python
 from sofab import Binding, Decoder
@@ -480,17 +489,36 @@ What follows from the caller owning the storage:
 * **Nested messages share the same storage.** `b.sequence(id, child)` descends
   into a child table in the same two buffers, so a whole tree decodes into one
   flat pair. A sequence with no binding is skipped whole.
-* **A binding is build-once.** Building a decoder freezes the table and compiles
-  it into the handler that decodes through it, so a table changed afterwards
-  cannot leave a decoder reading a stale copy.
+* **A binding is build-once.** Building a decoder freezes the table and derives
+  its destination map, so a table changed afterwards cannot leave a decoder
+  reading a stale copy. The map is cached on the `Binding`, so building a decoder
+  per message costs no recompilation.
 
 A `Binding` and a `Visitor` compose: bind the fields you know, the visitor gets
-the rest — every hook, including the *begin* destinations. The one exception is
-the raw `fp32` channel (`on_float32_bits` / `on_float32_array_bits`): a table
-delivers the widened `double`, and which route an `fp32` takes is a property of
-the handler rather than of the field, so the combination is refused instead of
-silently delivering one route's value to the other's hook. Decode through the
-visitor alone for bit-exact `fp32`.
+the rest — every hook, including the *begin* destinations and the raw `fp32`
+channel. A declaration is about *its own* field, so the two never collide: an
+`fp32` the table names lands in its slot as the widened `double` the table asked
+for, and one it does not name reaches `on_float32_bits` if the visitor overrides
+it.
+
+Declaring the slots on the handler instead is the same thing without the
+constructor keywords, and is what generated code should emit:
+
+```python
+from sofab import Visitor
+
+class Telemetry(Visitor):
+    def __init__(self):
+        self.words = bytearray(b.tree_words_required * 8)
+        self.objects = [None] * b.tree_objects_required
+
+    def destinations(self):                  # asked once, when the decoder is built
+        return (b, self.words, self.objects)
+
+t = Telemetry()
+Decoder(visitor=t).feed(payload)             # one handler argument, nothing else
+assert memoryview(t.words).cast("Q")[0] == u[0]
+```
 
 Anything a `Binding` declares, a hand-written `Visitor` can declare too:
 `on_schema_bound` is where a handler names the `count`/`maxlen` the *schema*
@@ -961,11 +989,12 @@ less work. Every other row is `Ir/op`'s to tell.
 The native accelerator is worth roughly an order of magnitude over the pure
 engine on the message-shaped rows and two on the array-heavy ones, and it beats
 protobuf everywhere except the smallest decode, where the two are level. That
-last workload is where the streaming decode costs the most: it crosses the
-Python↔C boundary once per field, a `Binding` included — §5.3.1 allows one decode
-surface and that surface is a callback — whereas protobuf parses the whole
-message in one C call. What a destination still buys is the *elements*: an array
-of any length crosses once, not once per element.
+last workload is where the streaming decode costs the most: a visitor crosses the
+Python↔C boundary once per field, whereas protobuf parses the whole message in
+one C call. What a **declared destination** buys is that crossing: a field the
+handler's table names is written into its slot without one, and an array of any
+length costs no crossing at all rather than one per element. Every rule still
+runs on the one path either way (§5.3.1).
 `bench/compare_protobuf.py` runs that comparison.
 
 Measured figures are not reproduced here — they belong to the cross-language
