@@ -48,6 +48,7 @@ from sofab import (
     Binding,
     Encoder,
     Field,
+    FixlenSubtype,
     SofaDecodeError,
     SofaLimitError,
     Visitor,
@@ -150,7 +151,7 @@ class _DeclaringVisitor(Recorder):
         self.declared = declared
         self.asked: list[tuple] = []
 
-    def on_schema_bound(self, field_id: int, n: int) -> int:
+    def on_schema_bound(self, field_id: int, n: int, wtype, subtype) -> int:
         self.asked.append((field_id, n))
         return self.declared if field_id == 1 else -1
 
@@ -219,7 +220,7 @@ class _Mirror(Visitor):
         self._e = e
         return None
 
-    def on_schema_bound(self, field_id: int, n: int) -> int:
+    def on_schema_bound(self, field_id: int, n: int, wtype, subtype) -> int:
         return -1 if self._e is None else self._e[3]
 
     def on_array_begin(self, field_id, wtype, count):
@@ -386,7 +387,7 @@ class _Bound(Recorder):
         self.declared = declared
         self.ids = ids
 
-    def on_schema_bound(self, field_id, n):
+    def on_schema_bound(self, field_id, n, wtype, subtype):
         return self.declared if field_id in self.ids else -1
 
 
@@ -452,7 +453,7 @@ def test_a_scalar_is_never_asked(engine):
             super().__init__()
             self.asked = []
 
-        def on_schema_bound(self, field_id, n):
+        def on_schema_bound(self, field_id, n, wtype, subtype):
             self.asked.append((field_id, n))
             return -1
 
@@ -482,7 +483,7 @@ def test_a_skipped_field_is_never_asked(engine):
             super().on_field(field)
             return False
 
-        def on_schema_bound(self, field_id, n):
+        def on_schema_bound(self, field_id, n, wtype, subtype):
             self.asked.append(field_id)
             return 1
 
@@ -587,7 +588,7 @@ class _Every(Recorder):
         self.bounds: list[int] = []
         self.seq_answer: object = None
 
-    def on_schema_bound(self, field_id, n):
+    def on_schema_bound(self, field_id, n, wtype, subtype):
         self.bounds.append(field_id)
         return -1
 
@@ -724,7 +725,7 @@ def test_a_mistyped_sequence_id_is_the_fallbacks(engine):
 def test_the_base_visitor_declares_no_bound():
     """The default: a handler that says nothing leaves every field to the
     receiver caps."""
-    assert Visitor().on_schema_bound(1, 0) == -1
+    assert Visitor().on_schema_bound(1, 0, WireType.FIXLEN, FixlenSubtype.STRING) == -1
 
 
 # --- the map's own state, across a reset and a scope it does not name ---------
@@ -819,7 +820,7 @@ def test_the_hook_is_told_what_the_wire_announced(engine):
             super().__init__()
             self.seen = []
 
-        def on_schema_bound(self, field_id, n):
+        def on_schema_bound(self, field_id, n, wtype, subtype):
             self.seen.append((field_id, n))
             return -1
 
@@ -835,18 +836,150 @@ def test_the_hook_is_told_what_the_wire_announced(engine):
     assert rec.seen == [(1, 5), (2, 3), (3, 4), (4, 2)]
 
 
+# --- the hook is told the tag, so §7.3 reaches it too (#133) ------------------
+
+
+class _TaggedBound(Recorder):
+    """A hand-written handler whose schema declares exactly one field: id 1, a
+    ``string`` with ``maxlen=32``. It answers the bound only for that tag --
+    which is what a table entry has the decoder do on its behalf."""
+
+    def on_schema_bound(self, field_id, n, wtype, subtype):
+        if (
+            field_id == 1
+            and wtype is WireType.FIXLEN
+            and subtype is FixlenSubtype.STRING
+        ):
+            return 32
+        return -1
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_bounded_id_under_another_tag_is_skipped_not_invalid(engine):
+    """§7.3: "a decoder MUST treat the field as it treats an unknown field id"
+    -- and "against a schema bound, this clause wins".
+
+    The bug this closes: the hook was told the id and the announced length and
+    nothing else, so a handler could not tell its own 32-byte-bounded string
+    from a 40-byte blob that happens to reuse id 1. It answered 32 for the blob
+    and the decode came back INVALID, where the same declaration written as a
+    ``Binding`` entry -- which gets the §7.3 tag test run ahead of it -- came
+    back COMPLETE with the slot untouched.
+    """
+    enc = Encoder()
+    enc.write_bytes(1, b"x" * 40)      # a BLOB at the id the schema calls a string
+    data = enc.getvalue()
+
+    # Declared by the table: the tag does not match, so the field is skipped.
+    b = Binding().string(1, at=0, maxlen=32)
+    words, objs = bytearray(b.tree_words_required * 8), [None]
+    assert engine(binding=b, words=words, objects=objs).feed(data) is Status.COMPLETE
+    assert objs[0] is None
+
+    # Declared by the hook. Same declaration, same answer.
+    status, rec, _dec = walk(engine, data, recorder=_TaggedBound())
+    assert status is Status.COMPLETE
+    assert rec.events == [("blob", 1, b"x" * 40)]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_the_bound_still_binds_the_field_it_was_declared_for(engine):
+    """The other half: answering -1 for a foreign tag must not cost the bound
+    on the field the schema really declared."""
+    enc = Encoder()
+    enc.write_string(1, "y" * 40)     # the declared tag, over the declared bound
+    status, _rec, dec = walk(engine, enc.getvalue(), recorder=_TaggedBound())
+    assert status is Status.INVALID
+    assert isinstance(dec.error, SofaDecodeError)
+    assert "exceeds the 32" in str(dec.error)
+
+    enc = Encoder()
+    enc.write_string(1, "y" * 10)     # and inside it, unchanged
+    status, rec, _dec = walk(engine, enc.getvalue(), recorder=_TaggedBound())
+    assert status is Status.COMPLETE
+    assert rec.events == [("str", 1, "y" * 10)]
+
+
+@pytest.mark.parametrize(
+    "write, wtype, subtype",
+    [
+        (lambda e: e.write_string(1, "abc"), WireType.FIXLEN, FixlenSubtype.STRING),
+        (lambda e: e.write_bytes(1, b"abc"), WireType.FIXLEN, FixlenSubtype.BLOB),
+        (lambda e: e.write_unsigned_array(1, [1, 2]), WireType.ARRAY_UNSIGNED, None),
+        (lambda e: e.write_signed_array(1, [-1, 2]), WireType.ARRAY_SIGNED, None),
+        (
+            lambda e: e.write_float32_array(1, [1.0]),
+            WireType.ARRAY_FIXLEN,
+            FixlenSubtype.FP32,
+        ),
+        (
+            lambda e: e.write_float64_array(1, [1.0]),
+            WireType.ARRAY_FIXLEN,
+            FixlenSubtype.FP64,
+        ),
+    ],
+    ids=["string", "blob", "u-array", "s-array", "fp32-array", "fp64-array"],
+)
+@pytest.mark.parametrize("engine", ENGINES)
+def test_every_bounded_kind_reports_its_own_tag(engine, write, wtype, subtype):
+    """One hook spans four wire types and three subtypes, so each must arrive
+    labelled with the one it actually is -- ``None`` for an integer array, which
+    carries no subtype word on the wire (§4.8)."""
+
+    class Seen(Recorder):
+        def __init__(self):
+            super().__init__()
+            self.tags = []
+
+        def on_schema_bound(self, field_id, n, wt, st):
+            self.tags.append((wt, st))
+            return -1
+
+    enc = Encoder()
+    write(enc)
+    status, rec, _dec = walk(engine, enc.getvalue(), recorder=Seen())
+    assert status is Status.COMPLETE
+    assert rec.tags == [(wtype, subtype)]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_bounded_kind_that_carries_no_bound_is_still_not_asked(engine):
+    """An fp32/fp64 *scalar* is a fixlen field with a fixed width, so there is
+    nothing for a schema to bound and the hook is not reached -- unchanged by
+    the tag, and the reason ``subtype`` never arrives as FP32/FP64 outside an
+    array."""
+
+    class Seen(Recorder):
+        def __init__(self):
+            super().__init__()
+            self.tags = []
+
+        def on_schema_bound(self, field_id, n, wt, st):
+            self.tags.append((wt, st))
+            return -1
+
+    enc = Encoder()
+    enc.write_float32(1, 1.5)
+    enc.write_float64(2, 2.5)
+    enc.write_unsigned(3, 7)
+    status, rec, _dec = walk(engine, enc.getvalue(), recorder=Seen())
+    assert status is Status.COMPLETE
+    assert rec.tags == []
+
+
 @pytest.mark.parametrize("engine", ENGINES)
 def test_declaring_a_bound_costs_no_object(engine):
-    """The point of the two-integer signature: the hook is handed the id and the
-    announced count/length as plain ``int``s, so a handler that declares schema
-    bounds and overrides nothing else never causes a ``Field`` to be built."""
+    """The point of the signature: the hook is handed the id and the announced
+    count/length as plain ``int``s and the tag as the enum members the decoder
+    already holds, so a handler that declares schema bounds and overrides
+    nothing else never causes a ``Field`` -- or anything else -- to be built."""
 
     class Bounds(Visitor):
         def __init__(self):
-            self.types = []
+            self.seen = []
 
-        def on_schema_bound(self, field_id, n):
-            self.types.append((type(field_id), type(n)))
+        def on_schema_bound(self, field_id, n, wtype, subtype):
+            self.seen.append((type(field_id), type(n), wtype, subtype))
             return -1
 
     enc = Encoder()
@@ -854,7 +987,13 @@ def test_declaring_a_bound_costs_no_object(engine):
     enc.write_unsigned_array(2, [1, 2])
     sink = Bounds()
     assert engine(visitor=sink).feed(bytes(enc.getvalue())) is Status.COMPLETE
-    assert sink.types == [(int, int), (int, int)]
+    assert sink.seen == [
+        (int, int, WireType.FIXLEN, FixlenSubtype.STRING),
+        (int, int, WireType.ARRAY_UNSIGNED, None),
+    ]
+    # Interned members, not values coerced per field: identity, not equality.
+    assert sink.seen[0][2] is WireType.FIXLEN
+    assert sink.seen[0][3] is FixlenSubtype.STRING
 
 
 def test_only_on_field_makes_the_decoder_build_one():
@@ -863,7 +1002,7 @@ def test_only_on_field_makes_the_decoder_build_one():
     still does."""
 
     class Bounds(Visitor):
-        def on_schema_bound(self, field_id, n):
+        def on_schema_bound(self, field_id, n, wtype, subtype):
             return -1
 
     class Fields(Visitor):

@@ -22,7 +22,10 @@ skipping a 10k-element array or a deep sub-tree costs nothing:
 A third hook carries the one fact the codec cannot know and the schema does:
 :meth:`Visitor.on_schema_bound` names the ``count``/``maxlen`` the schema puts
 on a field, which is what takes the receiver-side ``max_dyn_*`` cap off it
-(§6.2.1) and makes exceeding it ``INVALID`` rather than a policy rejection.
+(§6.2.1) and makes exceeding it ``INVALID`` rather than a policy rejection. It
+is told the wire's tag alongside the id, because it is the only hook that spans
+more than one kind — every other one fires for a single wire type, so the
+decoder has already matched the tag before calling it.
 
 A fourth hook is asked **once**, when the decoder is built, and never again:
 :meth:`Visitor.destinations` names the slots the handler wants its fields
@@ -101,7 +104,13 @@ class Visitor:
         to decode it and dispatch to the typed hook below."""
         return None
 
-    def on_schema_bound(self, field_id: int, n: int) -> int:
+    def on_schema_bound(
+        self,
+        field_id: int,
+        n: int,
+        wtype: WireType,
+        subtype: FixlenSubtype | None,
+    ) -> int:
         """The count or length the **schema** declares for this field, or ``-1``.
 
         Asked once, at the count/length header — after :meth:`on_field`, before a
@@ -111,9 +120,26 @@ class Visitor:
         field the handler skipped is never asked (§6.7.2).
 
         ``n`` is what the **wire** announced: the byte length for a ``string`` or
-        ``blob``, the element count for an array. It is passed so a handler can
-        answer without the decoder building an object for it — this hook takes
-        two integers precisely so that overriding it costs nothing per field.
+        ``blob``, the element count for an array.
+
+        ``wtype``/``subtype`` are the **tag the wire carried**, and they are here
+        so that a handler can apply MESSAGE_SPEC §7.3 to its own declaration
+        before answering. This is the only hook that spans more than one kind —
+        :meth:`on_string_begin` fires for a ``string`` and nothing else,
+        :meth:`on_array_begin` for an integer array and nothing else, so the
+        decoder has already matched the tag for them. Here it has not, and an id
+        the schema bounds can arrive under a tag the schema never declared for
+        it. §7.3 says such a field is skipped like an unknown id, so **a handler
+        must answer** ``-1`` **for a tag it did not declare** — a bound answered
+        for someone else's field is a bound applied to a length that was never
+        the handler's, and the ``INVALID`` that follows contradicts §7.3. A
+        table entry (:meth:`destinations`) gets the same test run for it by the
+        decoder, which is why the two routes agree.
+
+        ``subtype`` is the fixlen subtype for a ``string``, a ``blob`` and a
+        fixlen array, and ``None`` for an integer array, which carries none.
+        Both are enum members recovered by index, not built, so overriding this
+        hook still costs no allocation per field.
 
         Returning ``n >= 0``:
 
@@ -129,6 +155,14 @@ class Visitor:
         A handler that declares destinations (:meth:`destinations`) answers this
         from its table for every field the table names; this hook is what the
         rest go through, and both reach the same rule in the same place.
+
+        .. code-block:: python
+
+            def on_schema_bound(self, field_id, n, wtype, subtype):
+                if (field_id == 0 and wtype is WireType.FIXLEN
+                        and subtype is FixlenSubtype.STRING):
+                    return 32          # the schema's maxlen for this field
+                return -1              # not the field the schema declared
         """
         return -1
 

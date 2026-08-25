@@ -107,6 +107,15 @@ _R_SKIP = 1
 _R_VISIT = 2
 
 _WT = tuple(WireType)
+# The fixlen subtypes by index, for the same reason and at the same cost:
+# ``on_schema_bound`` is told the tag the wire carried, and recovering the
+# member by index is a tuple load rather than an ``IntEnum`` coercion.
+_ST = tuple(FixlenSubtype)
+
+# The two members ``on_schema_bound`` names outright, as single global loads:
+# the kind is known from the pending tuple there, so there is nothing to index.
+_WTM_FIXLEN = WireType.FIXLEN
+_WTM_ARRAY_FIXLEN = WireType.ARRAY_FIXLEN
 
 # The wire types and fixlen subtypes as plain ints. ``WireType.FIXLEN`` inside a
 # comparison is a global load plus an attribute lookup on the enum class, paid
@@ -1486,9 +1495,22 @@ class Decoder:
           one "to a field the schema already bounds".
 
         Only string, blob and array fields carry a count or a length to bound;
-        a scalar has neither, so none is asked for. The hook takes the id and the
-        announced count/length as **integers**, so overriding it costs no object
-        per field.
+        a scalar has neither, so none is asked for.
+
+        **The tag goes with it**, and that is what keeps this route level with
+        the table one. Every other hook is reached only for the kind it names —
+        ``on_string_begin`` for a string, ``on_array_begin`` for an integer
+        array — so the decoder has matched the wire's tag before calling it.
+        This hook spans string, blob and both array kinds, so it has not; an id
+        the handler bounds can arrive under a tag the handler never declared for
+        it, and MESSAGE_SPEC §7.3 says such a field is skipped like an unknown
+        id. Told only the id, a handler answers its bound for someone else's
+        field and turns a §7.3 skip into an INVALID — the divergence issue #133
+        measured against a ``Binding``, which gets the tag test run for it above.
+        Told the tag, it answers ``-1`` and the two routes agree again.
+
+        Everything passed is an integer or an enum member recovered by index, so
+        overriding this hook still costs no object per field.
         """
         pending = self._pending
         assert pending is not None  # every value field parks one at its header
@@ -1496,9 +1518,21 @@ class Decoder:
         kind = real[0]
         if kind == _SCALAR:
             return
-        if kind == _FIXLEN and real[1] < _ST_STRING:
-            return  # an fp32/fp64 payload: a fixed width, nothing to bound
-        self._settle_bound(visitor.on_schema_bound(fid, real[2]))
+        if kind == _FIXLEN:
+            st = real[1]
+            if st < _ST_STRING:
+                return  # an fp32/fp64 payload: a fixed width, nothing to bound
+            wt: WireType = _WTM_FIXLEN
+            sub: FixlenSubtype | None = _ST[st]
+        elif kind == _VARRAY:
+            # (_VARRAY, wtype, count): the wire type IS the element signedness,
+            # and an integer array carries no subtype word at all.
+            wt = _WT[real[1]]
+            sub = None
+        else:  # _FARRAY -- (_FARRAY, subtype, count, elem_size)
+            wt = _WTM_ARRAY_FIXLEN
+            sub = _ST[real[1]]
+        self._settle_bound(visitor.on_schema_bound(fid, real[2], wt, sub))
 
     def _settle_bound(self, declared: int) -> None:
         """**The** site the schema bound is applied at — the one place in this
@@ -1885,8 +1919,10 @@ class Decoder:
         self._wants_field = cls.on_field is not Visitor.on_field
         self._wants_bound = cls.on_schema_bound is not Visitor.on_schema_bound
         # A Field is built for the ONE hook that takes one. Every other hook —
-        # on_schema_bound included — takes integers, so declaring a schema bound
-        # costs no object per field.
+        # on_schema_bound included — takes integers and interned enum members,
+        # so declaring a schema bound costs no object per field. That is what
+        # lets generated code drop on_field entirely: with the wire's tag on
+        # this hook, there is nothing left for on_field to pre-filter (#133).
         self._make_field = self._wants_field
         self._wants_seq_begin = cls.on_sequence_begin is not Visitor.on_sequence_begin
         self._wants_array_begin = cls.on_array_begin is not Visitor.on_array_begin

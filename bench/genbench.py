@@ -27,10 +27,11 @@ from decode_shapes import (  # noqa: E402
     new_storage,
 )
 
-from sofab import Decoder, Visitor  # noqa: E402
+from sofab import Decoder, Visitor, WireType  # noqa: E402
 
 MSG = build_msg()
 _ARR = frozenset(ARRAY_IDS)
+_ARR_WT = WireType.ARRAY_UNSIGNED
 
 
 class Bounds(Visitor):
@@ -39,8 +40,11 @@ class Bounds(Visitor):
         self._wu = wu
         self._dst = {f: wu[ARRAY_AT[f]:ARRAY_AT[f] + ARRAY_CAP] for f in ARRAY_IDS}
 
-    def on_schema_bound(self, field_id, n):
-        return ARRAY_CAP if field_id in _ARR else -1
+    def on_schema_bound(self, field_id, n, wtype, subtype):
+        # The tag test §7.3 wants, in the hook rather than in an `on_field`
+        # kept alive for it: an id the schema bounds under a wire type it never
+        # declared is skipped, not bounded.
+        return ARRAY_CAP if field_id in _ARR and wtype is _ARR_WT else -1
 
     def on_unsigned(self, field_id, value):
         self._wu[SCALAR_AT[field_id]] = value
