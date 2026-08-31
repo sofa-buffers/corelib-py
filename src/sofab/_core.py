@@ -132,18 +132,24 @@ def unpack_f64(data: bytes) -> float:
     return value
 
 
-def unpack_f32_array(data: bytes, count: int) -> list[float]:
-    """Decode ``count`` little-endian fp32 values (NaN-bit-preserving)."""
-    values = list(struct.unpack(f"<{count}f", data))
+def unpack_f32_array(data: Any, count: int, start: int = 0) -> list[float]:
+    """Decode ``count`` little-endian fp32 values (NaN-bit-preserving).
+
+    ``data`` is any buffer and ``start`` the byte offset the payload begins at,
+    so a caller holding the payload inside a larger buffer never slices a copy
+    out first (CORELIB_PLAN §6.6: nothing the wire sizes on the way to a value).
+    """
+    values = list(struct.unpack_from(f"<{count}f", data, start))
     if not any(v != v for v in values):
         return values
-    bits = struct.unpack(f"<{count}I", data)
+    bits = struct.unpack_from(f"<{count}I", data, start)
     return [_unpack_f32_bits(b) if v != v else v for v, b in zip(values, bits)]
 
 
-def unpack_f64_array(data: bytes, count: int) -> list[float]:
-    """Decode ``count`` little-endian fp64 values in one ``struct`` call."""
-    return list(struct.unpack(f"<{count}d", data))
+def unpack_f64_array(data: Any, count: int, start: int = 0) -> list[float]:
+    """Decode ``count`` little-endian fp64 values in one ``struct`` call; see
+    :func:`unpack_f32_array` for ``start``."""
+    return list(struct.unpack_from(f"<{count}d", data, start))
 
 
 def pack_f32_array(values: list[float]) -> bytes:

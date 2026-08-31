@@ -37,6 +37,17 @@ CORELIB_PLAN §6.2.1):
     A pre-sized ``list``, for the two field kinds that have no fixed-width
     machine representation: ``string`` and ``blob``. Each lands at its own index.
 
+    A slot takes either of two shapes, and the row says which. :meth:`string`
+    and :meth:`bytes` name a slot to *put a value in*, and the decoder builds
+    that ``str``/``bytes`` — from the only size it has, the wire's, which is the
+    materialized aggregate CORELIB_PLAN §6.6.3 names. :meth:`string_into` and
+    :meth:`blob_into` name a slot that already **holds** a writable byte buffer
+    the caller put there, and the payload is copied into it: nothing is sized
+    from the wire, a destination too short is refused rather than grown, and
+    ``count_at`` receives the byte length. That is §6.6.3's third shape — "into a
+    destination the caller declared before the decode began" — and it is what
+    lets a whole message decode without one allocation the sender chose.
+
 A field the table does not name is not an error: it is dispatched to the
 :class:`sofab.Visitor` the decoder was given, or skipped. So a binding covers
 the schema's hot fields and everything else keeps working.
@@ -46,9 +57,11 @@ Example::
     b = Binding()
     b.unsigned(1, at=0).signed(2, at=1).string(3, at=0, count_at=2)
     b.unsigned_array(4, at=8, cap=16, count_at=3)
+    b.blob_into(5, at=1, count_at=4)          # into a buffer you put there
 
     words = bytearray(b.words_required * 8)
     objs = [None] * b.objects_required
+    objs[1] = bytearray(4096)                 # field 5's destination
     dec = Decoder(binding=b, words=words, objects=objs)
     st = dec.feed(chunk)
 
@@ -57,6 +70,7 @@ Example::
     objs[0]                   # field 3, or untouched if it never arrived
     u[2]                      # 1 if field 3 arrived, else untouched
     u[8:8 + u[3]]             # field 4's elements, u[3] of them
+    objs[1][:u[4]]            # field 5's payload, u[4] bytes of it
 """
 
 from __future__ import annotations
@@ -124,7 +138,7 @@ class Entry:
 
     __slots__ = (
         "kind", "field_id", "at", "cap", "count_at", "child", "wt", "st",
-        "elem_lo", "elem_hi", "elem_bounded", "declared",
+        "elem_lo", "elem_hi", "elem_bounded", "declared", "into",
     )
 
     def __init__(
@@ -138,6 +152,7 @@ class Entry:
         elem_lo: int = 0,
         elem_hi: int = 0,
         elem_bounded: bool = False,
+        into: bool = False,
     ) -> None:
         self.kind = kind
         self.field_id = field_id
@@ -145,6 +160,10 @@ class Entry:
         self.cap = cap
         self.count_at = count_at
         self.child = child
+        # A string/blob row whose ``objects`` slot already holds the destination
+        # (:meth:`Binding.string_into` / :meth:`Binding.blob_into`): the payload
+        # is copied into it and no ``str``/``bytes`` is built (§6.6.3).
+        self.into = into
         # The element width the schema declares for an array (§7.1), checked at
         # the element, before it is stored. Absent means "as wide as the wire
         # type allows".
@@ -175,12 +194,13 @@ class Binding:
 
     Every binder method returns ``self``, so a table reads as one statement.
     ``at`` is a slot index — into ``words`` for the numeric kinds, into
-    ``objects`` for :meth:`string` and :meth:`bytes`. ``count_at`` is an optional
-    ``words`` slot the decoder writes the field's *arrival* into: ``1`` for a
-    scalar that turned up, the element count for an array, the number of
-    occurrences for a sequence. Slots the decoder never writes are left exactly
-    as the caller prepared them, which is how a decode reports absence without
-    inventing a sentinel.
+    ``objects`` for :meth:`string`, :meth:`bytes`, :meth:`string_into` and
+    :meth:`blob_into`. ``count_at`` is an optional ``words`` slot the decoder
+    writes the field's *arrival* into: ``1`` for a scalar that turned up, the
+    element count for an array, the byte length for a :meth:`string_into` /
+    :meth:`blob_into` payload, the number of occurrences for a sequence. Slots
+    the decoder never writes are left exactly as the caller prepared them, which
+    is how a decode reports absence without inventing a sentinel.
 
     An array's ``count_at`` is written when the array's **count header** is read,
     not when its last element lands — that is where the destination is settled
@@ -342,6 +362,55 @@ class Binding:
         ``maxlen``."""
         return self._add(K_BYTES, field_id, at, maxlen, count_at, None)
 
+    def string_into(
+        self, field_id: int, at: int, maxlen: int = 0, count_at: int | None = None
+    ) -> Binding:
+        """Bind a UTF-8 ``string`` field **into the buffer already in**
+        ``objects[at]`` — no ``str`` is built.
+
+        This is §6.6.3's third shape: "into a destination the caller declared
+        before the decode began — a field-id → slot table — which is the bullet
+        above with the choice made once instead of per field". :meth:`string`
+        names a slot to *put a value in*, and the value is one the decoder has to
+        build from the only size it has, the wire's. This names a slot that
+        already *holds the storage*: put a writable, contiguous, single-byte
+        buffer (a ``bytearray``, a ``memoryview`` over one, an ``array("B")``) at
+        ``objects[at]`` before decoding, and the decoder validates the payload as
+        UTF-8 and copies the wire bytes into it.
+
+        Nothing here is sized from the wire. A destination shorter than the
+        announced length is refused with :class:`sofab.SofaArgumentError` — §6.3's
+        ``InvalidArgument``, because "the message is well-formed and within every
+        bound it declares — what does not fit is the storage this caller offered"
+        — and it is **never** grown.
+
+        ``count_at`` receives the payload's **byte length**, which is how the
+        caller knows how much of its buffer is live; an absent field leaves the
+        slot exactly as it was prepared, as everywhere else. (The arrival flag
+        :meth:`string` writes would not be enough here: a caller holding the
+        bytes needs to know how many of them are the message's.)
+
+        ``maxlen`` is the schema's declared byte length, exactly as on
+        :meth:`string`: declaring it makes a longer payload INVALID
+        (MESSAGE_SPEC §7.1) and takes the receiver-side ``max_dyn_string_len``
+        cap off the field (§6.2.1). Left at ``0`` the field is schema-unbounded —
+        and the cap does **not** apply to it either, on the same reasoning
+        :meth:`sofab.Visitor.on_string_begin` carries: the cap exists to stop the
+        sender dictating the receiver's allocation, and a caller that put the
+        buffer there sized it itself. What bounds this field is the buffer, and a
+        payload past it is refused at the length word before a byte is copied.
+        """
+        return self._add(K_STRING, field_id, at, maxlen, count_at, None, into=True)
+
+    def blob_into(
+        self, field_id: int, at: int, maxlen: int = 0, count_at: int | None = None
+    ) -> Binding:
+        """Bind a ``blob`` field into the buffer already in ``objects[at]``; see
+        :meth:`string_into`. The only difference is the one :meth:`bytes` has
+        from :meth:`string` — the payload is copied verbatim and not validated as
+        UTF-8."""
+        return self._add(K_BYTES, field_id, at, maxlen, count_at, None, into=True)
+
     def unsigned_array(
         self,
         field_id: int,
@@ -426,6 +495,7 @@ class Binding:
         child: Binding | None,
         elem_lo: Any = None,
         elem_hi: Any = None,
+        into: bool = False,
     ) -> Binding:
         if self._frozen:
             raise SofaArgumentError(
@@ -464,7 +534,7 @@ class Binding:
         if not (SIGNED_MIN <= lo <= SIGNED_MAX) or not (0 <= hi <= UNSIGNED_MAX):
             raise SofaArgumentError("declared element width out of range")
         entry = Entry(kind, fid, slot, n, cnt, child, lo, hi,
-                      elem_lo is not None or elem_hi is not None)
+                      elem_lo is not None or elem_hi is not None, into)
         self._entries.append(entry)
         self._by_id[fid] = entry
         return self

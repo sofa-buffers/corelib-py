@@ -1841,6 +1841,7 @@ cdef struct _BEntry:
     Py_ssize_t cap          # array capacity / declared fixlen maxlen, 0 = none
     Py_ssize_t count_at     # slot to write arrival into, or -1
     int child               # table index of a sequence's child, or -1
+    bint into               # string/blob: objects[at] already holds the buffer
     bint elem_bounded       # the schema declares the array's element width
     int64_t elem_lo
     uint64_t elem_hi
@@ -1939,6 +1940,7 @@ cdef class _Compiled:
                 self.bent[k].cap = <Py_ssize_t>e.cap
                 self.bent[k].count_at = <Py_ssize_t>e.count_at
                 self.bent[k].child = <int>seen[id(e.child)] if e.child is not None else -1
+                self.bent[k].into = <bint>e.into
                 self.bent[k].elem_bounded = <bint>e.elem_bounded
                 self.bent[k].elem_lo = <int64_t>e.elem_lo
                 self.bent[k].elem_hi = <uint64_t>e.elem_hi
@@ -3070,9 +3072,19 @@ cdef class Decoder:
         # known even for a zero-count array — check it like any other read.
         if self._pk != _PEND_FARRAY or self._pend_subtype != subtype:
             return self._mismatch()
-        cdef bytes data = self._take_farray_payload()
-        cdef const unsigned char* p = <const unsigned char*>PyBytes_AS_STRING(data)
-        cdef Py_ssize_t count = PyBytes_GET_SIZE(data) // width
+        # The count is taken before the payload, because taking the payload
+        # clears the pending value. _take_farray_ptr yields exactly
+        # count*_pend_size bytes or raises, and _pend_size is fixed to ``width``
+        # by the fixlen_word check above, so the loop below stays inside the
+        # payload it was handed.
+        cdef Py_ssize_t count = <Py_ssize_t>self._pend_count
+        # ...ptr, not payload: the values are read straight out of the fed
+        # buffer wherever they are already contiguous there. The whole-payload
+        # ``bytes`` this used to copy first was the codec's own scratch, sized by
+        # the wire and seen by nobody -- two wire-sized allocations to deliver
+        # one list (CORELIB_PLAN §6.6). The list itself is what the handler asked
+        # for and stays; the copy on the way to it does not.
+        cdef const unsigned char* p = self._take_farray_ptr()
         cdef list out = PyList_New(count)
         cdef Py_ssize_t i
         if width == 4:
@@ -3081,6 +3093,10 @@ cdef class Decoder:
         else:
             for i in range(count):
                 _SetItemSteal(out, i, _NewF64(_unpack_f64(p + i * 8)))
+        # Dropped as soon as the values are out of it: on the chunk-straddling
+        # path _take_farray_ptr parks the joined payload here, and holding it
+        # past the read would keep a wire-sized bytes alive for no reader.
+        self._spill = None
         return out
 
     cdef int _visit_farray_bits(self, object visitor, object fid) except -1:
@@ -3631,7 +3647,8 @@ cdef class Decoder:
             return lo >= -(<int64_t>1 << (bits - 1)) and <int64_t>hi < (<int64_t>1 << (bits - 1))
         return hi < (<uint64_t>1 << bits) if bits < 64 else True
 
-    cdef int _take_blob_into(self, object dst, Py_ssize_t size) except -1:
+    cdef int _take_blob_into(self, object dst, Py_ssize_t size,
+                             str who=u"on_blob_begin") except -1:
         # Copy a blob's payload into the caller's buffer (§6.6.3) -- no bytes
         # built on the way, which is the point: the only size a codec could
         # build one from is the wire's.
@@ -3641,16 +3658,16 @@ cdef class Decoder:
             PyObject_GetBuffer(dst, &view, PyBUF_WRITABLE | PyBUF_SIMPLE)
         except (BufferError, TypeError) as exc:
             raise SofaArgumentError(
-                "on_blob_begin returned a destination that is not a writable, "
-                "contiguous buffer") from exc
+                "%s gave a destination that is not a writable, "
+                "contiguous buffer" % who) from exc
         try:
             if view.itemsize != 1:
                 raise SofaArgumentError(
-                    "on_blob_begin's destination must hold single bytes")
+                    "%s's destination must hold single bytes" % who)
             if view.len < size:
                 raise SofaArgumentError(
-                    "on_blob_begin returned %d bytes for a blob of %d"
-                    % (view.len, size))
+                    "%s gave %d bytes for a blob of %d"
+                    % (who, view.len, size))
             p = self._take_fixlen_ptr(size)
             memcpy(view.buf, <const void*>p, size)
             self._spill = None
@@ -3658,7 +3675,8 @@ cdef class Decoder:
             PyBuffer_Release(&view)
         return 0
 
-    cdef int _take_string_into(self, object dst, Py_ssize_t size) except -1:
+    cdef int _take_string_into(self, object dst, Py_ssize_t size,
+                               str who=u"on_string_begin") except -1:
         # S6.6.3's destination route for a string. No str is built on the way,
         # but the bytes are still validated: S6.7.2 makes a field the handler
         # *reads* both materialized and validated. Mirrors the pure engine.
@@ -3669,16 +3687,16 @@ cdef class Decoder:
             PyObject_GetBuffer(dst, &view, PyBUF_WRITABLE | PyBUF_SIMPLE)
         except (BufferError, TypeError) as exc:
             raise SofaArgumentError(
-                "on_string_begin returned a destination that is not a "
-                "writable, contiguous buffer") from exc
+                "%s gave a destination that is not a "
+                "writable, contiguous buffer" % who) from exc
         try:
             if view.itemsize != 1:
                 raise SofaArgumentError(
-                    "on_string_begin's destination must hold single bytes")
+                    "%s's destination must hold single bytes" % who)
             if view.len < size:
                 raise SofaArgumentError(
-                    "on_string_begin returned %d bytes for a string of %d"
-                    % (view.len, size))
+                    "%s gave %d bytes for a string of %d"
+                    % (who, view.len, size))
             p = self._take_fixlen_ptr(size)
             # Validate before the destination is touched, so a caller never
             # sees a half-written buffer behind an INVALID verdict -- and by
@@ -3891,6 +3909,22 @@ cdef class Decoder:
                 (<double*>self._words)[e.at] = _unpack_f32(self._take_fixlen_ptr(4))
             elif st == _ST_FP64:
                 (<double*>self._words)[e.at] = _unpack_f64(self._take_fixlen_ptr(8))
+            elif e.into:
+                # S6.6.3's third shape: the destination was declared before the
+                # decode began and objects[at] already holds it, so the payload
+                # is copied in and nothing is sized from the wire. The cap is
+                # spent for the same reason on_string_begin spends it -- the
+                # buffer is the caller's own storage (S6.2.1). Mirrors the pure
+                # engine, down to the byte length landing in count_at.
+                if self._pk == _PEND_LIMIT:
+                    self._pk = self._pk_real
+                got = self._pend_size
+                if e.kind == _K_BYTES:
+                    self._take_blob_into(self._objects[e.at],
+                                         <Py_ssize_t>got, u"Binding.blob_into")
+                else:
+                    self._take_string_into(self._objects[e.at],
+                                           <Py_ssize_t>got, u"Binding.string_into")
             else:
                 if self._pk == _PEND_LIMIT:
                     # The schema left this field unbounded, so the cap still

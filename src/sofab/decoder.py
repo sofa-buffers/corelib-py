@@ -222,6 +222,15 @@ class Decoder:
     # fixed offset and the count stops mattering.
     __slots__ = (
         "_buf",
+        # One memoryview over ``_buf``, remade whenever the buffer changes and
+        # dropped when the feed ends. It is how a string's payload is transcoded
+        # without copying it out first, and §6.6.2's "language-forced handle" is
+        # exactly what it is: it carries no message bytes of its own and costs
+        # the same over ten bytes as over ten megabytes. Held per *feed*, never
+        # across one — §6's chunk lifetime is what _retain enforces, and a view
+        # left pointing at a returned chunk would break it.
+        "_bufsrc",
+        "_bufview",
         "_capped",
         "_cur_id",
         "_cur_subtype",
@@ -413,6 +422,8 @@ class Decoder:
                 "reassembly must be a bytearray, a byte count, or omitted"
             )
         self._buf: bytes | bytearray = b""
+        self._bufsrc: Any = None
+        self._bufview: Any = None
         # len(self._buf), kept in step with it. The buffer only ever changes in
         # feed() and reset(), while the walk asks for its length constantly —
         # 5.2 len() calls per field on the composite workload, each a builtin
@@ -697,9 +708,11 @@ class Decoder:
         rejected before this was ever called."""
         out: list[int] = []
         append = out.append
-        # ZigZag is folded in here for the bound path: the list path hands raw
-        # values back and lets read_signed_array transform them, but with a
-        # destination there is nowhere to do a second pass.
+        # ZigZag is folded in on **both** paths. The list path used to hand raw
+        # values back for the caller to transform in a second pass, and that pass
+        # was a second list the wire sized -- two wire-sized allocations to
+        # deliver one array (§6.6). Decoding the element where it is already in
+        # hand costs the same arithmetic and allocates nothing extra.
         store = into is not None
         # Normalise the declared width once: an omitted side is the widest value
         # its domain can hold, so a one-sided bound binds its own side and leaves
@@ -731,6 +744,8 @@ class Decoder:
                         raise SofaDecodeError("array element outside declared width")
                 if store:
                     into[base + i] = (b >> 1) ^ -(b & 1) if zigzag else b
+                elif zigzag:
+                    append((b >> 1) ^ -(b & 1))
                 else:
                     append(b)
                 continue
@@ -777,6 +792,8 @@ class Decoder:
                     raise SofaDecodeError("array element outside declared width")
             if store:
                 into[base + i] = (result >> 1) ^ -(result & 1) if zigzag else result
+            elif zigzag:
+                append((result >> 1) ^ -(result & 1))
             else:
                 append(result)
         self._pos = pos
@@ -1222,6 +1239,10 @@ class Decoder:
         is what makes §6's chunk-lifetime promise true: once ``feed`` returns,
         the decoder holds nothing of what was handed to it.
         """
+        # The view goes first, before any branch can return: it points into
+        # ``_buf``, and §6 ends this chunk's life with the call.
+        self._bufsrc = None
+        self._bufview = None
         if self._status is Status.INVALID or self._limit is not None:
             # Terminal (§5.2.3, §6.3): nothing will resume, so there is nothing
             # to keep. Dropping also keeps the real verdict on the error channel
@@ -1263,6 +1284,8 @@ class Decoder:
         the binding — the destinations are the caller's to clear (or not: a slot
         the next message does not write keeps whatever is in it, which is how
         absence is reported)."""
+        self._bufsrc = None
+        self._bufview = None
         self._buf = b""
         self._n = 0
         self._pos = 0
@@ -1633,20 +1656,39 @@ class Decoder:
         elif k == K_STRING or k == K_BYTES:
             pending = self._pending
             assert pending is not None
-            if pending[0] == _LIMIT:
-                # The schema left this field unbounded, so the cap still governs
-                # it and has already rejected it (§6.2.1). The hook path reaches
-                # the same verdict on its way past the parked tuple; the store
-                # goes straight to the payload, so it is raised here.
-                raise SofaLimitError(pending[1])
-            data = self._take_fixlen_matched(pending[2])
-            if k == K_BYTES:
-                self._objects[at] = data  # type: ignore[index]
+            if e.into:
+                # §6.6.3's third shape: the destination was declared before the
+                # decode began and the slot already holds it, so the payload is
+                # copied in and nothing is sized from the wire.
+                if pending[0] == _LIMIT:
+                    # Spent, for the same reason on_string_begin spends it: the
+                    # buffer is the caller's own storage, chosen after the schema
+                    # was known, so there is no allocation of this decoder's left
+                    # for the cap to prevent (§6.2.1). What bounds the field is
+                    # the buffer, and a payload past it is refused below.
+                    self._pending = pending = pending[2]
+                got = pending[2]
+                dst = self._objects[at]  # type: ignore[index]
+                if k == K_BYTES:
+                    self._take_blob_into(dst, got, "Binding.blob_into")
+                else:
+                    self._take_string_into(dst, got, "Binding.string_into")
             else:
-                try:
-                    self._objects[at] = data.decode("utf-8")  # type: ignore[index]
-                except UnicodeDecodeError as exc:
-                    raise SofaDecodeError("invalid UTF-8 in string field") from exc
+                if pending[0] == _LIMIT:
+                    # The schema left this field unbounded, so the cap still
+                    # governs it and has already rejected it (§6.2.1). The hook
+                    # path reaches the same verdict on its way past the parked
+                    # tuple; the store goes straight to the payload, so it is
+                    # raised here.
+                    raise SofaLimitError(pending[1])
+                if k == K_BYTES:
+                    self._objects[at] = self._take_fixlen_matched(  # type: ignore[index]
+                        pending[2]
+                    )
+                else:
+                    self._objects[at] = self._take_text_matched(  # type: ignore[index]
+                        pending[2]
+                    )
         else:
             pending = self._pending
             assert pending is not None
@@ -1676,6 +1718,46 @@ class Decoder:
         c = e.count_at
         if c >= 0:
             self._wu[c] = got
+
+    def _take_text_matched(self, size: int) -> str:
+        """The pending ``string`` payload as a ``str``, transcoded straight out
+        of the buffer it was fed into.
+
+        The ``str`` is the value a handler that asked for one gets, and the wire
+        sizes it — §6.6.3's materialized aggregate, and the gap this port's
+        README itemises. What is **not** here is the ``bytes`` copy that used to
+        be made on the way to it: that was the codec's own scratch, sized by the
+        wire, and no caller ever saw it. A megabyte string cost a megabyte twice.
+
+        What is left is one ``memoryview``, which is §6.6.2's language-forced
+        handle exactly: it carries no message bytes of its own, and it costs the
+        same over ten bytes as over ten megabytes. One is kept per buffer rather
+        than made per field, and :meth:`_retain` drops it when the feed ends, so
+        it never outlives the chunk it points into (§6).
+
+        The visitor's ``on_string`` branch in :meth:`_visit_value` carries these
+        same lines **inlined**, for the reason the rest of that branch is inlined:
+        a string field is the commonest thing on the wire and the delegation
+        showed up in the instruction count (~3% of a fifty-string message). They
+        are the same lines and must stay so — nothing here is a decode *rule*,
+        which is what §5.3.1 requires a single implementation of; the bound, the
+        cap, the tag test and the resume transaction all ran before either is
+        reached.
+        """
+        self._keep = pos = self._pos
+        end = pos + size
+        if end > self._n:
+            raise self._suspend("truncated payload")
+        buf = self._buf
+        if buf is not self._bufsrc:
+            self._bufsrc = buf
+            self._bufview = memoryview(buf)
+        self._pos = end
+        self._pending = None  # committed once the payload is in hand (§5.2)
+        try:
+            return str(self._bufview[pos:end], "utf-8")
+        except UnicodeDecodeError as exc:
+            raise SofaDecodeError("invalid UTF-8 in string field") from exc
 
     def _take_fixlen_matched(self, length: int) -> bytes:
         """:meth:`_take_scalar_matched` for a fixlen payload."""
@@ -1792,6 +1874,29 @@ class Decoder:
                 # build one from is the wire's. That is the allocation §6.2.1 is
                 # about, so the cap speaks.
                 raise SofaLimitError(pending[1])
+            subtype = pending[1]
+            if subtype == _ST_STRING:
+                # Folded in rather than delegated, like the rest of this branch:
+                # a string field is the commonest thing on the wire, and the
+                # ``bytes``-free transcode is four lines. It is the SAME four as
+                # _take_text_matched's, and it must stay so -- see there for what
+                # they are for and why the memoryview is the whole cost.
+                self._keep = pos = self._pos
+                end = pos + pending[2]
+                if end > self._n:
+                    raise self._suspend("truncated payload")
+                buf = self._buf
+                if buf is not self._bufsrc:
+                    self._bufsrc = buf
+                    self._bufview = memoryview(buf)
+                self._pos = end
+                self._pending = None  # committed once the payload is in hand
+                try:
+                    text = str(self._bufview[pos:end], "utf-8")
+                except UnicodeDecodeError as exc:
+                    raise SofaDecodeError("invalid UTF-8 in string field") from exc
+                visitor.on_string(fid, text)
+                return
             self._keep = pos = self._pos
             end = pos + pending[2]
             if end > self._n:
@@ -1802,14 +1907,7 @@ class Decoder:
             data = buf[pos:end] if type(buf) is bytes else bytes(memoryview(buf)[pos:end])
             self._pos = end
             self._pending = None  # committed once the payload is in hand (§5.2)
-            subtype = pending[1]
-            if subtype == _ST_STRING:
-                try:
-                    text = data.decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    raise SofaDecodeError("invalid UTF-8 in string field") from exc
-                visitor.on_string(fid, text)
-            elif subtype == _ST_BLOB:
+            if subtype == _ST_BLOB:
                 visitor.on_bytes(fid, data)
             elif subtype == _ST_FP32:
                 # _next_wire already refused any other width for these two, so
@@ -1841,21 +1939,27 @@ class Decoder:
             elif not self._visit_farray_into(visitor, fid, pending, 8):
                 visitor.on_float64_array(fid, self._take_farray_values(pending, 8))
 
-    def _take_blob_into(self, dst: Any, size: int) -> None:
+    def _take_blob_into(self, dst: Any, size: int, who: str = "on_blob_begin") -> None:
         """Copy a blob's payload into the caller's buffer (§6.6.3).
 
         No ``bytes`` is built on the way -- which is the point: the only size a
         codec could build one from is the wire's, and a megabyte blob would cost
         a megabyte allocation per message.
+
+        ``who`` names the route the buffer arrived by, so the §6.3 refusal reads
+        the same whether the caller answered :meth:`sofab.Visitor.on_blob_begin`
+        per field or declared the slot once with :meth:`sofab.Binding.blob_into`.
+        It is the **only** difference between the two: one rule, one
+        implementation, whichever way the destination was stated (§5.3.1).
         """
-        view = _writable(dst, "on_blob_begin")
+        view = _writable(dst, who)
         if view.itemsize != 1:
             raise SofaArgumentError(
-                "on_blob_begin's destination must hold single bytes"
+                f"{who}'s destination must hold single bytes"
             )
         if view.nbytes < size:
             raise SofaArgumentError(
-                f"on_blob_begin returned {view.nbytes} bytes for a blob of {size}"
+                f"{who} gave {view.nbytes} bytes for a blob of {size}"
             )
         self._keep = pos = self._pos
         end = pos + size
@@ -1865,23 +1969,26 @@ class Decoder:
         self._pos = end
         self._pending = None  # committed once the payload is in hand (§5.2)
 
-    def _take_string_into(self, dst: Any, size: int) -> None:
+    def _take_string_into(
+        self, dst: Any, size: int, who: str = "on_string_begin"
+    ) -> None:
         """Validate a string's payload and copy it into the caller's buffer.
 
         §6.6.3's destination route for the third aggregate. No ``str`` is built
         on the way — the only size a codec could build one from is the wire's —
         but the bytes are still validated, because §6.7.2 makes a field the
         handler *reads* both materialized and validated.
+
+        ``who`` names the route the buffer arrived by; see :meth:`_take_blob_into`.
         """
-        view = _writable(dst, "on_string_begin")
+        view = _writable(dst, who)
         if view.itemsize != 1:
             raise SofaArgumentError(
-                "on_string_begin's destination must hold single bytes"
+                f"{who}'s destination must hold single bytes"
             )
         if view.nbytes < size:
             raise SofaArgumentError(
-                f"on_string_begin returned {view.nbytes} bytes for a string "
-                f"of {size}"
+                f"{who} gave {view.nbytes} bytes for a string of {size}"
             )
         self._keep = pos = self._pos
         end = pos + size
@@ -2007,9 +2114,12 @@ class Decoder:
             self._pending = pending[2]
         self._keep = self._pos
         if dst is None:
+            # One list, not two: the ZigZag transform is folded into the element
+            # loop, where the raw value is already in hand. The list itself is
+            # the value the handler asked for and the wire sizes it -- that is
+            # the gap §6.6.3 names -- but nothing else on the way to it is sized
+            # by the wire any more.
             out = self._read_varints(count, lo, hi, zigzag)
-            if zigzag:
-                out = [(v >> 1) ^ -(v & 1) for v in out]
             self._pending = None  # committed once the payload is in hand (§5.2)
             if zigzag:
                 visitor.on_signed_array(fid, out)
@@ -2075,14 +2185,24 @@ class Decoder:
             raw.release()
 
     def _take_farray_values(self, pending: tuple[Any, ...], width: int) -> list[float]:
+        """The fallback route for a fixlen array: a ``list`` of Python floats.
+
+        The list is what the handler asked for and the wire sizes it, which is
+        the gap §6.6.3 names and the README itemises. What is **not** here any
+        more is the ``bytes`` copy of the payload that used to be made on the way
+        to it: the values are unpacked straight out of the buffer they were fed
+        into (:meth:`_span_exact`), so the route costs one wire-sized allocation
+        rather than two. Everything the codec could stop sizing from the wire, it
+        has stopped sizing from the wire.
+        """
         if pending[0] == _LIMIT:
             raise SofaLimitError(pending[1])
         count = pending[2]
         self._keep = self._pos
-        data = self._read_exact(self._farray_nbytes(count, pending[3]))
+        buf, off = self._span_exact(self._farray_nbytes(count, pending[3]))
         self._pending = None  # committed only once the payload is in hand (§5.2)
         return (
-            _core.unpack_f32_array(data, count)
+            _core.unpack_f32_array(buf, count, off)
             if width == 4
-            else _core.unpack_f64_array(data, count)
+            else _core.unpack_f64_array(buf, count, off)
         )
