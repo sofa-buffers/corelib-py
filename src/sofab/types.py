@@ -172,8 +172,12 @@ class SofaLimitError(SofaError):
     max_dyn_string_len=…, max_dyn_blob_len=…)``).
 
     This is a *policy* rejection, not wire malformation: the bytes are perfectly
-    well-formed and would decode fine with the limit unset — the receiver simply
-    declined to allocate for them. It is therefore a sibling of
+    well-formed and would decode fine under a looser limit — the receiver simply
+    declined to allocate for them. It is **never** what a decoder raises for a
+    limit that was not stated at all: there is no limit to raise then, so an
+    omitted ``max_dyn_*`` argument is :class:`SofaArgumentError` (§6.2.1, §6.3).
+
+    It is therefore a sibling of
     :class:`SofaDecodeError` under :class:`SofaError`, **not** a subclass of it,
     so ``except SofaDecodeError`` does not catch it and differential fuzzing does
     not see a limit rejection as a conformance divergence from another engine.
@@ -200,6 +204,18 @@ class SofaArgumentError(SofaError):
     is a caller mistake, not a value out of range. Every other port keeps the
     word (``Error::Argument`` in Rust, ``Error::InvalidArgument`` in C++), so
     this one does too. ``SofaRangeError`` remains as an alias.
+
+    On construction it covers a receiver cap the caller did not state. §6.2.1
+    fixes the provenance of the three ``max_dyn_*`` numbers even where the codec
+    performs the comparison: a codec "**MUST NOT** hold a limit of its own,
+    **MUST NOT** supply a default for one it was not given, **MUST NOT** read an
+    omitted argument as *unlimited*, and **MUST NOT** clamp to one". So all three
+    are required, on :class:`sofab.Decoder` and on a
+    :class:`sofab.SequenceCollector` alike, and omitting one is a mistake in the
+    **call** rather than a property of the message or of the deployment —
+    which is exactly what this code is for. :class:`SofaLimitError` would say
+    something untrue about it: it promises a limit to raise that was never
+    configured.
 
     On encode, a value (or id/count) is not writable: either it is outside the
     permitted range, or it is not an integer at all: integer fields accept

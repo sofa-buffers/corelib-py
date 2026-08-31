@@ -2083,9 +2083,9 @@ cdef class Decoder:
     cdef Py_ssize_t _resume_entry
 
     def __cinit__(self, *, binding=None, visitor=None, words=None, objects=None,
-                  max_dyn_array_count=_ARRAY_MAX_OBJ,
-                  max_dyn_string_len=_FIXLEN_MAX_OBJ,
-                  max_dyn_blob_len=_FIXLEN_MAX_OBJ,
+                  max_dyn_array_count=None,
+                  max_dyn_string_len=None,
+                  max_dyn_blob_len=None,
                   reassembly=None):
         self._stackmem = NULL
         self._vstack = NULL
@@ -2163,21 +2163,24 @@ cdef class Decoder:
         self._wants_blob_begin = False
         if visitor is not None:
             self._bind_visitor(visitor)
-        # §6.2.1: no unset state and no unlimited mode. None is refused rather
-        # than read as "no limit"; the defaults are the format ceilings above
-        # which the value is already INVALID, which is the widest a limit can be
-        # while still being one. See the pure engine for the full note.
+        # §6.2.1: the numbers are the caller's. There is no unset state, no
+        # unlimited mode and -- the point of this block -- no default: a codec
+        # "MUST NOT supply a default for one it was not given" and MUST NOT read
+        # an omitted argument as unlimited, so an omitted cap is refused here
+        # rather than resolved to the format ceiling. See the pure engine for the
+        # full note.
         # Written out rather than looped: a decoder is constructed per message on
         # the one-shot path, and a Python-level loop over three tuples is a
-        # measurable share of that.
-        # The identity test is not a shortcut past the check: a default IS the
-        # ceiling object, and the ceiling is what the check would accept.
-        if max_dyn_array_count is not _ARRAY_MAX_OBJ:
-            self._check_limit("max_dyn_array_count", max_dyn_array_count, _ARRAY_MAX_OBJ)
-        if max_dyn_string_len is not _FIXLEN_MAX_OBJ:
-            self._check_limit("max_dyn_string_len", max_dyn_string_len, _FIXLEN_MAX_OBJ)
-        if max_dyn_blob_len is not _FIXLEN_MAX_OBJ:
-            self._check_limit("max_dyn_blob_len", max_dyn_blob_len, _FIXLEN_MAX_OBJ)
+        # measurable share of that. The identity fast path that used to skip
+        # these is gone with the defaults it tested for: there is no ceiling
+        # object a caller could be holding rather than stating. Measured, the
+        # three checks are ~1.1k Ir of a ~8.0k Ir construction (Callgrind), and
+        # the three extra keyword arguments themselves are ~1.4k more; both land
+        # only on callers that build a decoder per message rather than reset()
+        # one.
+        self._check_limit("max_dyn_array_count", max_dyn_array_count, _ARRAY_MAX_OBJ)
+        self._check_limit("max_dyn_string_len", max_dyn_string_len, _FIXLEN_MAX_OBJ)
+        self._check_limit("max_dyn_blob_len", max_dyn_blob_len, _FIXLEN_MAX_OBJ)
         self._capped = (max_dyn_array_count < _ARRAY_MAX_OBJ
                         or max_dyn_string_len < _FIXLEN_MAX_OBJ
                         or max_dyn_blob_len < _FIXLEN_MAX_OBJ)
@@ -2218,9 +2221,13 @@ cdef class Decoder:
             self._wview = NULL
 
     cdef inline int _check_limit(self, str name, object value, object ceiling) except -1:
-        # §6.2.1: no unset state, no unlimited mode, and a domain of 0..ceiling.
+        # §6.2.1: no unset state, no unlimited mode, no default, and a domain of
+        # 0..ceiling. An omitted or None cap is a defect in the CALL, so it lands
+        # in §6.3's InvalidArgument tier and never in LimitExceeded.
         if value is None:
-            raise SofaArgumentError("%s has no unset state (§6.2.1)" % name)
+            raise SofaArgumentError(
+                "%s is required (§6.2.1): the codec holds no limit of its own "
+                "and reads no omitted argument as unlimited" % name)
         if value < 0 or value > ceiling:
             raise SofaArgumentError("%s=%s is outside 0..%s" % (name, value, ceiling))
         return 0

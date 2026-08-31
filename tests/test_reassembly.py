@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
-from vectors import Recorder, Status
+from vectors import NO_CAPS, Recorder, Status
 
 from sofab import DEFAULT_REASSEMBLY, Encoder, SofaArgumentError
 
@@ -49,7 +49,7 @@ WANT = [
 
 def _feed(engine, wire, chunk, **kw):
     rec = Recorder()
-    dec = engine(visitor=rec, **kw)
+    dec = engine(**NO_CAPS, visitor=rec, **kw)
     status = Status.COMPLETE
     for i in range(0, len(wire), chunk):
         status = dec.feed(wire[i : i + chunk])
@@ -90,7 +90,7 @@ def test_the_buffer_is_reused_across_messages_not_regrown(engine):
     wire = _msg()
     buf = bytearray(1024)
     rec = Recorder()
-    dec = engine(visitor=rec, reassembly=buf)
+    dec = engine(**NO_CAPS, visitor=rec, reassembly=buf)
     for _ in range(3):
         for i in range(0, len(wire), 7):
             dec.feed(wire[i : i + 7])
@@ -117,7 +117,7 @@ def test_the_chunk_may_be_overwritten_the_moment_feed_returns(engine):
     feed that ends mid-construct, the decoder holds nothing of the chunk."""
     wire = _msg()
     rec = Recorder()
-    dec = engine(visitor=rec, reassembly=bytearray(1024))
+    dec = engine(**NO_CAPS, visitor=rec, reassembly=bytearray(1024))
     status = Status.COMPLETE
     for i in range(0, len(wire), 9):
         chunk = bytearray(wire[i : i + 9])
@@ -137,11 +137,11 @@ def test_only_a_bytearray_or_a_byte_count_is_accepted(engine):
     """
     for bad in (b"\x00" * 64, memoryview(bytearray(64)), 64.0, "64", True):
         with pytest.raises(SofaArgumentError):
-            engine(visitor=Recorder(), reassembly=bad)
+            engine(**NO_CAPS, visitor=Recorder(), reassembly=bad)
     # A count below what a single spanning construct can need is refused too:
     # a buffer that cannot hold one is not a smaller buffer, it is a broken one.
     with pytest.raises(SofaArgumentError):
-        engine(visitor=Recorder(), reassembly=8)
+        engine(**NO_CAPS, visitor=Recorder(), reassembly=8)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -182,7 +182,7 @@ def test_the_default_buffer_is_bounded_and_never_grows(engine):
     # The same bytes in one call never touch the buffer at all, whatever their
     # size: nothing spans a chunk boundary when there is only one chunk.
     rec = Recorder()
-    assert engine(visitor=rec).feed(wire) is Status.COMPLETE
+    assert engine(**NO_CAPS, visitor=rec).feed(wire) is Status.COMPLETE
     assert rec.events == [("blob", 1, b"z" * (DEFAULT_REASSEMBLY * 2))]
 
 
@@ -211,6 +211,6 @@ def test_a_carry_larger_than_the_buffer_is_refused_on_the_way_out(engine):
     memory past the call (§6) or growing a buffer of our own (§6.6)."""
     wire = _msg()
     rec = Recorder()
-    dec = engine(visitor=rec, reassembly=bytearray(8))
+    dec = engine(**NO_CAPS, visitor=rec, reassembly=bytearray(8))
     with pytest.raises(SofaArgumentError):
         dec.feed(wire[:60])  # stops deep inside the 300-byte string

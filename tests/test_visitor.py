@@ -12,7 +12,7 @@ declared fields in ``test_conformance_vectors``; this suite is about the hooks.
 from __future__ import annotations
 
 import pytest
-from vectors import VECTORS
+from vectors import NO_CAPS, VECTORS
 
 from sofab import Decoder, Field, FixlenSubtype, Status, Visitor, WireType
 
@@ -84,11 +84,11 @@ class Recorder(Visitor):
 def test_a_vector_decodes_the_same_however_it_is_chunked(vec, chunk):
     data = bytes.fromhex(vec["serialized"]["hex"])
     whole = Recorder()
-    if Decoder(visitor=whole).feed(data) is not Status.COMPLETE:
+    if Decoder(**NO_CAPS, visitor=whole).feed(data) is not Status.COMPLETE:
         pytest.skip("vector is not a complete message on its own")
 
     piecewise = Recorder()
-    dec = Decoder(visitor=piecewise)
+    dec = Decoder(**NO_CAPS, visitor=piecewise)
     status = Status.COMPLETE
     for off in range(0, len(data), chunk):
         status = dec.feed(data[off : off + chunk])
@@ -105,11 +105,11 @@ def test_declined_fields_leave_the_rest_intact(vec):
     skip = frozenset(vec["skip_ids"])
 
     everything = Recorder()
-    if Decoder(visitor=everything).feed(data) is not Status.COMPLETE:
+    if Decoder(**NO_CAPS, visitor=everything).feed(data) is not Status.COMPLETE:
         pytest.skip("vector is not a complete message on its own")
 
     kept = Recorder(skip_ids=skip)
-    assert Decoder(visitor=kept).feed(data) is Status.COMPLETE
+    assert Decoder(**NO_CAPS, visitor=kept).feed(data) is Status.COMPLETE
 
     # Everything the declining run reported was also reported by the full run,
     # in the same order, and every declined id is gone from it.
@@ -139,7 +139,7 @@ def test_every_typed_hook_fires_for_its_wire_type(enc_cls=None):
     enc.flush()
 
     rec = Recorder()
-    assert Decoder(visitor=rec).feed(enc.getvalue()) is Status.COMPLETE
+    assert Decoder(**NO_CAPS, visitor=rec).feed(enc.getvalue()) is Status.COMPLETE
     assert rec.events == [
         ("u", 1, 300), ("s", 2, -7), ("f32", 3, 1.5), ("f64", 4, -2.25),
         ("str", 5, "hi"), ("blob", 6, b"\x00\xff"),
@@ -155,7 +155,7 @@ def test_default_visitor_consumes_everything():
     data = bytes.fromhex(
         next(v for v in VECTORS if v["name"] == "full_scale_example")["serialized"]["hex"]
     )
-    assert Decoder(visitor=Visitor()).feed(data) is Status.COMPLETE
+    assert Decoder(**NO_CAPS, visitor=Visitor()).feed(data) is Status.COMPLETE
 
 
 # --- the elision contract both engines rely on ------------------------------
@@ -209,6 +209,6 @@ def test_a_hook_that_delegates_to_the_base_still_receives_every_call():
     enc.flush()
 
     v = _Delegating()
-    assert Decoder(visitor=v).feed(enc.getvalue()) is Status.COMPLETE
+    assert Decoder(**NO_CAPS, visitor=v).feed(enc.getvalue()) is Status.COMPLETE
     assert v.fields == [1, 3]
     assert v.seqs == [2]

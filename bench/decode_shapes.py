@@ -48,7 +48,31 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from sofab import IMPL, Binding, Decoder, Encoder, Status, Visitor  # noqa: E402
+from sofab import (  # noqa: E402
+    ARRAY_MAX,
+    FIXLEN_MAX,
+    IMPL,
+    Binding,
+    Decoder,
+    Encoder,
+    Status,
+    Visitor,
+)
+
+# CORELIB_PLAN §6.2.1: the three receiver caps are the CALLER's numbers and a
+# Decoder has no default for them -- "a codec MUST NOT supply a default for one
+# it was not given" -- so every construction below states all three. They are the
+# format ceilings (§6.2), at which a cap cannot fire, because a larger value is
+# already INVALID before the check is reached: a benchmark measures the decode,
+# not a policy.
+#
+# Written out as three keyword arguments rather than unpacked from a dict: that
+# is the form generated code emits, so it is the form the rows should measure.
+# (Under Callgrind the two are within this harness's own run-to-run drift.)
+CAP_ARR = ARRAY_MAX
+CAP_STR = FIXLEN_MAX
+CAP_BLOB = FIXLEN_MAX
+
 
 GOLDEN = 0x9E3779B97F4A7C15
 MASK64 = (1 << 64) - 1
@@ -165,7 +189,9 @@ _SumVisitor = _make_visitor_class()
 def make_feed_visitor():
     def body(data: bytes) -> int:
         v = _SumVisitor()
-        Decoder(visitor=v).feed(data)
+        Decoder(max_dyn_array_count=CAP_ARR,
+                max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                visitor=v).feed(data)
         return v.acc
 
     return body
@@ -205,7 +231,9 @@ def _read_back_bulk(u: memoryview) -> int:
 
 def make_feed_bound():
     words, u = new_storage()
-    dec = Decoder(binding=BINDING, words=words)
+    dec = Decoder(max_dyn_array_count=CAP_ARR,
+                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                  binding=BINDING, words=words)
 
     def body(data: bytes) -> int:
         dec.reset()
@@ -217,7 +245,9 @@ def make_feed_bound():
 
 def make_feed_bound_read():
     words, u = new_storage()
-    dec = Decoder(binding=BINDING, words=words)
+    dec = Decoder(max_dyn_array_count=CAP_ARR,
+                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                  binding=BINDING, words=words)
 
     def body(data: bytes) -> int:
         dec.reset()
@@ -229,7 +259,9 @@ def make_feed_bound_read():
 
 def make_feed_bound_bulk():
     words, u = new_storage()
-    dec = Decoder(binding=BINDING, words=words)
+    dec = Decoder(max_dyn_array_count=CAP_ARR,
+                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                  binding=BINDING, words=words)
 
     def body(data: bytes) -> int:
         dec.reset()
@@ -242,7 +274,9 @@ def make_feed_bound_bulk():
 def make_feed_bound_fresh():
     def body(data: bytes) -> int:
         words, u = new_storage()
-        Decoder(binding=BINDING, words=words).feed(data)
+        Decoder(max_dyn_array_count=CAP_ARR,
+                max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                binding=BINDING, words=words).feed(data)
         return _read_back(u)
 
     return body
@@ -297,7 +331,9 @@ def selftest() -> int:
     # Chunked: the same bytes one at a time must land the same values, and the
     # final status must be COMPLETE (§5.2 / §7.2 item 4).
     words, u = new_storage()
-    dec = Decoder(binding=BINDING, words=words)
+    dec = Decoder(max_dyn_array_count=CAP_ARR,
+                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                  binding=BINDING, words=words)
     st = Status.COMPLETE
     for i in range(len(msg)):
         st = dec.feed(msg[i : i + 1])

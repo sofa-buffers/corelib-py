@@ -42,9 +42,11 @@ import inspect
 
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
-from vectors import Recorder, Slots, Status, walk
+from vectors import NO_CAPS, Recorder, Slots, Status, walk
 
 from sofab import (
+    ARRAY_MAX,
+    FIXLEN_MAX,
     Binding,
     Encoder,
     Field,
@@ -87,12 +89,12 @@ def test_a_table_is_reached_through_the_visitor():
         if engine is None:
             continue
         words[:] = bytes(8)
-        assert engine(visitor=Declaring()).feed(msg) is Status.COMPLETE
+        assert engine(**NO_CAPS, visitor=Declaring()).feed(msg) is Status.COMPLETE
         assert memoryview(words).cast("Q")[0] == 42
 
         # ``binding=`` is the same declaration, written at the constructor.
         w2 = bytearray(8)
-        assert engine(binding=b, words=w2).feed(msg) is Status.COMPLETE
+        assert engine(**NO_CAPS, binding=b, words=w2).feed(msg) is Status.COMPLETE
         assert memoryview(w2).cast("Q")[0] == 42
 
 
@@ -125,7 +127,7 @@ def test_a_binding_decodes_through_the_visitor_it_was_given(engine):
     b = Binding().unsigned(1, at=0)
     rec = Recorder()
     words = bytearray(8)
-    dec = engine(binding=b, words=words, visitor=rec)
+    dec = engine(**NO_CAPS, binding=b, words=words, visitor=rec)
     assert dec.feed(enc.getvalue()) is Status.COMPLETE
     assert Slots(words, []).u[0] == 7
     assert rec.events == [("u", 2, 9)]
@@ -166,7 +168,7 @@ def test_the_audited_divergence_is_gone(engine):
     b = Binding().string(1, at=0, maxlen=10)
     words = bytearray(8)
     objs: list = [None]
-    dec = engine(binding=b, words=words, objects=objs, max_dyn_string_len=4)
+    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, binding=b, words=words, objects=objs, max_dyn_string_len=4)
     assert dec.feed(data) is Status.COMPLETE
     assert objs[0] == BOUNDED
 
@@ -187,7 +189,7 @@ def test_declaring_nothing_is_capped_on_either_surface(engine):
     b = Binding().string(1, at=0)  # no maxlen: the schema leaves it open
     words = bytearray(8)
     with pytest.raises(SofaLimitError) as bound_exc:
-        engine(binding=b, words=words, objects=[None], max_dyn_string_len=4).feed(data)
+        engine(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, binding=b, words=words, objects=[None], max_dyn_string_len=4).feed(data)
 
     with pytest.raises(SofaLimitError) as visitor_exc:
         walk(engine, data, max_dyn_string_len=4)
@@ -524,7 +526,7 @@ def test_the_fp32_channel_is_per_field_not_per_decoder(engine):
     sink = Bits()
     words = bytearray(8)
     b = Binding().float32(1, at=0)
-    assert engine(binding=b, words=words, visitor=sink).feed(msg) is Status.COMPLETE
+    assert engine(**NO_CAPS, binding=b, words=words, visitor=sink).feed(msg) is Status.COMPLETE
     assert memoryview(words).cast("d")[0] == 1.5
     assert sink.bits == [(2, 0x40200000)]
 
@@ -546,7 +548,7 @@ def test_the_fp32_array_channel_is_per_field_too(engine):
     sink = ArrayBits()
     words = bytearray(16)
     b = Binding().float32_array(1, at=0, cap=2)
-    assert engine(binding=b, words=words, visitor=sink).feed(msg) is Status.COMPLETE
+    assert engine(**NO_CAPS, binding=b, words=words, visitor=sink).feed(msg) is Status.COMPLETE
     assert list(memoryview(words).cast("d")) == [1.5, 2.5]
     assert [(fid, n) for fid, n, _ in sink.seen] == [(2, 1)]
 
@@ -564,7 +566,7 @@ def test_both_engines_settle_a_declared_bound_the_same_way():
     for engine in (pure_decoder.Decoder, native.Decoder):
         b = Binding().string(1, at=0, maxlen=10)
         objects: list = [None]
-        dec = engine(
+        dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, 
             binding=b, words=bytearray(8), objects=objects, max_dyn_string_len=4
         )
         out.append((dec.feed(msg), objects[0]))
@@ -631,7 +633,7 @@ def test_the_fallback_still_gets_every_hook(engine):
     b = Binding().unsigned(1, at=0)
     rec = _Every()
     words = bytearray(8)
-    dec = engine(binding=b, words=words, visitor=rec)
+    dec = engine(**NO_CAPS, binding=b, words=words, visitor=rec)
     assert dec.feed(enc.getvalue()) is Status.COMPLETE
     assert Slots(words, []).u[0] == 1
     assert rec.events == [
@@ -665,7 +667,7 @@ def test_an_unbound_sequence_with_no_fallback_is_skipped(engine):
     inner = Binding().unsigned(1, at=0, count_at=1)
     b = Binding().sequence(1, inner, count_at=2)
     words = bytearray(3 * 8)
-    dec = engine(binding=b, words=words)
+    dec = engine(**NO_CAPS, binding=b, words=words)
     assert dec.feed(_nested()) is Status.COMPLETE
     s = Slots(words, [])
     assert (s.u[0], s.u[1], s.u[2]) == (11, 1, 1)   # id 2's sub-tree skipped whole
@@ -677,7 +679,7 @@ def test_an_unbound_sequence_goes_to_the_fallback_flat(engine):
     b = Binding().sequence(1, inner, count_at=2)
     rec = _Every()
     words = bytearray(3 * 8)
-    dec = engine(binding=b, words=words, visitor=rec)
+    dec = engine(**NO_CAPS, binding=b, words=words, visitor=rec)
     assert dec.feed(_nested()) is Status.COMPLETE
     assert Slots(words, []).u[0] == 11
     # The fallback heard its own scope open and close, and every close: a bound
@@ -691,7 +693,7 @@ def test_a_fallback_can_decline_an_unbound_sequence(engine):
     rec = _Every()
     rec.seq_answer = False
     words = bytearray(8)
-    dec = engine(binding=b, words=words, visitor=rec)
+    dec = engine(**NO_CAPS, binding=b, words=words, visitor=rec)
     assert dec.feed(_nested()) is Status.COMPLETE
     # Both sub-trees were offered and both declined, so nothing inside either
     # was decoded and no on_sequence_end fired for them.
@@ -705,7 +707,7 @@ def test_a_fallback_can_name_a_child_for_an_unbound_sequence(engine):
     rec = _Every()
     rec.seq_answer = child
     words = bytearray(8)
-    dec = engine(binding=b, words=words, visitor=rec)
+    dec = engine(**NO_CAPS, binding=b, words=words, visitor=rec)
     assert dec.feed(_nested()) is Status.COMPLETE
     assert child.events == [("u", 1, 11), ("seq}",), ("u", 1, 22), ("seq}",)]
 
@@ -717,7 +719,7 @@ def test_a_mistyped_sequence_id_is_the_fallbacks(engine):
     b = Binding().unsigned(1, at=0)
     rec = _Every()
     words = bytearray(8)
-    dec = engine(binding=b, words=words, visitor=rec)
+    dec = engine(**NO_CAPS, binding=b, words=words, visitor=rec)
     assert dec.feed(_nested()) is Status.COMPLETE
     assert rec.events[0] == ("seq{", 1)
 
@@ -747,7 +749,7 @@ def test_a_reset_inside_a_mapped_sequence_rewinds_the_map(engine):
     msg = bytes(enc.getvalue())
 
     words = bytearray(8 * 8)
-    dec = engine(binding=b, words=words)
+    dec = engine(**NO_CAPS, binding=b, words=words)
     # Stop inside the sequence: the child map is live and unbalanced.
     assert dec.feed(msg[:-1]) is Status.INCOMPLETE
     u = memoryview(words).cast("Q")
@@ -775,7 +777,7 @@ def test_a_map_with_no_fallback_skips_a_sequence_it_does_not_name(engine):
     msg = bytes(enc.getvalue())
 
     words = bytearray(4 * 8)
-    dec = engine(binding=b, words=words)
+    dec = engine(**NO_CAPS, binding=b, words=words)
     assert dec.feed(msg) is Status.COMPLETE
     u = memoryview(words).cast("Q")
     assert (u[0], u[1]) == (7, 11)
@@ -798,7 +800,7 @@ def test_a_skipped_unmapped_sequence_resumes_across_a_chunk(engine):
     msg = bytes(enc.getvalue())
 
     words = bytearray(4 * 8)
-    dec = engine(binding=b, words=words, reassembly=64)
+    dec = engine(**NO_CAPS, binding=b, words=words, reassembly=64)
     u = memoryview(words).cast("Q")
     # One byte at a time, so the skip is suspended at every boundary inside the
     # sub-tree and has to be resumed rather than restarted.
@@ -873,7 +875,7 @@ def test_a_bounded_id_under_another_tag_is_skipped_not_invalid(engine):
     # Declared by the table: the tag does not match, so the field is skipped.
     b = Binding().string(1, at=0, maxlen=32)
     words, objs = bytearray(b.tree_words_required * 8), [None]
-    assert engine(binding=b, words=words, objects=objs).feed(data) is Status.COMPLETE
+    assert engine(**NO_CAPS, binding=b, words=words, objects=objs).feed(data) is Status.COMPLETE
     assert objs[0] is None
 
     # Declared by the hook. Same declaration, same answer.
@@ -986,7 +988,7 @@ def test_declaring_a_bound_costs_no_object(engine):
     enc.write_string(1, "abc")
     enc.write_unsigned_array(2, [1, 2])
     sink = Bounds()
-    assert engine(visitor=sink).feed(bytes(enc.getvalue())) is Status.COMPLETE
+    assert engine(**NO_CAPS, visitor=sink).feed(bytes(enc.getvalue())) is Status.COMPLETE
     assert sink.seen == [
         (int, int, WireType.FIXLEN, FixlenSubtype.STRING),
         (int, int, WireType.ARRAY_UNSIGNED, None),
@@ -1009,5 +1011,5 @@ def test_only_on_field_makes_the_decoder_build_one():
         def on_field(self, field):
             return None
 
-    assert pure_decoder.Decoder(visitor=Bounds())._make_field is False
-    assert pure_decoder.Decoder(visitor=Fields())._make_field is True
+    assert pure_decoder.Decoder(**NO_CAPS, visitor=Bounds())._make_field is False
+    assert pure_decoder.Decoder(**NO_CAPS, visitor=Fields())._make_field is True

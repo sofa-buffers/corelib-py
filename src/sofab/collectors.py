@@ -35,9 +35,9 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .types import (
-    ARRAY_MAX,
     Field,
     FixlenSubtype,
+    SofaArgumentError,
     SofaDecodeError,
     SofaLimitError,
     WireType,
@@ -63,6 +63,19 @@ class SequenceCollector(Visitor):
     declared count, or ``None`` where the schema declares none;
     ``max_dyn_array_count`` is the receiver limit that then applies. ``default``
     is what an omitted interior element leaves behind.
+
+    ``max_dyn_array_count`` is **required**, and required whether or not ``cap``
+    is given. §6.2.1 lets this layer perform the comparison but not own the
+    number: it "**MUST NOT** hold a limit of its own, **MUST NOT** supply a
+    default for one it was not given, **MUST NOT** read an omitted argument as
+    *unlimited*, and **MUST NOT** clamp to one" — and a format ceiling (§6.2)
+    standing in for an unstated cap is the format's bound, not a receiver cap.
+    Omitting it is a defect in the call and raises
+    :class:`~sofab.SofaArgumentError` (§6.3's ``InvalidArgument`` tier), never
+    :class:`~sofab.SofaLimitError`. It is required alongside ``cap`` because
+    ``cap=None`` is how a caller says "the schema bounds nothing here", and that
+    is exactly the case in which a silently-defaulted receiver limit would leave
+    the array unbounded in practice.
     """
 
     default: Any = None
@@ -72,8 +85,13 @@ class SequenceCollector(Visitor):
         out: list[Any],
         *,
         cap: int | None = None,
-        max_dyn_array_count: int = ARRAY_MAX,
+        max_dyn_array_count: int | None = None,
     ) -> None:
+        if max_dyn_array_count is None:
+            raise SofaArgumentError(
+                "max_dyn_array_count is required (§6.2.1): a collector holds no "
+                "limit of its own and reads no omitted argument as unlimited"
+            )
         self.out = out
         self.cap = cap
         self.max_dyn_array_count = max_dyn_array_count

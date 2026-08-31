@@ -13,15 +13,19 @@ from __future__ import annotations
 
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
+from vectors import NO_CAPS
 
 from sofab import (
+    ARRAY_MAX,
     BytesSeq,
     Encoder,
     Float32Seq,
     Float64Seq,
     NestedSeq,
     SignedSeq,
+    SofaArgumentError,
     SofaDecodeError,
+    SofaError,
     SofaLimitError,
     Status,
     StringSeq,
@@ -68,7 +72,7 @@ def test_elements_are_placed_at_their_id_not_appended(engine):
     gap has to be filled: appending would shorten the array by every gap."""
     out: list = []
     wire = _wrap(lambda e: [e.write_string(0, "a"), e.write_string(3, "d")])
-    assert engine(visitor=root(lambda: StringSeq(out))).feed(wire) is Status.COMPLETE
+    assert engine(**NO_CAPS, visitor=root(lambda: StringSeq(out, max_dyn_array_count=ARRAY_MAX))).feed(wire) is Status.COMPLETE
     assert out == ["a", "", "", "d"]
 
 
@@ -76,14 +80,14 @@ def test_elements_are_placed_at_their_id_not_appended(engine):
 def test_a_reopened_id_overwrites_rather_than_appends(engine):
     out: list = []
     wire = _wrap(lambda e: [e.write_string(0, "a"), e.write_string(0, "b")])
-    assert engine(visitor=root(lambda: StringSeq(out))).feed(wire) is Status.COMPLETE
+    assert engine(**NO_CAPS, visitor=root(lambda: StringSeq(out, max_dyn_array_count=ARRAY_MAX))).feed(wire) is Status.COMPLETE
     assert out == ["b"]
 
 
 @pytest.mark.parametrize("engine", ENGINES)
 def test_an_empty_wrapper_collects_nothing(engine):
     out: list = []
-    assert engine(visitor=root(lambda: StringSeq(out))).feed(_wrap(lambda e: None)) is (
+    assert engine(**NO_CAPS, visitor=root(lambda: StringSeq(out, max_dyn_array_count=ARRAY_MAX))).feed(_wrap(lambda e: None)) is (
         Status.COMPLETE
     )
     assert out == []
@@ -103,7 +107,7 @@ def test_an_empty_wrapper_collects_nothing(engine):
 )
 def test_each_element_type_fills_its_gap_with_its_own_default(engine, cls, write, want):
     out: list = []
-    assert engine(visitor=root(lambda: cls(out))).feed(_wrap(write)) is Status.COMPLETE
+    assert engine(**NO_CAPS, visitor=root(lambda: cls(out, max_dyn_array_count=ARRAY_MAX))).feed(_wrap(write)) is Status.COMPLETE
     assert out == want
 
 
@@ -116,7 +120,7 @@ def test_a_schema_cap_makes_an_over_index_invalid(engine):
     validity (§7.1) -- not the receiver's capacity."""
     out: list = []
     wire = _wrap(lambda e: e.write_string(8, "x"))
-    dec = engine(visitor=root(lambda: StringSeq(out, cap=4)))
+    dec = engine(**NO_CAPS, visitor=root(lambda: StringSeq(out, cap=4, max_dyn_array_count=ARRAY_MAX)))
     # A schema-bound violation is the INVALID outcome, not an exception: the
     # decoder answers §7.1 in the status, and reserves the error channel for the
     # policy rejection a receiver limit is (§6.3).
@@ -130,7 +134,7 @@ def test_a_schema_cap_makes_an_over_index_invalid(engine):
 def test_without_a_schema_cap_the_receiver_limit_applies(engine):
     out: list = []
     wire = _wrap(lambda e: e.write_string(8, "x"))
-    dec = engine(visitor=root(lambda: StringSeq(out, max_dyn_array_count=4)))
+    dec = engine(**NO_CAPS, visitor=root(lambda: StringSeq(out, max_dyn_array_count=4)))
     with pytest.raises(SofaLimitError):
         dec.feed(wire)
     assert out == []
@@ -142,7 +146,7 @@ def test_a_schema_cap_takes_the_receiver_limit_off_the_field(engine):
     already bounds"."""
     out: list = []
     wire = _wrap(lambda e: e.write_string(6, "x"))
-    dec = engine(visitor=root(lambda: StringSeq(out, cap=8, max_dyn_array_count=2)))
+    dec = engine(**NO_CAPS, visitor=root(lambda: StringSeq(out, cap=8, max_dyn_array_count=2)))
     assert dec.feed(wire) is Status.COMPLETE
     assert len(out) == 7
 
@@ -152,7 +156,7 @@ def test_the_index_is_judged_before_the_list_grows(engine):
     """An index near 2**31 must cost a comparison, not an allocation."""
     out: list = []
     wire = _wrap(lambda e: e.write_string(1 << 30, "x"))
-    dec = engine(visitor=root(lambda: StringSeq(out, cap=4)))
+    dec = engine(**NO_CAPS, visitor=root(lambda: StringSeq(out, cap=4, max_dyn_array_count=ARRAY_MAX)))
     assert dec.feed(wire) is Status.INVALID
     assert out == []
 
@@ -161,7 +165,7 @@ def test_the_index_is_judged_before_the_list_grows(engine):
 def test_the_last_legal_index_is_accepted(engine):
     out: list = []
     wire = _wrap(lambda e: e.write_string(3, "d"))
-    assert engine(visitor=root(lambda: StringSeq(out, cap=4))).feed(wire) is (
+    assert engine(**NO_CAPS, visitor=root(lambda: StringSeq(out, cap=4, max_dyn_array_count=ARRAY_MAX))).feed(wire) is (
         Status.COMPLETE
     )
     assert out == ["", "", "", "d"]
@@ -173,7 +177,7 @@ def test_an_element_over_the_declared_maxlen_is_invalid(engine, cls, write):
     out: list = []
     payload = "y" * 40 if cls is StringSeq else b"y" * 40
     wire = _wrap(lambda e: getattr(e, write)(0, payload))
-    dec = engine(visitor=root(lambda: cls(out, elem_max=8)))
+    dec = engine(**NO_CAPS, visitor=root(lambda: cls(out, elem_max=8, max_dyn_array_count=ARRAY_MAX)))
     assert dec.feed(wire) is Status.INVALID
     assert isinstance(dec.error, SofaDecodeError)
     assert not isinstance(dec.error, SofaLimitError)
@@ -194,7 +198,7 @@ def test_framed_elements_each_get_their_own_handler(engine):
     enc.write_sequence_end_keep()
     enc.flush()
 
-    dec = engine(visitor=root(lambda: NestedSeq(out, factory=Row)))
+    dec = engine(**NO_CAPS, visitor=root(lambda: NestedSeq(out, factory=Row, max_dyn_array_count=ARRAY_MAX)))
     assert dec.feed(enc.getvalue()) is Status.COMPLETE
     assert len(out) == 3
     assert out[0].fields == {0: 11}
@@ -214,7 +218,7 @@ def test_a_framed_element_is_placed_before_it_is_filled(engine):
     enc.write_sequence_end_keep()
     enc.write_sequence_end_keep()
     enc.flush()
-    dec = engine(visitor=root(lambda: NestedSeq(out, factory=Row)))
+    dec = engine(**NO_CAPS, visitor=root(lambda: NestedSeq(out, factory=Row, max_dyn_array_count=ARRAY_MAX)))
     assert dec.feed(enc.getvalue()) is Status.COMPLETE
     assert out[0].fields == {0: 7}
 
@@ -235,7 +239,7 @@ def test_a_framed_element_over_the_cap_is_refused_before_the_factory_runs(engine
     enc.write_sequence_end_keep()
     enc.write_sequence_end_keep()
     enc.flush()
-    dec = engine(visitor=root(lambda: NestedSeq(out, factory=factory, cap=4)))
+    dec = engine(**NO_CAPS, visitor=root(lambda: NestedSeq(out, factory=factory, cap=4, max_dyn_array_count=ARRAY_MAX)))
     assert dec.feed(enc.getvalue()) is Status.INVALID
     assert out == []
     assert made == [1], "the factory runs, but its element is never placed"
@@ -249,7 +253,7 @@ def test_a_framed_element_over_the_cap_is_refused_before_the_factory_runs(engine
 def test_the_descent_survives_a_chunk_boundary(engine, chunk):
     out: list = []
     wire = _wrap(lambda e: [e.write_string(0, "a"), e.write_string(1, "bbbbbbbb")])
-    dec = engine(visitor=root(lambda: StringSeq(out)))
+    dec = engine(**NO_CAPS, visitor=root(lambda: StringSeq(out, max_dyn_array_count=ARRAY_MAX)))
     status = Status.COMPLETE
     if chunk is None:
         status = dec.feed(wire)
@@ -267,7 +271,7 @@ def test_the_parent_resumes_after_the_scope_closes(engine):
 
     class Root(Visitor):
         def on_sequence_begin(self, field_id):
-            return StringSeq(out) if field_id == WRAPPER else None
+            return StringSeq(out, max_dyn_array_count=ARRAY_MAX) if field_id == WRAPPER else None
 
         def on_unsigned(self, field_id, value):
             seen.append((field_id, value))
@@ -280,7 +284,7 @@ def test_the_parent_resumes_after_the_scope_closes(engine):
     enc.write_unsigned(2, 20)
     enc.flush()
 
-    assert engine(visitor=Root()).feed(enc.getvalue()) is Status.COMPLETE
+    assert engine(**NO_CAPS, visitor=Root()).feed(enc.getvalue()) is Status.COMPLETE
     assert out == ["a"]
     assert seen == [(1, 10), (2, 20)], "the parent must get the fields after the scope"
 
@@ -292,7 +296,7 @@ def test_two_wrappers_get_two_collectors(engine):
 
     class Root(Visitor):
         def on_sequence_begin(self, field_id):
-            return StringSeq(a if field_id == 4 else b)
+            return StringSeq(a if field_id == 4 else b, max_dyn_array_count=ARRAY_MAX)
 
     enc = Encoder()
     enc.write_sequence_begin_lazy(4)
@@ -303,7 +307,7 @@ def test_two_wrappers_get_two_collectors(engine):
     enc.write_sequence_end_keep()
     enc.flush()
 
-    assert engine(visitor=Root()).feed(enc.getvalue()) is Status.COMPLETE
+    assert engine(**NO_CAPS, visitor=Root()).feed(enc.getvalue()) is Status.COMPLETE
     assert a == ["x"]
     assert b == ["", "y"]
 
@@ -316,7 +320,7 @@ def test_reset_puts_the_callers_handler_back(engine):
 
     class Root(Visitor):
         def on_sequence_begin(self, field_id):
-            return StringSeq(out)
+            return StringSeq(out, max_dyn_array_count=ARRAY_MAX)
 
         def on_unsigned(self, field_id, value):
             seen.append(value)
@@ -326,7 +330,7 @@ def test_reset_puts_the_callers_handler_back(engine):
     enc.write_string(0, "a")
     enc.flush()  # no end marker: the descent is still open
 
-    dec = engine(visitor=Root())
+    dec = engine(**NO_CAPS, visitor=Root())
     assert dec.feed(enc.getvalue()) is Status.INCOMPLETE
     dec.reset()
 
@@ -349,7 +353,7 @@ def test_a_string_elements_maxlen_is_a_byte_length_not_a_character_count(engine)
     """
     out: list = []
     wire = _wrap(lambda e: e.write_string(0, "hél"))
-    dec = engine(visitor=root(lambda: StringSeq(out, elem_max=3)))
+    dec = engine(**NO_CAPS, visitor=root(lambda: StringSeq(out, elem_max=3, max_dyn_array_count=ARRAY_MAX)))
     assert dec.feed(wire) is Status.INVALID
     assert isinstance(dec.error, SofaDecodeError)
     assert not isinstance(dec.error, SofaLimitError)
@@ -357,7 +361,7 @@ def test_a_string_elements_maxlen_is_a_byte_length_not_a_character_count(engine)
 
     # Four is the byte length, so four is what the bound has to accept.
     ok: list = []
-    assert engine(visitor=root(lambda: StringSeq(ok, elem_max=4))).feed(wire) is (
+    assert engine(**NO_CAPS, visitor=root(lambda: StringSeq(ok, elem_max=4, max_dyn_array_count=ARRAY_MAX))).feed(wire) is (
         Status.COMPLETE
     )
     assert ok == ["hél"]
@@ -373,7 +377,7 @@ def test_an_over_long_element_is_refused_at_the_fixlen_word(engine, cls, write):
     wire = _wrap(lambda e: getattr(e, write)(0, payload))
     # Cut the message inside the payload: the length word has arrived, the
     # bytes it announces have not.
-    dec = engine(visitor=root(lambda: cls(out, elem_max=8)))
+    dec = engine(**NO_CAPS, visitor=root(lambda: cls(out, elem_max=8, max_dyn_array_count=ARRAY_MAX)))
     assert dec.feed(wire[:6]) is Status.INVALID
     assert isinstance(dec.error, SofaDecodeError)
     assert out == []
@@ -385,7 +389,7 @@ def test_an_elements_bound_does_not_judge_the_other_subtype(engine):
     it is skipped, so it is never judged against a bound that is not its."""
     out: list = []
     wire = _wrap(lambda e: e.write_bytes(0, b"y" * 40))
-    assert engine(visitor=root(lambda: StringSeq(out, elem_max=8))).feed(wire) is (
+    assert engine(**NO_CAPS, visitor=root(lambda: StringSeq(out, elem_max=8, max_dyn_array_count=ARRAY_MAX))).feed(wire) is (
         Status.COMPLETE
     )
     assert out == []
@@ -414,7 +418,7 @@ def test_a_child_handler_gets_its_own_on_field(engine):
             return Child() if field_id == WRAPPER else None
 
     wire = _wrap(lambda e: (e.write_string(0, "ab"), e.write_unsigned(1, 7)))
-    dec = engine(visitor=Root())
+    dec = engine(**NO_CAPS, visitor=Root())
     assert dec.feed(wire) is Status.COMPLETE
     assert [(i, s) for i, _t, s in seen] == [(0, 2), (1, 0)]
 
@@ -440,7 +444,7 @@ def test_the_container_extends_to_the_index_in_one_pass():
 
     def place(step):
         out: list = []
-        coll = UnsignedSeq(out, cap=span)
+        coll = UnsignedSeq(out, cap=span, max_dyn_array_count=ARRAY_MAX)
         tracemalloc.start()
         try:
             base = tracemalloc.get_traced_memory()[0]
@@ -468,3 +472,38 @@ def test_the_container_extends_to_the_index_in_one_pass():
     # One list of `span` slots is ~8 bytes per slot; anything near a multiple of
     # that is a copy per element.
     assert sparse < span * 8 * 3, f"{sparse} bytes for {span} slots"
+
+
+# --- the cap is the caller's (§6.2.1) ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    "cls", [StringSeq, BytesSeq, UnsignedSeq, SignedSeq, Float32Seq, Float64Seq]
+)
+def test_a_collector_holds_no_limit_of_its_own(cls):
+    """§6.2.1: a collector "MUST NOT supply a default for one it was not given".
+
+    The old signature defaulted ``max_dyn_array_count`` to ``ARRAY_MAX`` -- the
+    format ceiling, which §6.2.1 says a port "MUST NOT present as" a receiver
+    cap. Now the number has to be stated.
+    """
+    with pytest.raises(SofaArgumentError):
+        cls([])
+
+
+def test_the_cap_is_required_even_where_the_schema_bounds_the_array():
+    """``cap=None`` is how a caller says the schema bounds nothing here, which is
+    exactly when a silently-defaulted receiver limit would leave it unbounded --
+    so the argument is required whichever way ``cap`` goes."""
+    with pytest.raises(SofaArgumentError):
+        UnsignedSeq([], cap=4)
+    UnsignedSeq([], cap=4, max_dyn_array_count=8)     # stated: accepted
+
+
+def test_a_missing_cap_is_an_argument_error_not_a_limit_rejection():
+    """§6.3: ``LimitExceeded`` would promise a limit to raise that was never
+    configured, so the refusal is the ``InvalidArgument`` tier."""
+    with pytest.raises(SofaError) as exc:
+        NestedSeq([], factory=Row)
+    assert not isinstance(exc.value, SofaLimitError)
+    assert isinstance(exc.value, SofaArgumentError)

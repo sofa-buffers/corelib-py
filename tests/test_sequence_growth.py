@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
 from vectors import ENCODER_ENGINES as ENCODERS
+from vectors import NO_CAPS
 
 from sofab import NestedSeq, SofaLimitError, Status, StringSeq, Visitor
 
@@ -124,7 +125,7 @@ def test_sequence_growth_case(case, enc_cls, dec_cls):
     assert "dynamic_arrays" in case["requires"], case["name"]
     wire = _build(enc_cls, case)
     out: list = []
-    dec = dec_cls(visitor=collector_for(case, out))
+    dec = dec_cls(**NO_CAPS, visitor=collector_for(case, out))
     expect = case["expect"]
 
     if expect["outcome"] == "limit_exceeded":

@@ -186,7 +186,9 @@ class Handler(Visitor):
     def on_unsigned(self, field_id, value): ...
     def on_string(self, field_id, value): ...
 
-dec = Decoder(visitor=Handler())
+dec = Decoder(visitor=Handler(),                     # the three caps are required
+              max_dyn_array_count=65536,             # see "Decode limits" below
+              max_dyn_string_len=1 << 20, max_dyn_blob_len=1 << 20)
 for chunk in socket_chunks():
     st = dec.feed(chunk)
     if st is Status.INVALID:
@@ -364,9 +366,12 @@ So there is one buffer, sized once and never grown. Name its size, or hand over
 the storage:
 
 ```python
-dec = Decoder(visitor=handler, reassembly=64 * 1024)          # decoder sizes it
-dec = Decoder(visitor=handler, reassembly=bytearray(1 << 20))  # or you do
-dec = Decoder(visitor=handler)                     # sofab.DEFAULT_REASSEMBLY
+caps = dict(max_dyn_array_count=65536,           # required; see "Decode limits"
+            max_dyn_string_len=1 << 20, max_dyn_blob_len=1 << 20)
+
+dec = Decoder(visitor=handler, reassembly=64 * 1024, **caps)          # decoder sizes it
+dec = Decoder(visitor=handler, reassembly=bytearray(1 << 20), **caps)  # or you do
+dec = Decoder(visitor=handler, **caps)                     # sofab.DEFAULT_REASSEMBLY
 ```
 
 The pieces are copied into that buffer as they arrive, and a construct that does
@@ -458,7 +463,8 @@ b = (Binding()
 
 words = bytearray(b.tree_words_required * 8)     # you allocate; you size it
 objs = [None] * b.tree_objects_required
-dec = Decoder(binding=b, words=words, objects=objs)
+dec = Decoder(binding=b, words=words, objects=objs,
+              max_dyn_array_count=65536, max_dyn_string_len=1 << 20, max_dyn_blob_len=1 << 20)
 dec.feed(payload)
 
 u = memoryview(words).cast("Q")                  # as many typed views as you like
@@ -516,7 +522,8 @@ class Telemetry(Visitor):
         return (b, self.words, self.objects)
 
 t = Telemetry()
-Decoder(visitor=t).feed(payload)             # one handler argument, nothing else
+Decoder(visitor=t, max_dyn_array_count=65536,   # one handler argument, plus the caps
+        max_dyn_string_len=1 << 20, max_dyn_blob_len=1 << 20).feed(payload)
 assert memoryview(t.words).cast("Q")[0] == u[0]
 ```
 
@@ -560,10 +567,19 @@ class Point:
         if u[3]:
             self.y = q[1]
 
+    # The receiver caps generated code bakes in from the sofabgen config: the
+    # numbers are the generated layer's, never the codec's (§6.2.1).
+    MAX_DYN_ARRAY_COUNT = 65536
+    MAX_DYN_STRING_LEN = 1 << 20
+    MAX_DYN_BLOB_LEN = 1 << 20
+
     @classmethod
     def decoder(cls):                           # §6.1.1: the streaming reader
         words = bytearray(cls.BINDING.tree_words_required * 8)
-        return Decoder(binding=cls.BINDING, words=words), words
+        return Decoder(binding=cls.BINDING, words=words,
+                       max_dyn_array_count=cls.MAX_DYN_ARRAY_COUNT,
+                       max_dyn_string_len=cls.MAX_DYN_STRING_LEN,
+                       max_dyn_blob_len=cls.MAX_DYN_BLOB_LEN), words
 
     def encode(self) -> bytes:                  # one-shot wrapper over serialize()
         e = Encoder()
@@ -614,12 +630,21 @@ whether more can still come.
 A field the schema leaves unbounded lets the *sender* decide what the *receiver*
 allocates, so every decoder carries **receiver-side** limits that reject an
 oversize field on its count/length word alone — *before* any allocation or
-payload buffering:
+payload buffering. **All three are required constructor arguments:**
 
 ```python
 dec = Decoder(binding=b, words=words,
               max_dyn_array_count=65536, max_dyn_string_len=1 << 20, max_dyn_blob_len=1 << 20)
 ```
+
+Required, because the numbers are **yours**. CORELIB_PLAN §6.2.1 lets the codec
+perform the comparison — "a corelib **MAY** take a limit as an argument and
+perform the check itself" — but not own the number: it "**MUST NOT** hold a limit
+of its own, **MUST NOT** supply a default for one it was not given, **MUST NOT**
+read an omitted argument as *unlimited*, and **MUST NOT** clamp to one". Omitting
+one raises `SofaArgumentError` (§6.3's `InvalidArgument`), never
+`SofaLimitError`, which would promise a limit to raise that was never
+configured.
 
 A field whose declared count/length exceeds its limit raises `SofaLimitError`: a
 *policy* rejection, distinct from malformed input, and a sibling of
@@ -636,11 +661,14 @@ is the `INCOMPLETE` outcome, which §6.3 is explicit is not an error at all.
 an alias.
 
 **There is no unset state and no unlimited mode.** `None` is refused rather than
-read as "no limit". Each defaults to the format-wide ceiling — `ARRAY_MAX` for
+read as "no limit", and there is no default to fall back on. A caller that wants
+the widest limit there is states the format-wide ceiling itself — `ARRAY_MAX` for
 the count, `FIXLEN_MAX` for the two lengths — above which the value is already
-`INVALID`, so the default configuration rejects nothing a looser one would
-accept. `0` is a real setting, not an unset one. The numbers are supplied by
-generated code, which knows the schema and the deployment.
+`INVALID`, so that configuration rejects nothing a looser one would accept. That
+is then *your* number: a ceiling reached because nobody stated a cap is the
+**format's** bound, not a receiver cap, and §6.2.1 forbids a codec from
+presenting it as one. `0` is a real setting, not an unset one. The numbers are
+supplied by generated code, which knows the schema and the deployment.
 
 Independent of any limit, the decoder never pre-allocates from an untrusted array
 count — a truncated oversize claim fails promptly as an `INCOMPLETE`.

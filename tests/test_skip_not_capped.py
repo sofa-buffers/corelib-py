@@ -34,7 +34,7 @@ import pytest
 from vectors import DECODER_ENGINES as ENGINES
 from vectors import Recorder, Status, bound, walk
 
-from sofab import Binding, Encoder, SofaArgumentError, SofaLimitError
+from sofab import ARRAY_MAX, FIXLEN_MAX, Binding, Encoder, SofaArgumentError, SofaLimitError
 
 # The issue's own message: a 100-byte blob at id 7 the handler does not want,
 # with a cap of 10 -- and a plain field on either side of it, so a skip that
@@ -140,7 +140,7 @@ def test_the_callers_reassembly_buffer_is_what_bounds_a_skip(engine):
     assert status is Status.COMPLETE
     assert rec.events == NEIGHBOURS
 
-    dec = engine(
+    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, 
         visitor=Recorder(decline=lambda f: f.id == 7),
         max_dyn_blob_len=CAP,
         reassembly=bytearray(16),
@@ -156,7 +156,7 @@ def test_the_cap_still_fires_on_the_route_that_allocates(engine):
     been removed: the same bytes, the same limit, a handler that takes the
     default. Nothing but a ``bytes`` of the decoder's own can hold the payload,
     and the wire is the only size it could build one from."""
-    dec = engine(visitor=Recorder(), max_dyn_blob_len=CAP)
+    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Recorder(), max_dyn_blob_len=CAP)
     with pytest.raises(SofaLimitError):
         dec.feed(_msg())
 

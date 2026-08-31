@@ -18,7 +18,9 @@ from typing import Callable
 import pytest
 
 from sofab import (
+    ARRAY_MAX,
     DEFAULT_REASSEMBLY,
+    FIXLEN_MAX,
     Binding,
     Encoder,
     Field,
@@ -30,12 +32,38 @@ from sofab import (
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
 
+# --- the receiver caps every decoder in this suite is built with ------------
+
+# CORELIB_PLAN §6.2.1: the three ``max_dyn_*`` caps are the CALLER's numbers and
+# a Decoder has no default for them -- "a codec MUST NOT supply a default for one
+# it was not given" -- so every construction in this suite has to state all three.
+# These are the format ceilings (§6.2), which is the widest a limit can be while
+# still being one: at the ceiling a cap cannot fire, because a larger value is
+# already INVALID before the check is reached. That is what almost every test
+# here wants, since almost none of them are about the caps.
+#
+# Stating them here rather than defaulting them in the library is the whole
+# point of the change: the ceiling is the format's bound, not a receiver cap,
+# and the number is on the caller either way.
+NO_CAPS = {
+    "max_dyn_array_count": ARRAY_MAX,
+    "max_dyn_string_len": FIXLEN_MAX,
+    "max_dyn_blob_len": FIXLEN_MAX,
+}
+
+
+def capped(**kw):
+    """``NO_CAPS`` with ``kw`` layered on: the caps a test actually cares about."""
+    return {**NO_CAPS, **kw}
+
+
 # --- the shared conformance vectors -----------------------------------------
 
 # Re-exported so a suite building a binding imports one name from one place.
 # ``ruff`` would otherwise read Binding as unused here and drop it.
 __all__ = [
     "DBL_MAX", "DECODER_ENGINES", "ENCODER_ENGINES", "ENGINE_PAIRS", "FLT_MAX",
+    "NO_CAPS", "capped",
     "FP64_FROM_FLOAT", "FULL_SCALE_EXPECTED", "VECTORS", "VECTOR_DOC",
     "Binding", "Recorder", "Slots", "Status", "Visitor",
     "WireType",
@@ -177,7 +205,9 @@ def walk(dec_cls, data: bytes, chunk: int | None = None, **kw):
     # vectors has room and the tests exercise the wire rather than the buffer.
     # Tests about the buffer itself pass their own.
     kw.setdefault("reassembly", max(len(data) + 16, DEFAULT_REASSEMBLY))
-    dec = dec_cls(visitor=rec, **kw)
+    # The caps are the caller's and have no default (§6.2.1); this helper is the
+    # caller, so it states them. A test that is about a cap passes its own.
+    dec = dec_cls(visitor=rec, **capped(**kw))
     status = Status.COMPLETE
     if chunk is None:
         status = dec.feed(data)
@@ -238,7 +268,7 @@ def bound(dec_cls, data: bytes, binding, chunk: int | None = None, **kw):
     """
     words = bytearray(binding.tree_words_required * 8)
     objects: list = [None] * binding.tree_objects_required
-    dec = dec_cls(binding=binding, words=words, objects=objects, **kw)
+    dec = dec_cls(binding=binding, words=words, objects=objects, **capped(**kw))
     status = Status.COMPLETE
     if chunk is None:
         status = dec.feed(data)

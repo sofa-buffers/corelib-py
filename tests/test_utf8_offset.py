@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
-from vectors import Recorder, Status, raise_for, uvarint, values, verdict, walk
+from vectors import NO_CAPS, Recorder, Status, raise_for, uvarint, values, verdict, walk
 
 from sofab import (
     Encoder,
@@ -82,7 +82,7 @@ def _stalling(engine, data: bytes, chunk: int = 1):
     a resumed read starts from every possible offset into the payload.
     """
     rec = Recorder()
-    dec = engine(visitor=rec)
+    dec = engine(**NO_CAPS, visitor=rec)
     status = Status.COMPLETE
     for off in range(0, len(data), chunk):
         dec.feed(b"")
