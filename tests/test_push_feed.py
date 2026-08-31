@@ -12,9 +12,9 @@ every one of those. The binding destinations get their own suite
 from __future__ import annotations
 
 import pytest
-from vectors import DECODER_ENGINES, ENGINE_PAIRS, VECTORS
+from vectors import DECODER_ENGINES, ENGINE_PAIRS, NO_CAPS, VECTORS
 
-from sofab import Binding, SofaArgumentError, SofaLimitError, Status, Visitor
+from sofab import FIXLEN_MAX, Binding, SofaArgumentError, SofaLimitError, Status, Visitor
 
 
 class Collect(Visitor):
@@ -87,7 +87,7 @@ def sample(enc_cls) -> bytes:
 @pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
 def test_a_whole_message_is_complete(enc_cls, dec_cls):
     v = Collect()
-    assert dec_cls(visitor=v).feed(sample(enc_cls)) is Status.COMPLETE
+    assert dec_cls(**NO_CAPS, visitor=v).feed(sample(enc_cls)) is Status.COMPLETE
 
 
 @pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
@@ -98,7 +98,7 @@ def test_no_prefix_of_a_valid_message_is_invalid(enc_cls, dec_cls):
     has in common is only that none of them is INVALID."""
     msg = sample(enc_cls)
     for cut in range(1, len(msg)):
-        dec = dec_cls(visitor=Collect())
+        dec = dec_cls(**NO_CAPS, visitor=Collect())
         assert dec.feed(msg[:cut]) is not Status.INVALID, cut
         assert dec.error is None
 
@@ -113,7 +113,7 @@ def test_a_cut_inside_a_construct_is_incomplete(enc_cls, dec_cls):
     msg = enc.getvalue()
     for cut in range(1, len(msg)):
         v = Collect()
-        dec = dec_cls(visitor=v)
+        dec = dec_cls(**NO_CAPS, visitor=v)
         assert dec.feed(msg[:cut]) is Status.INCOMPLETE, cut
         assert v.events == []
 
@@ -125,10 +125,10 @@ def test_feeding_the_rest_completes_the_message(enc_cls, dec_cls):
     error (§5.2, §7.2 item 4)."""
     msg = sample(enc_cls)
     whole = Collect()
-    dec_cls(visitor=whole).feed(msg)
+    dec_cls(**NO_CAPS, visitor=whole).feed(msg)
     for cut in range(1, len(msg)):
         split = Collect()
-        dec = dec_cls(visitor=split)
+        dec = dec_cls(**NO_CAPS, visitor=split)
         assert dec.feed(msg[:cut]) is not Status.INVALID
         assert dec.feed(msg[cut:]) is Status.COMPLETE
         assert split.events == whole.events, cut
@@ -138,9 +138,9 @@ def test_feeding_the_rest_completes_the_message(enc_cls, dec_cls):
 def test_one_byte_at_a_time_decodes_the_same(enc_cls, dec_cls):
     msg = sample(enc_cls)
     whole = Collect()
-    dec_cls(visitor=whole).feed(msg)
+    dec_cls(**NO_CAPS, visitor=whole).feed(msg)
     drip = Collect()
-    dec = dec_cls(visitor=drip)
+    dec = dec_cls(**NO_CAPS, visitor=drip)
     st = None
     for i in range(len(msg)):
         st = dec.feed(msg[i : i + 1])
@@ -159,7 +159,7 @@ def test_one_byte_at_a_time_decodes_the_same(enc_cls, dec_cls):
     ],
 )
 def test_malformed_input_is_invalid(dec_cls, data, what):
-    dec = dec_cls(visitor=Collect())
+    dec = dec_cls(**NO_CAPS, visitor=Collect())
     assert dec.feed(data) is Status.INVALID, what
     assert dec.error is not None
 
@@ -168,7 +168,7 @@ def test_malformed_input_is_invalid(dec_cls, data, what):
 def test_invalid_is_terminal(dec_cls):
     """§5.2: INVALID means no continuation of bytes can make the stream valid,
     so the decoder stays there rather than resynchronising."""
-    dec = dec_cls(visitor=Collect())
+    dec = dec_cls(**NO_CAPS, visitor=Collect())
     assert dec.feed(b"\x3f") is Status.INVALID
     reason = dec.error
     assert dec.feed(b"\x08\x01") is Status.INVALID
@@ -183,7 +183,7 @@ def test_an_open_sequence_at_end_of_input_is_incomplete(enc_cls, dec_cls):
     enc.write_sequence_begin_lazy(1)
     enc.write_unsigned(2, 5)
     enc.flush()
-    dec = dec_cls(visitor=Collect())
+    dec = dec_cls(**NO_CAPS, visitor=Collect())
     assert dec.feed(enc.getvalue()) is Status.INCOMPLETE
     assert dec.error is None
 
@@ -192,13 +192,13 @@ def test_an_open_sequence_at_end_of_input_is_incomplete(enc_cls, dec_cls):
 def test_a_lone_continuation_byte_is_incomplete(dec_cls):
     """§5.2 names this one explicitly: 0x80 is a well-formed *prefix* of a
     varint, so it is INCOMPLETE, not INVALID."""
-    dec = dec_cls(visitor=Collect())
+    dec = dec_cls(**NO_CAPS, visitor=Collect())
     assert dec.feed(b"\x80") is Status.INCOMPLETE
 
 
 @pytest.mark.parametrize("dec_cls", DECODER_ENGINES)
 def test_status_reports_the_last_outcome(dec_cls):
-    dec = dec_cls(visitor=Collect())
+    dec = dec_cls(**NO_CAPS, visitor=Collect())
     assert dec.status is Status.COMPLETE
     dec.feed(b"\x80")
     assert dec.status is Status.INCOMPLETE
@@ -208,7 +208,7 @@ def test_status_reports_the_last_outcome(dec_cls):
 def test_there_is_no_finalize_step(dec_cls):
     """§5.2: a decoder MUST NOT provide a finish/finalize that reclassifies
     INCOMPLETE. Nothing on the object may promote a truncation to an error."""
-    dec = dec_cls(visitor=Collect())
+    dec = dec_cls(**NO_CAPS, visitor=Collect())
     for name in ("finish", "finalize", "end", "close", "eof"):
         assert not hasattr(dec, name), name
 
@@ -224,10 +224,10 @@ def test_a_fed_chunk_may_be_overwritten_afterwards(enc_cls, dec_cls, chunk):
     from a bytearray that is then scribbled over is the direct test."""
     msg = sample(enc_cls)
     whole = Collect()
-    dec_cls(visitor=whole).feed(msg)
+    dec_cls(**NO_CAPS, visitor=whole).feed(msg)
 
     got = Collect()
-    dec = dec_cls(visitor=got, reassembly=len(msg) + 16)
+    dec = dec_cls(**NO_CAPS, visitor=got, reassembly=len(msg) + 16)
     scratch = bytearray(chunk)
     view = memoryview(scratch)
     for off in range(0, len(msg), chunk):
@@ -248,7 +248,7 @@ def test_feed_accepts_any_buffer(dec_cls):
     msg = b"\x08\xac\x02"
     for shape in (msg, bytearray(msg), memoryview(msg)):
         v = Collect()
-        assert dec_cls(visitor=v).feed(shape) is Status.COMPLETE
+        assert dec_cls(**NO_CAPS, visitor=v).feed(shape) is Status.COMPLETE
         assert v.events == [("u", 1, 300)]
 
 
@@ -267,7 +267,7 @@ def test_feed_is_not_re_entrant(dec_cls):
         def on_unsigned(self, field_id, value):
             dec.feed(b"\x08\x01")
 
-    dec = dec_cls(visitor=Reentrant())
+    dec = dec_cls(**NO_CAPS, visitor=Reentrant())
     with pytest.raises(SofaArgumentError):
         dec.feed(b"\x08\x01")
 
@@ -276,7 +276,7 @@ def test_feed_is_not_re_entrant(dec_cls):
 def test_reset_starts_a_new_message(enc_cls, dec_cls):
     msg = sample(enc_cls)
     v = Collect()
-    dec = dec_cls(visitor=v)
+    dec = dec_cls(**NO_CAPS, visitor=v)
     assert dec.feed(msg) is Status.COMPLETE
     n = len(v.events)
     dec.reset()
@@ -286,7 +286,7 @@ def test_reset_starts_a_new_message(enc_cls, dec_cls):
 
 @pytest.mark.parametrize("dec_cls", DECODER_ENGINES)
 def test_reset_clears_a_terminal_invalid(dec_cls):
-    dec = dec_cls(visitor=Collect())
+    dec = dec_cls(**NO_CAPS, visitor=Collect())
     assert dec.feed(b"\x3f") is Status.INVALID
     dec.reset()
     assert dec.error is None
@@ -304,7 +304,7 @@ def test_a_receiver_cap_is_raised_not_folded_into_invalid(enc_cls, dec_cls):
     enc = enc_cls()
     enc.write_unsigned_array(1, [1, 2, 3, 4, 5])
     enc.flush()
-    dec = dec_cls(visitor=Collect(), max_dyn_array_count=2)
+    dec = dec_cls(max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Collect(), max_dyn_array_count=2)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
 
@@ -321,10 +321,10 @@ def test_a_declared_bound_takes_the_receiver_cap_off_the_field(enc_cls, dec_cls)
     msg = enc.getvalue()
     b = Binding().unsigned_array(1, at=0, cap=8, count_at=8)
     words = bytearray(b.tree_words_required * 8)
-    assert dec_cls(binding=b, words=words, max_dyn_array_count=2).feed(msg) is Status.COMPLETE
+    assert dec_cls(max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, binding=b, words=words, max_dyn_array_count=2).feed(msg) is Status.COMPLETE
 
     tight = Binding().unsigned_array(1, at=0, cap=3, count_at=8)
-    dec = dec_cls(binding=tight, words=bytearray(tight.tree_words_required * 8))
+    dec = dec_cls(**NO_CAPS, binding=tight, words=bytearray(tight.tree_words_required * 8))
     assert dec.feed(msg) is Status.INVALID
 
 
@@ -341,11 +341,11 @@ def test_every_decode_vector_is_chunking_independent(dec_cls, chunk):
             continue
         data = bytes.fromhex(vec["bytes"])
         want = Collect()
-        if dec_cls(visitor=want).feed(data) is not Status.COMPLETE:
+        if dec_cls(**NO_CAPS, visitor=want).feed(data) is not Status.COMPLETE:
             continue  # the vector set includes malformed input
 
         got = Collect()
-        dec = dec_cls(visitor=got)
+        dec = dec_cls(**NO_CAPS, visitor=got)
         st = Status.COMPLETE
         for off in range(0, len(data), chunk):
             st = dec.feed(data[off : off + chunk])
@@ -383,7 +383,7 @@ def test_a_declined_field_that_straddles_a_chunk_does_not_replay(enc_cls, dec_cl
     wire = enc.getvalue()
 
     rec = _DecliningCollect(5)
-    dec = dec_cls(visitor=rec)
+    dec = dec_cls(**NO_CAPS, visitor=rec)
     status = Status.COMPLETE
     for off in range(0, len(wire), chunk):
         status = dec.feed(wire[off : off + chunk])
@@ -417,5 +417,5 @@ def test_a_truncated_fixlen_payload_is_incomplete(enc_cls, dec_cls):
     enc.flush()
     cut = enc.getvalue()[:-10]
 
-    assert dec_cls(visitor=Collect()).feed(cut) is Status.INCOMPLETE
-    assert dec_cls(visitor=_DecliningCollect(1)).feed(cut) is Status.INCOMPLETE
+    assert dec_cls(**NO_CAPS, visitor=Collect()).feed(cut) is Status.INCOMPLETE
+    assert dec_cls(**NO_CAPS, visitor=_DecliningCollect(1)).feed(cut) is Status.INCOMPLETE

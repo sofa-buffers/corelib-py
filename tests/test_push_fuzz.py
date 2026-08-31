@@ -15,7 +15,7 @@ import random
 
 import pytest
 from test_push_feed import Collect
-from vectors import ENGINE_PAIRS
+from vectors import ENGINE_PAIRS, NO_CAPS
 
 from sofab import Binding, Status, Visitor
 
@@ -82,10 +82,10 @@ def test_push_visitor_is_chunking_independent(enc_cls, dec_cls, chunk):
     for seed in range(SEEDS):
         msg = _message(enc_cls, seed)
         want = Collect()
-        assert dec_cls(visitor=want).feed(msg) is Status.COMPLETE
+        assert dec_cls(**NO_CAPS, visitor=want).feed(msg) is Status.COMPLETE
 
         got = Collect()
-        dec = dec_cls(visitor=got)
+        dec = dec_cls(**NO_CAPS, visitor=got)
         st = Status.COMPLETE
         for off in range(0, len(msg), chunk):
             st = dec.feed(msg[off : off + chunk])
@@ -189,7 +189,7 @@ class _LastPerScope(Visitor):
 
 def _visitor_last(dec_cls, msg: bytes) -> dict:
     v = _LastPerScope()
-    assert dec_cls(visitor=v).feed(msg) is Status.COMPLETE
+    assert dec_cls(**NO_CAPS, visitor=v).feed(msg) is Status.COMPLETE
     return v.out
 
 
@@ -227,7 +227,7 @@ def test_bound_destinations_match_the_visitor(enc_cls, dec_cls, chunk):
 
         words = bytearray(binding.tree_words_required * 8)
         objects: list = [None] * binding.tree_objects_required
-        dec = dec_cls(binding=binding, words=words, objects=objects)
+        dec = dec_cls(**NO_CAPS, binding=binding, words=words, objects=objects)
         st = Status.COMPLETE
         for off in range(0, len(msg), chunk):
             st = dec.feed(msg[off : off + chunk])

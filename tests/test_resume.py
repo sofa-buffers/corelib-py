@@ -15,7 +15,7 @@ call, so every chunk boundary in the message becomes a suspension point.
 from __future__ import annotations
 
 import pytest
-from vectors import FULL_SCALE_EXPECTED, VECTORS, Recorder, Status, values
+from vectors import FULL_SCALE_EXPECTED, NO_CAPS, VECTORS, Recorder, Status, values
 
 from sofab import Decoder, Encoder, WireType
 
@@ -31,7 +31,7 @@ class Feed:
 
     def __init__(self, dec_cls=None, **kw) -> None:
         self.rec = Recorder()
-        self.dec = (dec_cls or Decoder)(visitor=self.rec, **kw)
+        self.dec = (dec_cls or Decoder)(**NO_CAPS, visitor=self.rec, **kw)
         self.status = Status.COMPLETE
 
     def push(self, data: bytes) -> Status:
@@ -170,7 +170,7 @@ def test_skipping_a_truncated_sequence_resumes():
         # A handler that declines the outer sequence: the decoder walks the whole
         # sub-tree, which spans many fields and so must be all-or-nothing.
         f.rec = Recorder(decline=lambda fld: fld.id == 3)
-        f.dec = Decoder(visitor=f.rec)
+        f.dec = Decoder(**NO_CAPS, visitor=f.rec)
         f.push(wire[:cut])
         assert f.push(wire[cut:]) is Status.COMPLETE, f"cut={cut}"
         assert ("u", 9, 5) in f.events

@@ -45,7 +45,22 @@ import sys
 import time
 from typing import Callable
 
-from sofab import IMPL, Decoder, Encoder, Visitor
+from sofab import ARRAY_MAX, FIXLEN_MAX, IMPL, Decoder, Encoder, Visitor
+
+# CORELIB_PLAN §6.2.1: the three receiver caps are the CALLER's numbers and a
+# Decoder has no default for them -- "a codec MUST NOT supply a default for one
+# it was not given" -- so every construction below states all three. They are the
+# format ceilings (§6.2), at which a cap cannot fire, because a larger value is
+# already INVALID before the check is reached: a benchmark measures the decode,
+# not a policy.
+#
+# Written out as three keyword arguments rather than unpacked from a dict: that
+# is the form generated code emits, so it is the form the rows should measure.
+# (Under Callgrind the two are within this harness's own run-to-run drift.)
+CAP_ARR = ARRAY_MAX
+CAP_STR = FIXLEN_MAX
+CAP_BLOB = FIXLEN_MAX
+
 
 N = 1000
 GOLDEN = 0x9E3779B97F4A7C15
@@ -115,7 +130,9 @@ class _U64ArraySink(Visitor):
 
 def decode_u64_array(data: bytes) -> int:
     sink = _U64ArraySink()
-    Decoder(visitor=sink).feed(data)
+    Decoder(max_dyn_array_count=CAP_ARR,
+            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+            visitor=sink).feed(data)
     return sink.acc
 
 
@@ -147,7 +164,9 @@ class _TypicalSink(Visitor):
 
 def decode_typical(data: bytes) -> int:
     sink = _TypicalSink()
-    Decoder(visitor=sink).feed(data)
+    Decoder(max_dyn_array_count=CAP_ARR,
+            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+            visitor=sink).feed(data)
     return sink.acc
 
 
@@ -250,7 +269,9 @@ def decode_blob(data: bytes) -> int:
     # The reassembly buffer is the caller's (CORELIB_PLAN §6.6.2) and this
     # caller knows what it is streaming: a megabyte payload arriving in 4 KiB
     # pieces has to be joined somewhere, and the decoder never grows its own.
-    dec = Decoder(visitor=sink, reassembly=len(data) + STREAM_BUFFER)
+    dec = Decoder(max_dyn_array_count=CAP_ARR,
+                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                  visitor=sink, reassembly=len(data) + STREAM_BUFFER)
     for off in range(0, len(data), STREAM_BUFFER):
         dec.feed(data[off : off + STREAM_BUFFER])
     return sink.acc
@@ -332,7 +353,9 @@ class _CompositeSink(Visitor):
 def decode_composite(data: bytes) -> int:
     """Whole message, all fields read."""
     sink = _CompositeSink()
-    Decoder(visitor=sink).feed(data)
+    Decoder(max_dyn_array_count=CAP_ARR,
+            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+            visitor=sink).feed(data)
     return sink.acc
 
 
@@ -358,7 +381,9 @@ def decode_composite_skip(data: bytes) -> int:
     """Same bytes, every field and sub-sequence skipped — the path a router or a
     filter runs: walk the message, materialize nothing."""
     sink = _SkipAllSink()
-    Decoder(visitor=sink).feed(data)
+    Decoder(max_dyn_array_count=CAP_ARR,
+            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+            visitor=sink).feed(data)
     return sink.n
 
 
@@ -594,7 +619,9 @@ class _PerfSink(Visitor):
 def decode_perf(data: bytes) -> int:
     """Decode the perf message, folding every value into a checksum."""
     sink = _PerfSink()
-    Decoder(visitor=sink).feed(data)
+    Decoder(max_dyn_array_count=CAP_ARR,
+            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+            visitor=sink).feed(data)
     return sink.acc
 
 

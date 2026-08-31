@@ -169,6 +169,30 @@ def _width_fits(itemsize: int, zigzag: bool, lo: int | None, hi: int | None) -> 
     return hi is not None and hi < (1 << bits)
 
 
+def _stated_limit(name: str, value: int | None, ceiling: int) -> int:
+    """Take a receiver cap the **caller** stated, or refuse the call (§6.2.1).
+
+    §6.2.1 fixes the provenance of the number even where the comparison runs
+    inside the codec: a codec "**MUST NOT** hold a limit of its own, **MUST NOT**
+    supply a default for one it was not given, **MUST NOT** read an omitted
+    argument as *unlimited*, and **MUST NOT** clamp to one". A format ceiling
+    (§6.2) reached because no cap was stated is the *format's* bound, not a
+    receiver cap, so it cannot stand in for one either.
+
+    An omitted cap is therefore a defect in the **call**, and §6.3 puts a defect
+    in the call in the ``InvalidArgument`` tier — never ``LimitExceeded``, which
+    would promise a limit to raise that was never configured.
+    """
+    if value is None:
+        raise SofaArgumentError(
+            f"{name} is required (§6.2.1): the codec holds no limit of its own "
+            f"and reads no omitted argument as unlimited"
+        )
+    if value < 0 or value > ceiling:
+        raise SofaArgumentError(f"{name}={value} is outside 0..{ceiling}")
+    return value
+
+
 class Decoder:
     """Decodes a SofaBuffers stream, pushing each field at a handler.
 
@@ -253,9 +277,9 @@ class Decoder:
         visitor: Visitor | None = None,
         words: Any = None,
         objects: list[Any] | None = None,
-        max_dyn_array_count: int = ARRAY_MAX,
-        max_dyn_string_len: int = FIXLEN_MAX,
-        max_dyn_blob_len: int = FIXLEN_MAX,
+        max_dyn_array_count: int | None = None,
+        max_dyn_string_len: int | None = None,
+        max_dyn_blob_len: int | None = None,
         reassembly: Any = None,
     ) -> None:
         """Build a push decoder around a field handler (CORELIB_PLAN §5.2).
@@ -282,6 +306,19 @@ class Decoder:
         count/length header — before any allocation or payload buffering, so a
         hostile claim fails even if the payload never arrives.
 
+        **All three are required.** §6.2.1 lets the codec *perform* the
+        comparison — "a corelib **MAY** take a limit as an argument and perform
+        the check itself" — but the number stays the caller's: the codec "**MUST
+        NOT** hold a limit of its own, **MUST NOT** supply a default for one it
+        was not given, **MUST NOT** read an omitted argument as *unlimited*, and
+        **MUST NOT** clamp to one". Omitting one — or passing ``None`` — is a
+        defect in the call and raises :class:`SofaArgumentError` (§6.3's
+        ``InvalidArgument`` tier), never :class:`SofaLimitError`, which would
+        promise a limit to raise that was never configured. A caller that wants
+        the widest limit the format admits states the ceiling itself
+        (``max_dyn_array_count=sofab.ARRAY_MAX``); that is then the caller's
+        number, not the codec's default.
+
         What they bound is what **this decoder** allocates, which §6.2.1 states
         as their whole purpose: an unbounded field "would let the *sender*
         dictate the *receiver's* allocation". So they govern the default route,
@@ -295,12 +332,9 @@ class Decoder:
         :class:`SofaArgumentError` rather than a policy rejection.
 
         **There is no unset state and no unlimited mode** (§6.2.1): "unbounded by
-        the schema" is still bounded by the receiver. ``None`` is refused rather
-        than read as "no limit", and each defaults to the format-wide ceiling
-        above which the value is already INVALID (§6.2) — the widest a limit can
-        be while still being one. The numbers themselves belong to generated
-        code, which knows the schema and the deployment; the codec neither
-        invents a policy of its own nor clamps to one.
+        the schema" is still bounded by the receiver. The numbers themselves
+        belong to generated code, which knows the schema and the deployment; the
+        codec neither invents a policy of its own nor clamps to one.
 
         They never apply to a field the handler declares a schema bound for —
         a ``maxlen``/``cap`` on a binding entry, or a
@@ -327,31 +361,25 @@ class Decoder:
         """
         if binding is None and visitor is None:
             raise SofaArgumentError("a decoder needs a field handler (binding / visitor)")
-        for name, value, ceiling in (
-            ("max_dyn_array_count", max_dyn_array_count, ARRAY_MAX),
-            ("max_dyn_string_len", max_dyn_string_len, FIXLEN_MAX),
-            ("max_dyn_blob_len", max_dyn_blob_len, FIXLEN_MAX),
-        ):
-            if value is ceiling:
-                continue  # a default: the ceiling is what the check would accept
-            if value is None:
-                raise SofaArgumentError(f"{name} has no unset state (§6.2.1)")
-            if value < 0 or value > ceiling:
-                raise SofaArgumentError(
-                    f"{name}={value} is outside 0..{ceiling}"
-                )
-        self._max_dyn_array_count = max_dyn_array_count
-        self._max_dyn_string_len = max_dyn_string_len
-        self._max_dyn_blob_len = max_dyn_blob_len
+        # §6.2.1: the numbers are the caller's, and there is no default to fall
+        # back on -- omitting one is refused here rather than resolved to the
+        # format ceiling, which is the format's bound and not a receiver cap.
+        # Written out rather than looped: a decoder is constructed per message on
+        # the one-shot path, and a Python-level loop over three tuples is a
+        # measurable share of that.
+        arr_cap = _stated_limit("max_dyn_array_count", max_dyn_array_count, ARRAY_MAX)
+        str_cap = _stated_limit("max_dyn_string_len", max_dyn_string_len, FIXLEN_MAX)
+        blob_cap = _stated_limit("max_dyn_blob_len", max_dyn_blob_len, FIXLEN_MAX)
+        self._max_dyn_array_count = arr_cap
+        self._max_dyn_string_len = str_cap
+        self._max_dyn_blob_len = blob_cap
         # Whether any limit is tighter than the ceiling the format already
         # enforces. At the ceiling a limit cannot fire — a longer value is
         # INVALID before the check is reached — so the header walk can skip the
         # whole block, which otherwise costs a subtype test, an attribute load
         # and a comparison for every string, blob and array it passes.
         self._capped = (
-            max_dyn_array_count < ARRAY_MAX
-            or max_dyn_string_len < FIXLEN_MAX
-            or max_dyn_blob_len < FIXLEN_MAX
+            arr_cap < ARRAY_MAX or str_cap < FIXLEN_MAX or blob_cap < FIXLEN_MAX
         )
         # The reassembly buffer, and the span of it currently holding a
         # construct that spans a chunk boundary.

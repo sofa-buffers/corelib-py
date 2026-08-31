@@ -26,7 +26,7 @@ import tracemalloc
 from typing import Any, Callable
 
 import pytest
-from vectors import ENGINE_PAIRS, Binding, Recorder, Status, walk
+from vectors import ENGINE_PAIRS, NO_CAPS, Binding, Recorder, Status, walk
 
 ENGINES = pytest.mark.parametrize(("Encoder", "Decoder"), ENGINE_PAIRS)
 
@@ -53,7 +53,7 @@ def _measure(Decoder: Any, wire: bytes, *, decline: bool) -> int:
     declined. The bytes are handed over in one feed either way, so the two runs
     differ only in whether the payload is materialised."""
     rec = Recorder(decline=(lambda f: f.id == 1) if decline else None)
-    dec = Decoder(visitor=rec)
+    dec = Decoder(**NO_CAPS, visitor=rec)
     return _peak_bytes(lambda: dec.feed(wire))
 
 
@@ -120,7 +120,7 @@ def test_an_unbound_payload_is_not_copied(Encoder: Any, Decoder: Any, build: Any
     control = _control(Decoder, wire)
     b = Binding().unsigned(2, at=0, count_at=1)  # field 1, the payload, is unbound
     words = bytearray(b.tree_words_required * 8)
-    dec = Decoder(binding=b, words=words)
+    dec = Decoder(**NO_CAPS, binding=b, words=words)
     peak = _peak_bytes(lambda: dec.feed(wire))
     assert control - peak > PAYLOAD // 2, (
         f"an unbound payload allocated {peak} bytes against {control} for "

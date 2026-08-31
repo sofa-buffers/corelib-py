@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 
 import pytest
+from vectors import NO_CAPS
 
 from sofab import Encoder
 
@@ -166,7 +167,7 @@ def test_array_begin_example_fills_the_destination(readme: str) -> None:
     got: list = []
     handler = handler_cls()
     handler.on_unsigned_array = lambda fid, vals: got.append((fid, list(vals)))
-    assert Decoder(visitor=handler).feed(enc.getvalue()) is Status.COMPLETE
+    assert Decoder(**NO_CAPS, visitor=handler).feed(enc.getvalue()) is Status.COMPLETE
 
     assert list(handler.ports[:3]) == [1, 2, 0xFFFF]
     assert got == [(8, [1 << 20])], "id 7 went to the destination, not the hook"
@@ -188,7 +189,7 @@ def test_string_begin_example_fills_the_destination(readme: str) -> None:
     enc.write_string(3, "grüß dich")
     enc.write_string(4, "elsewhere")
     enc.flush()
-    assert Decoder(visitor=handler).feed(enc.getvalue()) is Status.COMPLETE
+    assert Decoder(**NO_CAPS, visitor=handler).feed(enc.getvalue()) is Status.COMPLETE
 
     utf8 = "grüß dich".encode()
     assert bytes(handler.name[: len(utf8)]) == utf8
@@ -209,7 +210,7 @@ def test_float_array_begin_example_fills_the_destination(readme: str) -> None:
     enc.write_float64_array(5, [0.5, 1.5, 2.5])
     enc.write_float64_array(6, [9.0])
     enc.flush()
-    assert Decoder(visitor=handler).feed(enc.getvalue()) is Status.COMPLETE
+    assert Decoder(**NO_CAPS, visitor=handler).feed(enc.getvalue()) is Status.COMPLETE
 
     assert list(handler.samples[:3]) == [0.5, 1.5, 2.5]
     assert got == [(6, [9.0])], "id 5 went to the destination, not the hook"
@@ -236,6 +237,6 @@ def test_bit_exact_float_example_round_trips_a_signaling_nan(readme: str) -> Non
     other.flush()
     wire = one.getvalue()[:-4] + snan + other.getvalue()[:-4] + snan
 
-    assert Decoder(visitor=ns["Transcoder"]()).feed(wire) is Status.COMPLETE
+    assert Decoder(**NO_CAPS, visitor=ns["Transcoder"]()).feed(wire) is Status.COMPLETE
     out.flush()
     assert out.getvalue() == wire

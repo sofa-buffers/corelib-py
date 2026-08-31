@@ -1,29 +1,42 @@
-"""§6.2.1: the receiver-side limits are present, finite, and never unset.
+"""§6.2.1: the receiver-side limits are the CALLER's, present, finite, never unset.
 
     There is no unset state and no unlimited mode. Unbounded by the schema is
     still bounded by the receiver.
 
-A decoder therefore always carries all three of ``max_dyn_array_count``,
-``max_dyn_string_len`` and ``max_dyn_blob_len``, and ``None`` is refused rather
-than read as "no limit". The defaults are the format-wide ceilings of §6.2, above
-which the value is already INVALID — the widest a limit can be while still being
-one, and not a policy the codec invented.
+and, on the site of the comparison:
+
+    A codec **MUST NOT** hold a limit of its own, **MUST NOT** supply a default
+    for one it was not given, **MUST NOT** read an omitted argument as
+    *unlimited*, and **MUST NOT** clamp to one.
+
+So a decoder always carries all three of ``max_dyn_array_count``,
+``max_dyn_string_len`` and ``max_dyn_blob_len`` — and carries them because a
+**caller stated them**. All three are required: omitting one, or passing
+``None``, is a defect in the call and lands in §6.3's ``InvalidArgument`` tier
+(:class:`SofaArgumentError`), never in ``LimitExceeded``, which would promise a
+limit to raise that was never configured.
+
+The format ceilings of §6.2 are **not** a stand-in for an unstated cap. A caller
+may state a ceiling as its limit — at the ceiling a limit cannot fire, since a
+larger value is already INVALID before the check is reached — but that is then
+the caller's number, and a decode with no number at all does not happen.
 
 What the limits *do* once set is the subject of ``test_schema_bounded.py``; this
-file is about their existence and their domain.
+file is about their provenance, their existence and their domain.
 """
 
 from __future__ import annotations
 
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
-from vectors import Recorder
+from vectors import NO_CAPS, Recorder, capped
 
 from sofab import (
     ARRAY_MAX,
     FIXLEN_MAX,
     Encoder,
     SofaArgumentError,
+    SofaError,
     SofaLimitError,
     Status,
 )
@@ -38,9 +51,46 @@ CEILINGS = {
 
 @pytest.mark.parametrize("engine", ENGINES)
 @pytest.mark.parametrize("name", NAMES)
+def test_an_omitted_limit_is_refused(engine, name):
+    """The codec supplies no default for a limit it was not given (§6.2.1).
+
+    The other two are stated, so the only thing missing is this one — and the
+    construction fails rather than resolving it to the format ceiling.
+    """
+    stated = {k: v for k, v in NO_CAPS.items() if k != name}
+    with pytest.raises(SofaArgumentError) as exc:
+        engine(visitor=Recorder(), **stated)
+    assert name in str(exc.value)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_stating_no_limit_at_all_is_refused(engine):
+    with pytest.raises(SofaArgumentError):
+        engine(visitor=Recorder())
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("name", NAMES)
+def test_an_omitted_limit_is_an_argument_error_not_a_limit_rejection(engine, name):
+    """§6.3: the two codes say different things and must stay distinguishable.
+
+    ``LimitExceeded`` means "raise my limit"; there is no limit to raise here,
+    because none was ever configured. So the refusal is the ``InvalidArgument``
+    tier and nothing else — asserted as *not* a ``SofaLimitError`` rather than
+    only as a ``SofaArgumentError``, since a subclass would satisfy both.
+    """
+    stated = {k: v for k, v in NO_CAPS.items() if k != name}
+    with pytest.raises(SofaError) as exc:
+        engine(visitor=Recorder(), **stated)
+    assert not isinstance(exc.value, SofaLimitError)
+    assert isinstance(exc.value, SofaArgumentError)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("name", NAMES)
 def test_none_is_refused_there_is_no_unset_state(engine, name):
     with pytest.raises(SofaArgumentError):
-        engine(visitor=Recorder(), **{name: None})
+        engine(visitor=Recorder(), **capped(**{name: None}))
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -48,13 +98,13 @@ def test_none_is_refused_there_is_no_unset_state(engine, name):
 def test_a_limit_outside_its_domain_is_refused(engine, name):
     for bad in (-1, CEILINGS[name] + 1):
         with pytest.raises(SofaArgumentError):
-            engine(visitor=Recorder(), **{name: bad})
+            engine(visitor=Recorder(), **capped(**{name: bad}))
 
 
 @pytest.mark.parametrize("engine", ENGINES)
 @pytest.mark.parametrize("name", NAMES)
 def test_the_ceiling_itself_is_accepted(engine, name):
-    engine(visitor=Recorder(), **{name: CEILINGS[name]})
+    engine(visitor=Recorder(), **capped(**{name: CEILINGS[name]}))
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -62,7 +112,7 @@ def test_the_ceiling_itself_is_accepted(engine, name):
 def test_zero_is_a_limit_like_any_other(engine, name):
     """Zero is a real setting -- 'accept nothing unbounded' -- not an unset
     state wearing a different value."""
-    engine(visitor=Recorder(), **{name: 0})
+    engine(visitor=Recorder(), **capped(**{name: 0}))
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -71,22 +121,27 @@ def test_a_zero_limit_rejects_rather_than_clamps(engine):
     enc = Encoder()
     enc.write_string(1, "x")
     enc.flush()
-    dec = engine(visitor=Recorder(), max_dyn_string_len=0)
+    dec = engine(visitor=Recorder(), **capped(max_dyn_string_len=0))
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_the_defaults_admit_everything_the_format_admits(engine):
-    """At the ceiling a limit cannot fire: a longer value is INVALID first, so
-    the default configuration rejects nothing a looser one would accept."""
+def test_a_caller_stated_ceiling_admits_everything_the_format_admits(engine):
+    """At the ceiling a limit cannot fire: a longer value is INVALID first, so a
+    caller that states the ceilings rejects nothing a looser one would accept.
+
+    This is the caller choosing the widest limit there is, not the codec falling
+    back on one — the number is in ``NO_CAPS``, in this suite, and the decoder
+    would refuse the construction without it.
+    """
     enc = Encoder()
     enc.write_string(1, "z" * 4096)
     enc.write_bytes(2, b"b" * 4096)
     enc.write_unsigned_array(3, list(range(4096)))
     enc.flush()
     rec = Recorder()
-    dec = engine(visitor=rec)
+    dec = engine(**NO_CAPS, visitor=rec)
     dec.feed(enc.getvalue())
     assert [e[0] for e in rec.events] == ["str", "blob", "ua"]
 
@@ -119,7 +174,7 @@ def test_the_limit_still_governs_the_list_the_decoder_would_build(engine):
             return None  # asked, and declined to name a destination
 
     wire = bytes([0x0B]) + _uvarint(0x7FFFFFFF) + b"\x01"
-    dec = engine(visitor=Handler(), max_dyn_array_count=4)
+    dec = engine(max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(), max_dyn_array_count=4)
     with pytest.raises(SofaLimitError):
         dec.feed(wire)
 
@@ -149,7 +204,7 @@ def test_a_handlers_own_destination_is_not_the_senders_to_dictate(engine):
     enc = Encoder()
     enc.write_unsigned_array(1, [7, 8, 9])
     enc.flush()
-    dec = engine(visitor=Handler(), max_dyn_array_count=1)
+    dec = engine(max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(), max_dyn_array_count=1)
     dec.feed(enc.getvalue())
     assert asked == [3]
     assert list(dst) == [7, 8, 9, 0]
@@ -171,7 +226,7 @@ def test_a_destination_too_short_is_a_range_error_not_a_limit(engine):
 
     # id 1, unsigned array, count 2**31-1, then one lone element byte.
     wire = bytes([0x0B]) + _uvarint(0x7FFFFFFF) + b"\x01"
-    dec = engine(visitor=Handler(), max_dyn_array_count=4)
+    dec = engine(max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(), max_dyn_array_count=4)
     with pytest.raises(SofaArgumentError):
         dec.feed(wire)
 
@@ -197,21 +252,21 @@ def test_the_same_two_answers_for_a_blob(engine):
             return self._dst
 
     # Its own buffer, big enough: read, cap or no cap.
-    dec = engine(visitor=Handler(bytearray(4096)), max_dyn_blob_len=10)
+    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(bytearray(4096)), max_dyn_blob_len=10)
     dec.feed(wire)
     assert asked == [100]
 
     # Its own buffer, too short: the buffer's size is the only ceiling left,
     # and overrunning it is a range error rather than a policy rejection.
     asked.clear()
-    dec = engine(visitor=Handler(bytearray(8)), max_dyn_blob_len=10)
+    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(bytearray(8)), max_dyn_blob_len=10)
     with pytest.raises(SofaArgumentError):
         dec.feed(wire)
     assert asked == [100]
 
     # No buffer back: the decoder would build the ``bytes`` itself, sized by the
     # wire, and that is the allocation the cap exists to prevent.
-    dec = engine(visitor=Handler(None), max_dyn_blob_len=10)
+    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(None), max_dyn_blob_len=10)
     with pytest.raises(SofaLimitError):
         dec.feed(wire)
 
@@ -221,7 +276,7 @@ def test_the_limit_leaves_a_reassembly_buffer_untouched(engine):
     """The verdict is on the length word alone, so not a byte of payload is
     buffered -- the caller's reassembly buffer never sees the field."""
     buf = bytearray(64)
-    dec = engine(visitor=Recorder(), max_dyn_blob_len=16, reassembly=buf)
+    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Recorder(), max_dyn_blob_len=16, reassembly=buf)
     with pytest.raises(SofaLimitError):
         dec.feed(bytes([0x0A]) + _uvarint((1_000_000 << 3) | 0x3))
     assert buf == bytearray(64)
@@ -244,7 +299,7 @@ def test_a_limit_rejection_is_terminal(engine):
     enc.flush()
 
     rec = Recorder()
-    dec = engine(visitor=rec, max_dyn_string_len=16)
+    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, visitor=rec, max_dyn_string_len=16)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
     assert rec.events == []
@@ -284,7 +339,7 @@ def test_a_limit_a_handler_raised_is_terminal_too(engine):
     enc.flush()
 
     rec = Picky()
-    dec = engine(visitor=rec)
+    dec = engine(**NO_CAPS, visitor=rec)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
     with pytest.raises(SofaLimitError):
@@ -300,7 +355,7 @@ def test_the_rejection_is_on_the_error_channel_not_the_status(engine):
     enc = Encoder()
     enc.write_string(1, "x" * 2000)
     enc.flush()
-    dec = engine(visitor=Recorder(), max_dyn_string_len=16)
+    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, visitor=Recorder(), max_dyn_string_len=16)
     with pytest.raises(SofaLimitError) as caught:
         dec.feed(enc.getvalue())
     assert dec.error is caught.value
@@ -312,7 +367,7 @@ def test_reset_clears_the_rejection(engine):
     enc = Encoder()
     enc.write_string(1, "x" * 2000)
     enc.flush()
-    dec = engine(visitor=Recorder(), max_dyn_string_len=16)
+    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, visitor=Recorder(), max_dyn_string_len=16)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
     dec.reset()

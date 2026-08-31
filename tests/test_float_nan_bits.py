@@ -20,7 +20,7 @@ import struct
 import pytest
 from vectors import DECODER_ENGINES as DECODERS
 from vectors import ENCODER_ENGINES as ENCODERS
-from vectors import Status, values
+from vectors import NO_CAPS, Status, values
 
 from sofab import Decoder, Encoder, SofaArgumentError, Visitor
 from sofab._core import _unpack_f32_bits, unpack_f32
@@ -171,7 +171,7 @@ def _reencode_message(wire: bytes) -> bytes:
             self.enc.write_float64_array(field_id, values_)
 
     t = Transcoder()
-    assert Decoder(visitor=t).feed(wire) is Status.COMPLETE
+    assert Decoder(**NO_CAPS, visitor=t).feed(wire) is Status.COMPLETE
     enc = t.enc
     return enc.getvalue()
 
@@ -306,7 +306,7 @@ def test_a_scalar_fp32_reaches_a_bit_consumer_as_wire_bits(
     wire = enc.getvalue()[:-4] + raw
 
     taker = _BitTaker()
-    assert dec_cls(visitor=taker).feed(wire) is Status.COMPLETE
+    assert dec_cls(**NO_CAPS, visitor=taker).feed(wire) is Status.COMPLETE
     assert taker.values == [], "the raw channel must replace the value one"
     assert taker.scalars == [(7, int.from_bytes(raw, "little"))]
 
@@ -329,7 +329,7 @@ def test_every_element_of_an_fp32_array_reaches_it_as_wire_bits(dec_cls, enc_cls
     wire = enc.getvalue()[: -len(payload)] + payload
 
     taker = _BitTaker()
-    assert dec_cls(visitor=taker).feed(wire) is Status.COMPLETE
+    assert dec_cls(**NO_CAPS, visitor=taker).feed(wire) is Status.COMPLETE
     assert taker.values == []
     assert taker.arrays == [(2, len(FP32_PAYLOADS), payload)]
 
@@ -351,7 +351,7 @@ def test_the_raw_array_payload_survives_a_chunk_boundary(dec_cls, enc_cls):
     wire = enc.getvalue()[: -len(payload)] + payload
 
     taker = _BitTaker()
-    dec = dec_cls(visitor=taker, reassembly=bytearray(256))
+    dec = dec_cls(**NO_CAPS, visitor=taker, reassembly=bytearray(256))
     for i in range(0, len(wire), 3):
         dec.feed(wire[i : i + 3])
     assert taker.arrays == [(2, len(FP32_PAYLOADS), payload)]
@@ -371,7 +371,7 @@ def test_the_raw_array_view_does_not_outlive_the_callback(dec_cls):
     enc = Encoder()
     enc.write_float32_array(2, [1.0, 2.0])
     enc.flush()
-    assert dec_cls(visitor=Keeper()).feed(enc.getvalue()) is Status.COMPLETE
+    assert dec_cls(**NO_CAPS, visitor=Keeper()).feed(enc.getvalue()) is Status.COMPLETE
     with pytest.raises(ValueError):
         bytes(kept[0])
 

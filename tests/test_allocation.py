@@ -31,6 +31,7 @@ import tracemalloc
 import pytest
 from vectors import DECODER_ENGINES as DECODERS
 from vectors import ENCODER_ENGINES as ENCODERS
+from vectors import NO_CAPS
 
 from sofab import MAX_DEPTH, Binding, Status, Visitor
 
@@ -123,7 +124,7 @@ def test_decode_does_not_scale_when_the_caller_supplies_the_storage(dec_cls, enc
         wire = _blob_wire(enc_cls, payload)
 
         def work():
-            dec = dec_cls(visitor=Sink(dst), reassembly=reassembly)
+            dec = dec_cls(**NO_CAPS, visitor=Sink(dst), reassembly=reassembly)
             for i in range(0, len(wire), 4096):
                 dec.feed(wire[i : i + 4096])
 
@@ -152,7 +153,7 @@ def test_a_binding_decode_does_not_scale_with_an_arrays_length(dec_cls, enc_cls)
         words = bytearray(8 * (LARGE // 8 + 8))
 
         def work():
-            dec = dec_cls(binding=binding, words=words)
+            dec = dec_cls(**NO_CAPS, binding=binding, words=words)
             assert dec.feed(wire) is Status.COMPLETE
 
         return _peak(work)
@@ -272,7 +273,7 @@ def test_descending_costs_no_more_than_walking_the_same_bytes(dec_cls, enc_cls):
     wire = _deep_wire(enc_cls, MAX_DEPTH - 1)
 
     def run(handler_cls):
-        dec = dec_cls(visitor=handler_cls(), reassembly=bytearray(1 << 12))
+        dec = dec_cls(**NO_CAPS, visitor=handler_cls(), reassembly=bytearray(1 << 12))
 
         def work():
             dec.reset()
@@ -303,7 +304,7 @@ def test_the_decoders_descent_state_is_the_same_containers_afterwards(
     block, which no Python-level check can reach; the byte-for-byte parity
     suite is what pins it to the engine measured here.)
     """
-    dec = dec_cls(visitor=_Descending(), reassembly=bytearray(1 << 12))
+    dec = dec_cls(**NO_CAPS, visitor=_Descending(), reassembly=bytearray(1 << 12))
     stacks = [getattr(dec, n, None) for n in ("_vstack", "_bstack")]
     if all(s is None for s in stacks):
         pytest.skip("the native engine holds these in C memory")
@@ -340,7 +341,7 @@ def test_a_binding_float_array_does_not_scale_with_its_length(dec_cls, enc_cls):
         words = bytearray(8 * ((64 << 10) + 8))
 
         def work():
-            dec = dec_cls(binding=binding, words=words)
+            dec = dec_cls(**NO_CAPS, binding=binding, words=words)
             assert dec.feed(wire) is Status.COMPLETE
 
         return _peak(work)
@@ -380,7 +381,7 @@ def test_a_visitor_that_takes_a_value_pays_for_it(dec_cls, enc_cls):
         wire = _blob_wire(enc_cls, payload)
 
         def work():
-            dec = dec_cls(visitor=Taker())
+            dec = dec_cls(**NO_CAPS, visitor=Taker())
             dec.feed(wire)
 
         return _peak(work)
@@ -416,7 +417,7 @@ def test_an_encoder_holds_only_the_handles_the_readme_lists(enc_cls):
 @pytest.mark.parametrize("dec_cls", DECODERS)
 def test_a_binding_decoder_holds_only_the_handles_the_readme_lists(dec_cls):
     binding = Binding().unsigned(1, at=0)
-    dec = dec_cls(binding=binding, words=bytearray(64))
+    dec = dec_cls(**NO_CAPS, binding=binding, words=bytearray(64))
     held = _memoryviews(dec)
     assert held <= 3, (
         f"the decoder holds {held} memoryviews; the README lists the views over "

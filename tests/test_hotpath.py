@@ -19,7 +19,7 @@ import enum
 import inspect
 
 import pytest
-from vectors import Visitor, pairs, values, verdict
+from vectors import NO_CAPS, Visitor, pairs, values, verdict
 
 from sofab.decoder import Decoder as PyDecoder
 from sofab.encoder import Encoder as PyEncoder
@@ -429,7 +429,7 @@ def test_call_shapes_match_the_pure_engine():
     everywhere the extension is missing and fail where it is present."""
     for pure_cls, native_cls, make in (
         (PyEncoder, NativeEncoder, lambda cls: cls()),
-        (PyDecoder, NativeDecoder, lambda cls: cls(visitor=Visitor())),
+        (PyDecoder, NativeDecoder, lambda cls: cls(**NO_CAPS, visitor=Visitor())),
     ):
         public = {n for n in dir(pure_cls) if not n.startswith("_")}
         assert public == {n for n in dir(native_cls) if not n.startswith("_")}
