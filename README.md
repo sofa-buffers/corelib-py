@@ -480,6 +480,13 @@ pre-sized list for `string` and `blob`, which have no fixed-width machine form.
 Read the slots back through `.cast("q")` / `.cast("Q")` / `.cast("d")` over the
 *same* buffer, at no copy.
 
+An `objects` slot takes either shape, and the row says which. `.string(…)` /
+`.bytes(…)` name a slot to *put a value in*, and the decoder builds that
+`str`/`bytes` — the one thing on this route the wire still sizes. `.string_into(…)`
+/ `.blob_into(…)` name a slot that already **holds** a writable byte buffer you
+put there; the payload is copied into it, `count_at` receives the byte length, and
+nothing is sized from the wire at all. See [Memory handling](#memory-handling).
+
 What follows from the caller owning the storage:
 
 * **Nothing is ever sized from the wire.** `cap` and `maxlen` are the *schema's*
@@ -790,6 +797,21 @@ byte is decoded, and refuses a destination too short rather than growing one:
 | `fp32` / `fp64` array | `on_float_array_begin(id, subtype, count)` | a writable buffer of `count` 8-byte slots |
 | `fp32` / `fp64` scalar | — | a value; a scalar is not storage (§6.6.3) |
 
+§6.6.3 has a **third** shape — the same destination, declared once before the
+decode instead of per field — and a `Binding` is it. Every numeric field and both
+array kinds already landed in `words` slots you sized from the schema; the two
+aggregates with no fixed-width machine form now do too:
+
+| row | slot holds | on decode |
+|---|---|---|
+| `string(id, at, maxlen)` / `bytes(id, at, maxlen)` | anything | the decoder builds a `str`/`bytes` there — sized by the wire |
+| `string_into(id, at, maxlen)` / `blob_into(id, at, maxlen)` | **your writable byte buffer** | the payload is copied into it; `count_at` gets the byte length |
+
+A destination too short is `SofaArgumentError` at the length word, before a byte
+is copied, and is never grown. A `string_into` payload is still validated as
+UTF-8 (§6.7.2). With `string_into`/`blob_into` a whole message — scalars,
+arrays, strings and blobs — decodes without a single allocation the sender chose.
+
 `fp32` additionally has §6.5's raw channel — `on_float32_bits` and
 `on_float32_array_bits`, paired with `Encoder.write_float32_bits` /
 `write_float32_array_bits` — for a consumer that has to reproduce the wire bytes
@@ -798,15 +820,24 @@ rather than the value.
 **Where this port stands against CORELIB_PLAN §6.6, stated plainly.** The codec
 allocates nothing a wire number sizes on the paths above — encode, a `Binding`
 decode, and a visitor decode that takes the destination routes — and
-`tests/test_allocation.py` and `tests/test_aggregate_destinations.py` measure
-exactly that: a payload a thousand times larger costs the same. It does not hold
-where a handler asks for the **value**: `on_string`, `on_bytes`,
-`on_unsigned_array` and the float-array hooks each hand back a whole object, and
-the only size available to build one from is the wire's, which is what §6.6.3
-says such a callback obliges. Those hooks are kept because they are the
-convenient way to read a message, and every one of them now has an opt-out.
-Beneath both, CPython allocates for every object a handler is given, so a
-literal zero is not reachable in this language whatever the API looks like.
+`tests/test_allocation.py`, `tests/test_aggregate_destinations.py` and
+`tests/test_declared_destinations.py` measure exactly that: a payload a thousand
+times larger costs the same. It does not hold where a handler asks for the
+**value**: `on_string`, `on_bytes`, `on_unsigned_array` and the float-array hooks
+each hand back a whole object, and the only size available to build one from is
+the wire's, which is what §6.6.3 says such a callback obliges. Those hooks are
+kept because they are the convenient way to read a message, and every one of them
+now has an opt-out — three of them, counting the declared-once form above.
+
+Where a handler does take the value, it costs that value **once**. Nothing else
+on the way to it is sized from the wire: no scratch copy of the payload before
+the `str` is built, no second container for a second pass. That is the difference
+between an allocation the caller asked for and one the codec made for itself, and
+it is pinned by measurement — `on_string` costs the `str`, a signed array costs
+what its unsigned twin costs, an `fp64` array costs what an `fp32` array of the
+same length costs. Beneath all of it, CPython allocates for every object a
+handler is given, so a literal zero is not reachable in this language whatever
+the API looks like.
 
 * **Decode: no value outlives the callback, and nothing is aliased.** A handler
   receives a fresh `str`, independent `bytes`, a fresh `int`/`float` or a new
@@ -825,9 +856,10 @@ literal zero is not reachable in this language whatever the API looks like.
   streams larger `string`/`blob`/array payloads **across chunk boundaries**.
   A message fed in one call never touches the buffer, whatever its size.
 * **Decode: a decoded value can land in your storage too.** `Binding` writes
-  every field into slots you supply, and the five *begin* hooks above take a
-  buffer for every aggregate — so an array of any length costs no list and no
-  object per element. A `string` is still **validated** when it goes into your buffer (§6.7.2:
+  every field into slots you supply — `string_into`/`blob_into` into a byte
+  buffer you put in the slot — and the five *begin* hooks above take a buffer for
+  every aggregate, so an array of any length costs no list and no object per
+  element. A `string` is still **validated** when it goes into your buffer (§6.7.2:
   a field the handler reads is materialized *and* validated); the check runs over
   the bytes in fixed windows, so it does not build the `str` the destination
   exists to avoid. What is left materialising is the scalars, and those are

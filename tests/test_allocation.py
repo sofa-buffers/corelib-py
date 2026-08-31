@@ -354,6 +354,48 @@ def test_a_binding_float_array_does_not_scale_with_its_length(dec_cls, enc_cls):
     )
 
 
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("dec_cls", DECODERS)
+@pytest.mark.parametrize("kind", ["string", "blob"])
+def test_a_declared_byte_destination_does_not_scale_with_the_payload(
+    dec_cls, enc_cls, kind
+):
+    """§6.6.3's third shape, for the two aggregates that had no machine form.
+
+    A ``Binding`` row used to name a slot to *put a value in*, so a whole message
+    could decode into caller storage and a 1 MiB string would still cost a 1 MiB
+    allocation inside the codec — on the very route §6.6.3 names.
+    :meth:`sofab.Binding.string_into` / :meth:`~sofab.Binding.blob_into` name a
+    slot that already **holds** the buffer, and the payload is copied into it.
+    """
+
+    def run(n):
+        enc = enc_cls()
+        if kind == "string":
+            enc.write_string(1, "x" * n)
+            table = Binding().string_into(1, at=0, count_at=0)
+        else:
+            enc.write_bytes(1, b"x" * n)
+            table = Binding().blob_into(1, at=0, count_at=0)
+        enc.flush()
+        wire = enc.getvalue()
+        objs = [bytearray(LARGE)]
+        words = bytearray(8 * table.tree_words_required)
+
+        def work():
+            dec = dec_cls(**NO_CAPS, binding=table, words=words, objects=objs)
+            assert dec.feed(wire) is Status.COMPLETE
+
+        return _peak(work)
+
+    small = run(SMALL)
+    large = run(LARGE)
+    assert large - small < FLAT, (
+        f"a {LARGE}-byte {kind} cost {large - small} bytes more than a "
+        f"{SMALL}-byte one; the wire is sizing an allocation"
+    )
+
+
 # --- the gap this port has accepted -----------------------------------------
 
 
@@ -393,6 +435,135 @@ def test_a_visitor_that_takes_a_value_pays_for_it(dec_cls, enc_cls):
     assert grown < 3 * LARGE, (
         f"the payload was materialized {grown / LARGE:.1f} times over; one copy "
         "is the cost this port accepts, more is a defect"
+    )
+
+
+# --- and it costs the value ONCE: nothing else is sized from the wire --------
+#
+# §6.6.3 obliges the codec to build the aggregate a value-taking callback asks
+# for, and this port ships those callbacks. What it must not do is size anything
+# *else* from the wire on the way there -- a scratch copy of the payload, or a
+# second pass into a second container, is the codec's own allocation, seen by
+# nobody, and squarely what §6.6 forbids. Each test below reads the cost of one
+# route against a control that delivers the same value without the extra copy,
+# so the claim is a comparison and not a threshold anyone has to argue about.
+
+
+def _peak_visit(dec_cls, wire, sink_cls):
+    def work():
+        dec_cls(**NO_CAPS, visitor=sink_cls()).feed(wire)
+
+    return _peak(work)
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_on_string_costs_the_str_and_not_a_copy_of_the_payload_as_well(
+    dec_cls, enc_cls
+):
+    """The ``str`` is the value the handler asked for. The ``bytes`` slice the
+    payload used to be copied into on the way to it was not: it was scratch the
+    wire sized, and a 1 MiB string paid for it twice."""
+
+    class Taker(Visitor):
+        def on_string(self, field_id, value):
+            self.n = len(value)
+
+    def run(n):
+        enc = enc_cls()
+        enc.write_string(1, "x" * n)
+        enc.flush()
+        return _peak_visit(dec_cls, enc.getvalue(), Taker)
+
+    grown = run(LARGE) - run(SMALL)
+    assert grown > LARGE * 0.9, "the str must actually be materialized"
+    assert grown < LARGE * 1.5, (
+        f"a {LARGE}-byte string cost {grown} bytes: the payload is being copied "
+        "before the str is built"
+    )
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_a_signed_array_costs_what_an_unsigned_array_of_the_same_length_costs(
+    dec_cls, enc_cls
+):
+    """Read against the unsigned twin rather than a threshold: the two deliver
+    the same shape — one ``list`` of ``count`` boxed ints — so whatever CPython
+    charges for that, it charges both.
+
+    ZigZag used to be undone in a **second pass that built a second list**, so
+    the signed route peaked at twice the unsigned one. Folding the transform
+    into the element loop costs the same arithmetic where the raw value is
+    already in hand, and allocates nothing extra.
+    """
+
+    class Taker(Visitor):
+        def on_unsigned_array(self, field_id, values):
+            self.n = len(values)
+
+        def on_signed_array(self, field_id, values):
+            self.n = len(values)
+
+    count = 64 << 10
+
+    def run(signed):
+        enc = enc_cls()
+        if signed:
+            enc.write_signed_array(1, [-1] * count)
+        else:
+            enc.write_unsigned_array(1, [1] * count)
+        enc.flush()
+        return _peak_visit(dec_cls, enc.getvalue(), Taker)
+
+    unsigned = run(False)
+    signed = run(True)
+    assert signed < unsigned * 1.25, (
+        f"a {count}-element signed array cost {signed} bytes against the "
+        f"unsigned twin's {unsigned}; the ZigZag pass is building a second list"
+    )
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_an_fp64_array_costs_what_an_fp32_array_of_the_same_length_costs(
+    dec_cls, enc_cls
+):
+    """Both deliver one ``list`` of ``count`` Python floats — a Python float is
+    a double whichever subtype it came from — so the two costs must match.
+
+    They did not: the payload was copied into a whole ``bytes`` before the list
+    was built, and that copy *is* the difference between the subtypes (4 bytes
+    per element against 8). Reading the values straight out of the buffer they
+    were fed into removes it, and with it the only term that told the two routes
+    apart.
+    """
+
+    class Taker(Visitor):
+        def on_float32_array(self, field_id, values):
+            self.n = len(values)
+
+        def on_float64_array(self, field_id, values):
+            self.n = len(values)
+
+    count = 64 << 10
+
+    def run(width):
+        enc = enc_cls()
+        if width == 4:
+            enc.write_float32_array(1, [1.5] * count)
+        else:
+            enc.write_float64_array(1, [1.5] * count)
+        enc.flush()
+        return _peak_visit(dec_cls, enc.getvalue(), Taker)
+
+    fp32 = run(4)
+    fp64 = run(8)
+    # The payload copy was exactly count*width bytes, so the two subtypes
+    # differed by count*4. Anything under one byte per element cannot be it.
+    assert abs(fp64 - fp32) < count, (
+        f"an fp64 array cost {fp64} bytes against an fp32 array's {fp32} at the "
+        "same length; the payload is being copied before the list is built"
     )
 
 
