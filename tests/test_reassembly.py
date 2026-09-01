@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
-from vectors import NO_CAPS, Recorder, Status
+from vectors import Recorder, Status, capped
 
-from sofab import DEFAULT_REASSEMBLY, Encoder, SofaArgumentError
+from sofab import ARRAY_MAX, FIXLEN_MAX, MIN_REASSEMBLY, Encoder, SofaArgumentError
 
 BIG = "a" * 300
 
@@ -49,7 +49,9 @@ WANT = [
 
 def _feed(engine, wire, chunk, **kw):
     rec = Recorder()
-    dec = engine(**NO_CAPS, visitor=rec, **kw)
+    # ``capped`` layers, so a case that names its own buffer replaces the
+    # suite's roomy one rather than colliding with it.
+    dec = engine(**capped(**kw), visitor=rec)
     status = Status.COMPLETE
     for i in range(0, len(wire), chunk):
         status = dec.feed(wire[i : i + chunk])
@@ -90,7 +92,7 @@ def test_the_buffer_is_reused_across_messages_not_regrown(engine):
     wire = _msg()
     buf = bytearray(1024)
     rec = Recorder()
-    dec = engine(**NO_CAPS, visitor=rec, reassembly=buf)
+    dec = engine(**capped(reassembly=buf), visitor=rec)
     for _ in range(3):
         for i in range(0, len(wire), 7):
             dec.feed(wire[i : i + 7])
@@ -117,7 +119,7 @@ def test_the_chunk_may_be_overwritten_the_moment_feed_returns(engine):
     feed that ends mid-construct, the decoder holds nothing of the chunk."""
     wire = _msg()
     rec = Recorder()
-    dec = engine(**NO_CAPS, visitor=rec, reassembly=bytearray(1024))
+    dec = engine(**capped(reassembly=bytearray(1024)), visitor=rec)
     status = Status.COMPLETE
     for i in range(0, len(wire), 9):
         chunk = bytearray(wire[i : i + 9])
@@ -137,11 +139,11 @@ def test_only_a_bytearray_or_a_byte_count_is_accepted(engine):
     """
     for bad in (b"\x00" * 64, memoryview(bytearray(64)), 64.0, "64", True):
         with pytest.raises(SofaArgumentError):
-            engine(**NO_CAPS, visitor=Recorder(), reassembly=bad)
+            engine(**capped(reassembly=bad), visitor=Recorder())
     # A count below what a single spanning construct can need is refused too:
     # a buffer that cannot hold one is not a smaller buffer, it is a broken one.
     with pytest.raises(SofaArgumentError):
-        engine(**NO_CAPS, visitor=Recorder(), reassembly=8)
+        engine(**capped(reassembly=8), visitor=Recorder())
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -163,27 +165,57 @@ def test_a_byte_count_sizes_the_buffer_at_construction(engine):
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_the_default_buffer_is_bounded_and_never_grows(engine):
+def test_the_size_is_required_and_the_codec_holds_none(engine):
+    """§6.2.1, the same rule the three ``max_dyn_*`` caps answer to (#137): a
+    codec "**MUST NOT** hold a limit of its own" and "**MUST NOT** supply a
+    default for one it was not given".
+
+    A reassembly size is such a number. It decides which well-formed messages
+    this receiver can stream -- a construct that does not fit is refused -- so
+    it states a policy, and the policy is the deployment's. This library
+    answered 4096 for every caller who did not ask, which made the number the
+    corelib's; the docstring on the constant conceded as much. Omitting it is
+    now a defect in the CALL (§6.3's InvalidArgument tier), not a cue to invent
+    a size.
+    """
+    with pytest.raises(SofaArgumentError) as exc:
+        engine(
+            visitor=Recorder(),
+            max_dyn_array_count=ARRAY_MAX,
+            max_dyn_string_len=FIXLEN_MAX,
+            max_dyn_blob_len=FIXLEN_MAX,
+        )
+    assert "reassembly" in str(exc.value)
+
+    # And it is not merely unset-vs-set: there is no spelling of "unlimited"
+    # either, because the buffer is real memory the caller pays for.
+    for bad in (None, -1, 0, MIN_REASSEMBLY - 1):
+        with pytest.raises(SofaArgumentError):
+            engine(**capped(reassembly=bad), visitor=Recorder())
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_the_buffer_is_bounded_and_never_grows(engine):
     """§6.6.2: "A codec **MUST NOT** grow a private accumulator instead."
 
-    Omitting the parameter used to mean exactly that — a ``bytearray`` of the
-    decoder's own, extended to whatever the message declared, so a sender chose
-    the receiver's memory. There is now one shape: a buffer sized at
-    construction, and a construct that does not fit it is refused.
+    The buffer used to be a ``bytearray`` of the decoder's own, extended to
+    whatever the message declared, so a sender chose the receiver's memory.
+    There is now one shape: sized at construction, and a construct that does not
+    fit it is refused.
     """
     enc = Encoder()
-    enc.write_bytes(1, b"z" * (DEFAULT_REASSEMBLY * 2))
+    enc.write_bytes(1, b"z" * 8192)
     enc.flush()
     wire = enc.getvalue()
 
     with pytest.raises(SofaArgumentError):
-        _feed(engine, wire, 512)
+        _feed(engine, wire, 512, reassembly=4096)
 
     # The same bytes in one call never touch the buffer at all, whatever their
     # size: nothing spans a chunk boundary when there is only one chunk.
     rec = Recorder()
-    assert engine(**NO_CAPS, visitor=rec).feed(wire) is Status.COMPLETE
-    assert rec.events == [("blob", 1, b"z" * (DEFAULT_REASSEMBLY * 2))]
+    assert engine(**capped(reassembly=4096), visitor=rec).feed(wire) is Status.COMPLETE
+    assert rec.events == [("blob", 1, b"z" * 8192)]
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -211,6 +243,6 @@ def test_a_carry_larger_than_the_buffer_is_refused_on_the_way_out(engine):
     memory past the call (§6) or growing a buffer of our own (§6.6)."""
     wire = _msg()
     rec = Recorder()
-    dec = engine(**NO_CAPS, visitor=rec, reassembly=bytearray(8))
+    dec = engine(**capped(reassembly=bytearray(8)), visitor=rec)
     with pytest.raises(SofaArgumentError):
         dec.feed(wire[:60])  # stops deep inside the 300-byte string

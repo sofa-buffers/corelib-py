@@ -20,7 +20,7 @@ import struct
 import pytest
 from vectors import DECODER_ENGINES as DECODERS
 from vectors import ENCODER_ENGINES as ENCODERS
-from vectors import NO_CAPS, Status, values
+from vectors import NO_CAPS, Status, capped, values
 
 from sofab import Decoder, Encoder, SofaArgumentError, Visitor
 from sofab._core import _unpack_f32_bits, unpack_f32
@@ -351,7 +351,7 @@ def test_the_raw_array_payload_survives_a_chunk_boundary(dec_cls, enc_cls):
     wire = enc.getvalue()[: -len(payload)] + payload
 
     taker = _BitTaker()
-    dec = dec_cls(**NO_CAPS, visitor=taker, reassembly=bytearray(256))
+    dec = dec_cls(**capped(reassembly=bytearray(256)), visitor=taker)
     for i in range(0, len(wire), 3):
         dec.feed(wire[i : i + 3])
     assert taker.arrays == [(2, len(FP32_PAYLOADS), payload)]

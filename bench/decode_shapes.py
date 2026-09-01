@@ -73,6 +73,12 @@ CAP_ARR = ARRAY_MAX
 CAP_STR = FIXLEN_MAX
 CAP_BLOB = FIXLEN_MAX
 
+# The reassembly buffer is the caller's too (§6.6.2), and the codec holds no
+# size of its own -- so, like the caps, it is stated here rather than defaulted.
+# Room for the largest single construct any workload below streams; nothing a
+# row SKIPS needs room at all, because a discarded construct never enters it.
+REASSEMBLY = 1 << 21
+
 
 GOLDEN = 0x9E3779B97F4A7C15
 MASK64 = (1 << 64) - 1
@@ -190,7 +196,7 @@ def make_feed_visitor():
     def body(data: bytes) -> int:
         v = _SumVisitor()
         Decoder(max_dyn_array_count=CAP_ARR,
-                max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB, reassembly=REASSEMBLY,
                 visitor=v).feed(data)
         return v.acc
 
@@ -232,7 +238,7 @@ def _read_back_bulk(u: memoryview) -> int:
 def make_feed_bound():
     words, u = new_storage()
     dec = Decoder(max_dyn_array_count=CAP_ARR,
-                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB, reassembly=REASSEMBLY,
                   binding=BINDING, words=words)
 
     def body(data: bytes) -> int:
@@ -246,7 +252,7 @@ def make_feed_bound():
 def make_feed_bound_read():
     words, u = new_storage()
     dec = Decoder(max_dyn_array_count=CAP_ARR,
-                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB, reassembly=REASSEMBLY,
                   binding=BINDING, words=words)
 
     def body(data: bytes) -> int:
@@ -260,7 +266,7 @@ def make_feed_bound_read():
 def make_feed_bound_bulk():
     words, u = new_storage()
     dec = Decoder(max_dyn_array_count=CAP_ARR,
-                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB, reassembly=REASSEMBLY,
                   binding=BINDING, words=words)
 
     def body(data: bytes) -> int:
@@ -275,7 +281,7 @@ def make_feed_bound_fresh():
     def body(data: bytes) -> int:
         words, u = new_storage()
         Decoder(max_dyn_array_count=CAP_ARR,
-                max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB, reassembly=REASSEMBLY,
                 binding=BINDING, words=words).feed(data)
         return _read_back(u)
 
@@ -332,7 +338,7 @@ def selftest() -> int:
     # final status must be COMPLETE (§5.2 / §7.2 item 4).
     words, u = new_storage()
     dec = Decoder(max_dyn_array_count=CAP_ARR,
-                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB, reassembly=REASSEMBLY,
                   binding=BINDING, words=words)
     st = Status.COMPLETE
     for i in range(len(msg)):

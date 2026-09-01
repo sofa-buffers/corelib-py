@@ -12,7 +12,7 @@ every one of those. The binding destinations get their own suite
 from __future__ import annotations
 
 import pytest
-from vectors import DECODER_ENGINES, ENGINE_PAIRS, NO_CAPS, VECTORS
+from vectors import DECODER_ENGINES, ENGINE_PAIRS, NO_CAPS, ROOMY_REASSEMBLY, VECTORS, capped
 
 from sofab import FIXLEN_MAX, Binding, SofaArgumentError, SofaLimitError, Status, Visitor
 
@@ -227,7 +227,7 @@ def test_a_fed_chunk_may_be_overwritten_afterwards(enc_cls, dec_cls, chunk):
     dec_cls(**NO_CAPS, visitor=whole).feed(msg)
 
     got = Collect()
-    dec = dec_cls(**NO_CAPS, visitor=got, reassembly=len(msg) + 16)
+    dec = dec_cls(**capped(reassembly=len(msg) + 16), visitor=got)
     scratch = bytearray(chunk)
     view = memoryview(scratch)
     for off in range(0, len(msg), chunk):
@@ -304,7 +304,7 @@ def test_a_receiver_cap_is_raised_not_folded_into_invalid(enc_cls, dec_cls):
     enc = enc_cls()
     enc.write_unsigned_array(1, [1, 2, 3, 4, 5])
     enc.flush()
-    dec = dec_cls(max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Collect(), max_dyn_array_count=2)
+    dec = dec_cls(reassembly=ROOMY_REASSEMBLY, max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Collect(), max_dyn_array_count=2)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
 
@@ -321,7 +321,7 @@ def test_a_declared_bound_takes_the_receiver_cap_off_the_field(enc_cls, dec_cls)
     msg = enc.getvalue()
     b = Binding().unsigned_array(1, at=0, cap=8, count_at=8)
     words = bytearray(b.tree_words_required * 8)
-    assert dec_cls(max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, binding=b, words=words, max_dyn_array_count=2).feed(msg) is Status.COMPLETE
+    assert dec_cls(reassembly=ROOMY_REASSEMBLY, max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, binding=b, words=words, max_dyn_array_count=2).feed(msg) is Status.COMPLETE
 
     tight = Binding().unsigned_array(1, at=0, cap=3, count_at=8)
     dec = dec_cls(**NO_CAPS, binding=tight, words=bytearray(tight.tree_words_required * 8))

@@ -31,7 +31,7 @@ import tracemalloc
 import pytest
 from vectors import DECODER_ENGINES as DECODERS
 from vectors import ENCODER_ENGINES as ENCODERS
-from vectors import NO_CAPS
+from vectors import NO_CAPS, capped
 
 from sofab import MAX_DEPTH, Binding, Status, Visitor
 
@@ -124,7 +124,7 @@ def test_decode_does_not_scale_when_the_caller_supplies_the_storage(dec_cls, enc
         wire = _blob_wire(enc_cls, payload)
 
         def work():
-            dec = dec_cls(**NO_CAPS, visitor=Sink(dst), reassembly=reassembly)
+            dec = dec_cls(**capped(reassembly=reassembly), visitor=Sink(dst))
             for i in range(0, len(wire), 4096):
                 dec.feed(wire[i : i + 4096])
 
@@ -273,7 +273,7 @@ def test_descending_costs_no_more_than_walking_the_same_bytes(dec_cls, enc_cls):
     wire = _deep_wire(enc_cls, MAX_DEPTH - 1)
 
     def run(handler_cls):
-        dec = dec_cls(**NO_CAPS, visitor=handler_cls(), reassembly=bytearray(1 << 12))
+        dec = dec_cls(**capped(reassembly=bytearray(1 << 12)), visitor=handler_cls())
 
         def work():
             dec.reset()
@@ -304,7 +304,7 @@ def test_the_decoders_descent_state_is_the_same_containers_afterwards(
     block, which no Python-level check can reach; the byte-for-byte parity
     suite is what pins it to the engine measured here.)
     """
-    dec = dec_cls(**NO_CAPS, visitor=_Descending(), reassembly=bytearray(1 << 12))
+    dec = dec_cls(**capped(reassembly=bytearray(1 << 12)), visitor=_Descending())
     stacks = [getattr(dec, n, None) for n in ("_vstack", "_bstack")]
     if all(s is None for s in stacks):
         pytest.skip("the native engine holds these in C memory")

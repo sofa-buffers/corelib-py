@@ -43,8 +43,7 @@ MAX_DEPTH = 255
 #: ``MAX_SIZE`` gets an exact fit.
 MIN_OUTPUT_BUFFER = 1
 
-#: Bytes of reassembly space a :class:`sofab.Decoder` takes when the caller
-#: names no size (see ``Decoder(reassembly=…)``).
+#: The smallest reassembly buffer a :class:`sofab.Decoder` accepts.
 #:
 #: A construct split across fed chunks has to be joined somewhere, and
 #: CORELIB_PLAN §6.6.2 puts that somewhere in the caller's hands: "A codec
@@ -54,13 +53,19 @@ MIN_OUTPUT_BUFFER = 1
 #: and a construct that does not fit it is refused with
 #: :class:`SofaArgumentError` rather than accommodated.
 #:
-#: This number is the corelib's, not the specification's: §6.6.2 names no
-#: default because the storage is meant to be the caller's outright. It is a
-#: size that lets ordinary messages stream without configuration; a receiver
-#: that takes larger `string`/`blob`/array payloads **across chunk boundaries**
-#: passes its own buffer, or a byte count for the decoder to size one from.
-#: (Whole messages fed in one call never touch it, whatever their size.)
-DEFAULT_REASSEMBLY = 4096
+#: There is deliberately no *default* size to go with this minimum. §6.2.1 says
+#: a codec "**MUST NOT** hold a limit of its own" and "**MUST NOT** supply a
+#: default for one it was not given", and a reassembly size is exactly such a
+#: number: it decides which well-formed messages this receiver can stream. The
+#: library used to answer 4096 for every caller who did not ask, which made the
+#: number the corelib's rather than the deployment's — the same defect the three
+#: ``max_dyn_*`` caps had before #137. ``reassembly`` is now required, and
+#: generated code derives it from the schema.
+#:
+#: The floor is what a single spanning construct's framing needs: an id header
+#: and a length/count word are ten bytes each at the outside (§4.1). A buffer
+#: that cannot hold those is not a smaller buffer, it is a broken one.
+MIN_REASSEMBLY = 16
 
 #: 64-bit mask used by varint/zigzag wrap-around to match the C ``uint64_t``.
 MASK64 = (1 << 64) - 1

@@ -186,9 +186,10 @@ class Handler(Visitor):
     def on_unsigned(self, field_id, value): ...
     def on_string(self, field_id, value): ...
 
-dec = Decoder(visitor=Handler(),                     # the three caps are required
+dec = Decoder(visitor=Handler(),                     # the four are all required
               max_dyn_array_count=65536,             # see "Decode limits" below
-              max_dyn_string_len=1 << 20, max_dyn_blob_len=1 << 20)
+              max_dyn_string_len=1 << 20, max_dyn_blob_len=1 << 20,
+              reassembly=64 * 1024)                  # see "reassembly" below
 for chunk in socket_chunks():
     st = dec.feed(chunk)
     if st is Status.INVALID:
@@ -362,17 +363,24 @@ A construct split across two fed chunks has to be joined somewhere. CORELIB_PLAN
 > storage the caller supplied [...] A codec **MUST NOT** grow a private
 > accumulator instead.
 
-So there is one buffer, sized once and never grown. Name its size, or hand over
-the storage:
+So there is one buffer, sized once and never grown — and, like the three caps,
+it is **required**. The size decides which well-formed messages this receiver can
+stream, which makes it a receiver policy, and §6.2.1 leaves the codec no policy
+to invent. Name a size, or hand over the storage:
 
 ```python
 caps = dict(max_dyn_array_count=65536,           # required; see "Decode limits"
             max_dyn_string_len=1 << 20, max_dyn_blob_len=1 << 20)
 
-dec = Decoder(visitor=handler, reassembly=64 * 1024, **caps)          # decoder sizes it
+dec = Decoder(visitor=handler, reassembly=64 * 1024, **caps)           # decoder sizes it
 dec = Decoder(visitor=handler, reassembly=bytearray(1 << 20), **caps)  # or you do
-dec = Decoder(visitor=handler, **caps)                     # sofab.DEFAULT_REASSEMBLY
 ```
+
+The number to pass is **the largest single value this receiver reads**, not the
+largest field a sender might send: a field you skip — an unknown id, or one
+MESSAGE_SPEC §7.3 says is mistyped — is discarded as it arrives and needs no room
+at all, whatever its size. The floor is `sofab.MIN_REASSEMBLY` (16), what a single
+construct's framing can need.
 
 The pieces are copied into that buffer as they arrive, and a construct that does
 not fit is `SofaArgumentError` — **refused, never accommodated**. That is what lets
@@ -463,7 +471,7 @@ b = (Binding()
 
 words = bytearray(b.tree_words_required * 8)     # you allocate; you size it
 objs = [None] * b.tree_objects_required
-dec = Decoder(binding=b, words=words, objects=objs,
+dec = Decoder(binding=b, words=words, objects=objs, reassembly=64 * 1024,
               max_dyn_array_count=65536, max_dyn_string_len=1 << 20, max_dyn_blob_len=1 << 20)
 dec.feed(payload)
 
@@ -529,8 +537,9 @@ class Telemetry(Visitor):
         return (b, self.words, self.objects)
 
 t = Telemetry()
-Decoder(visitor=t, max_dyn_array_count=65536,   # one handler argument, plus the caps
-        max_dyn_string_len=1 << 20, max_dyn_blob_len=1 << 20).feed(payload)
+Decoder(visitor=t, max_dyn_array_count=65536,   # one handler argument, plus the policy
+        max_dyn_string_len=1 << 20, max_dyn_blob_len=1 << 20,
+        reassembly=64 * 1024).feed(payload)
 assert memoryview(t.words).cast("Q")[0] == u[0]
 ```
 
@@ -579,6 +588,9 @@ class Point:
     MAX_DYN_ARRAY_COUNT = 65536
     MAX_DYN_STRING_LEN = 1 << 20
     MAX_DYN_BLOB_LEN = 1 << 20
+    #: Derived from the schema by the generator, the same way: the largest
+    #: single value this receiver READS, since a skipped field needs no room.
+    REASSEMBLY = 1 << 20
 
     @classmethod
     def decoder(cls):                           # §6.1.1: the streaming reader
@@ -586,7 +598,8 @@ class Point:
         return Decoder(binding=cls.BINDING, words=words,
                        max_dyn_array_count=cls.MAX_DYN_ARRAY_COUNT,
                        max_dyn_string_len=cls.MAX_DYN_STRING_LEN,
-                       max_dyn_blob_len=cls.MAX_DYN_BLOB_LEN), words
+                       max_dyn_blob_len=cls.MAX_DYN_BLOB_LEN,
+                       reassembly=cls.REASSEMBLY), words
 
     def encode(self) -> bytes:                  # one-shot wrapper over serialize()
         e = Encoder()
@@ -637,10 +650,11 @@ whether more can still come.
 A field the schema leaves unbounded lets the *sender* decide what the *receiver*
 allocates, so every decoder carries **receiver-side** limits that reject an
 oversize field on its count/length word alone — *before* any allocation or
-payload buffering. **All three are required constructor arguments:**
+payload buffering. **All three are required constructor arguments** — as is
+`reassembly`, which is the same kind of number:
 
 ```python
-dec = Decoder(binding=b, words=words,
+dec = Decoder(binding=b, words=words, reassembly=64 * 1024,
               max_dyn_array_count=65536, max_dyn_string_len=1 << 20, max_dyn_blob_len=1 << 20)
 ```
 
@@ -762,9 +776,10 @@ the hook was told, and the decoder refuses it — `SofaArgumentError`
 about your storage rather than a verdict on the message, which is why it is not
 `SofaLimitError`.
 
-The same goes for `reassembly=`: a skipped payload spanning a chunk boundary is
-still joined in the buffer you supplied, so what a skip can cost is bounded by
-that buffer, and one that does not fit is refused the same way.
+`reassembly=` is the other way round: a skipped payload never enters that buffer
+at all. It has no value to rebuild, so it is discarded as it arrives, across as
+many chunks as it takes — which is what makes MESSAGE_SPEC §7.3's "the receiver
+ignores this field" true at any size.
 
 A **schema** bound is the opposite kind of thing from a cap: it is part of the
 message definition, so breaching it is malformed input, not policy. The
@@ -847,14 +862,15 @@ the API looks like.
   when the callback returns, so it cannot be kept by accident.
 * **Decode: a chunk-straddling construct is joined in one bounded buffer.**
   `Decoder(reassembly=…)` takes a `bytearray` you supply, or an `int` for the
-  decoder to size one from at construction; omit it and it takes
-  `sofab.DEFAULT_REASSEMBLY` (4096) bytes. There is no other shape and it never
-  grows: a construct that does not fit is `SofaArgumentError`, which is what
-  bounds a decode's memory by construction. CORELIB_PLAN §6.6.2 requires exactly
-  that — no sender can enlarge this buffer by sending different bytes. The 4096
-  is this port's number and not the specification's; raise it for a reader that
-  streams larger `string`/`blob`/array payloads **across chunk boundaries**.
-  A message fed in one call never touches the buffer, whatever its size.
+  decoder to size one from at construction. It is **required** and has no
+  default: the size decides which well-formed messages this receiver can stream,
+  so it is a receiver policy and §6.2.1 leaves the codec none to invent. There is
+  no other shape and it never grows: a construct that does not fit is
+  `SofaArgumentError`, which is what bounds a decode's memory by construction.
+  CORELIB_PLAN §6.6.2 requires exactly that — no sender can enlarge this buffer by
+  sending different bytes. Size it for the largest single value you **read**;
+  what you skip needs none of it. A message fed in one call never touches the
+  buffer, whatever its size.
 * **Decode: a decoded value can land in your storage too.** `Binding` writes
   every field into slots you supply — `string_into`/`blob_into` into a byte
   buffer you put in the slot — and the five *begin* hooks above take a buffer for
@@ -885,12 +901,12 @@ the API looks like.
   binding names and no visitor wants — or one a visitor declines — walks a string,
   blob or fixlen-array payload by advancing the cursor, so nothing is allocated
   for bytes that are being discarded: skipping a 1 MiB blob already in the
-  buffer is a pointer bump. The bytes are still **buffered** when the payload
-  straddles a chunk boundary, so what a skip saves is the copy, not the window —
-  and a skipped construct larger than the reassembly buffer is therefore refused
-  where a port that skips by advancing a cursor would walk past it. That is the
-  resume contract's doing: a suspended skip replays from the construct's first
-  byte, so the bytes cannot be dropped as they arrive.
+  buffer is a pointer bump. Nothing is **buffered** for it either when the
+  payload straddles a chunk boundary — a construct being discarded has no value
+  to rebuild, so it is dropped a chunk at a time and never enters the reassembly
+  buffer. A skipped field of any size therefore costs nothing and can never end
+  a decode, which is what MESSAGE_SPEC §7.3 and CORELIB_PLAN §6.2.1's "a skipped
+  field is never capped" require.
 * **Encode: one ownership model — the output buffer is fixed, and never grows.**
   CORELIB_PLAN §5.1 forbids a corelib to allocate an output buffer or to grow
   one, so there is a single mechanism here with three ways to reach it:

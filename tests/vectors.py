@@ -19,7 +19,6 @@ import pytest
 
 from sofab import (
     ARRAY_MAX,
-    DEFAULT_REASSEMBLY,
     FIXLEN_MAX,
     Binding,
     Encoder,
@@ -45,15 +44,23 @@ from sofab.encoder import Encoder as PyEncoder
 # Stating them here rather than defaulting them in the library is the whole
 # point of the change: the ceiling is the format's bound, not a receiver cap,
 # and the number is on the caller either way.
+#: Room for anything this suite feeds. ``reassembly`` is the caller's storage and
+#: the decoder holds no size of its own (§6.6.2, #139), so every construction
+#: here has to state one -- exactly as it has to state the three caps. A test
+#: that is about the buffer passes its own through ``capped(reassembly=...)``.
+ROOMY_REASSEMBLY = 1 << 20
+
 NO_CAPS = {
     "max_dyn_array_count": ARRAY_MAX,
     "max_dyn_string_len": FIXLEN_MAX,
     "max_dyn_blob_len": FIXLEN_MAX,
+    "reassembly": ROOMY_REASSEMBLY,
 }
 
 
 def capped(**kw):
-    """``NO_CAPS`` with ``kw`` layered on: the caps a test actually cares about."""
+    """``NO_CAPS`` with ``kw`` layered on: the caps (or the buffer) a test
+    actually cares about."""
     return {**NO_CAPS, **kw}
 
 
@@ -63,7 +70,7 @@ def capped(**kw):
 # ``ruff`` would otherwise read Binding as unused here and drop it.
 __all__ = [
     "DBL_MAX", "DECODER_ENGINES", "ENCODER_ENGINES", "ENGINE_PAIRS", "FLT_MAX",
-    "NO_CAPS", "capped",
+    "NO_CAPS", "ROOMY_REASSEMBLY", "capped",
     "FP64_FROM_FLOAT", "FULL_SCALE_EXPECTED", "VECTORS", "VECTOR_DOC",
     "Binding", "Recorder", "Slots", "Status", "Visitor",
     "WireType",
@@ -204,7 +211,7 @@ def walk(dec_cls, data: bytes, chunk: int | None = None, **kw):
     # message: size it for the whole of it, so a chunked feed of any of these
     # vectors has room and the tests exercise the wire rather than the buffer.
     # Tests about the buffer itself pass their own.
-    kw.setdefault("reassembly", max(len(data) + 16, DEFAULT_REASSEMBLY))
+    kw.setdefault("reassembly", max(len(data) + 16, 4096))
     # The caps are the caller's and have no default (§6.2.1); this helper is the
     # caller, so it states them. A test that is about a cap passes its own.
     dec = dec_cls(visitor=rec, **capped(**kw))

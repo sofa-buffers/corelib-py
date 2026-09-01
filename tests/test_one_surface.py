@@ -42,7 +42,7 @@ import inspect
 
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
-from vectors import NO_CAPS, Recorder, Slots, Status, walk
+from vectors import NO_CAPS, ROOMY_REASSEMBLY, Recorder, Slots, Status, capped, walk
 
 from sofab import (
     ARRAY_MAX,
@@ -168,7 +168,7 @@ def test_the_audited_divergence_is_gone(engine):
     b = Binding().string(1, at=0, maxlen=10)
     words = bytearray(8)
     objs: list = [None]
-    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, binding=b, words=words, objects=objs, max_dyn_string_len=4)
+    dec = engine(reassembly=ROOMY_REASSEMBLY, max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, binding=b, words=words, objects=objs, max_dyn_string_len=4)
     assert dec.feed(data) is Status.COMPLETE
     assert objs[0] == BOUNDED
 
@@ -189,7 +189,7 @@ def test_declaring_nothing_is_capped_on_either_surface(engine):
     b = Binding().string(1, at=0)  # no maxlen: the schema leaves it open
     words = bytearray(8)
     with pytest.raises(SofaLimitError) as bound_exc:
-        engine(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, binding=b, words=words, objects=[None], max_dyn_string_len=4).feed(data)
+        engine(reassembly=ROOMY_REASSEMBLY, max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, binding=b, words=words, objects=[None], max_dyn_string_len=4).feed(data)
 
     with pytest.raises(SofaLimitError) as visitor_exc:
         walk(engine, data, max_dyn_string_len=4)
@@ -566,7 +566,7 @@ def test_both_engines_settle_a_declared_bound_the_same_way():
     for engine in (pure_decoder.Decoder, native.Decoder):
         b = Binding().string(1, at=0, maxlen=10)
         objects: list = [None]
-        dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, 
+        dec = engine(reassembly=ROOMY_REASSEMBLY, max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, 
             binding=b, words=bytearray(8), objects=objects, max_dyn_string_len=4
         )
         out.append((dec.feed(msg), objects[0]))
@@ -800,7 +800,7 @@ def test_a_skipped_unmapped_sequence_resumes_across_a_chunk(engine):
     msg = bytes(enc.getvalue())
 
     words = bytearray(4 * 8)
-    dec = engine(**NO_CAPS, binding=b, words=words, reassembly=64)
+    dec = engine(**capped(reassembly=64), binding=b, words=words)
     u = memoryview(words).cast("Q")
     # One byte at a time, so the skip is suspended at every boundary inside the
     # sub-tree and has to be resumed rather than restarted.
