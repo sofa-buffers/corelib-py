@@ -15,7 +15,7 @@ import math
 import struct
 
 import pytest
-from vectors import DECODER_ENGINES, ENGINE_PAIRS, NO_CAPS
+from vectors import DECODER_ENGINES, ENGINE_PAIRS, NO_CAPS, ROOMY_REASSEMBLY
 
 from sofab import ARRAY_MAX, FIXLEN_MAX, Binding, SofaArgumentError, Status
 
@@ -419,7 +419,7 @@ def test_an_undeclared_string_is_still_subject_to_the_receiver_cap(enc_cls, dec_
     enc.flush()
     b = Binding().string(1, at=0)
     words, objects, *_ = storage(b)
-    dec = dec_cls(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, binding=b, words=words, objects=objects, max_dyn_string_len=4)
+    dec = dec_cls(reassembly=ROOMY_REASSEMBLY, max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, binding=b, words=words, objects=objects, max_dyn_string_len=4)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
     assert objects[0] is None
@@ -434,7 +434,7 @@ def test_a_declared_maxlen_lifts_the_receiver_cap(enc_cls, dec_cls):
     enc.flush()
     b = Binding().string(1, at=0, maxlen=64)
     words, objects, *_ = storage(b)
-    dec = dec_cls(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, binding=b, words=words, objects=objects, max_dyn_string_len=4)
+    dec = dec_cls(reassembly=ROOMY_REASSEMBLY, max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, binding=b, words=words, objects=objects, max_dyn_string_len=4)
     assert dec.feed(enc.getvalue()) is Status.COMPLETE
     assert objects[0] == "0123456789"
 
@@ -455,7 +455,7 @@ def test_a_limit_rejection_stays_rejected(enc_cls, dec_cls):
     enc.flush()
     b = Binding().string(1, at=0).unsigned(2, at=0, count_at=1)
     words, objects, u, _q, _f = storage(b)
-    dec = dec_cls(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, binding=b, words=words, objects=objects, max_dyn_string_len=2)
+    dec = dec_cls(reassembly=ROOMY_REASSEMBLY, max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, binding=b, words=words, objects=objects, max_dyn_string_len=2)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
     with pytest.raises(SofaLimitError):
@@ -479,7 +479,7 @@ def test_a_field_the_table_does_not_name_is_skipped_uncapped(enc_cls, dec_cls):
     enc.flush()
     b = Binding().unsigned(2, at=0, count_at=1)
     words, objects, u, _q, _f = storage(b)
-    dec = dec_cls(max_dyn_string_len=FIXLEN_MAX, 
+    dec = dec_cls(reassembly=ROOMY_REASSEMBLY, max_dyn_string_len=FIXLEN_MAX, 
         binding=b,
         words=words,
         max_dyn_array_count=2,

@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
-from vectors import NO_CAPS, Recorder, capped
+from vectors import NO_CAPS, ROOMY_REASSEMBLY, Recorder, capped
 
 from sofab import (
     ARRAY_MAX,
@@ -174,7 +174,7 @@ def test_the_limit_still_governs_the_list_the_decoder_would_build(engine):
             return None  # asked, and declined to name a destination
 
     wire = bytes([0x0B]) + _uvarint(0x7FFFFFFF) + b"\x01"
-    dec = engine(max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(), max_dyn_array_count=4)
+    dec = engine(reassembly=ROOMY_REASSEMBLY, max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(), max_dyn_array_count=4)
     with pytest.raises(SofaLimitError):
         dec.feed(wire)
 
@@ -204,7 +204,7 @@ def test_a_handlers_own_destination_is_not_the_senders_to_dictate(engine):
     enc = Encoder()
     enc.write_unsigned_array(1, [7, 8, 9])
     enc.flush()
-    dec = engine(max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(), max_dyn_array_count=1)
+    dec = engine(reassembly=ROOMY_REASSEMBLY, max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(), max_dyn_array_count=1)
     dec.feed(enc.getvalue())
     assert asked == [3]
     assert list(dst) == [7, 8, 9, 0]
@@ -226,7 +226,7 @@ def test_a_destination_too_short_is_a_range_error_not_a_limit(engine):
 
     # id 1, unsigned array, count 2**31-1, then one lone element byte.
     wire = bytes([0x0B]) + _uvarint(0x7FFFFFFF) + b"\x01"
-    dec = engine(max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(), max_dyn_array_count=4)
+    dec = engine(reassembly=ROOMY_REASSEMBLY, max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(), max_dyn_array_count=4)
     with pytest.raises(SofaArgumentError):
         dec.feed(wire)
 
@@ -252,21 +252,21 @@ def test_the_same_two_answers_for_a_blob(engine):
             return self._dst
 
     # Its own buffer, big enough: read, cap or no cap.
-    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(bytearray(4096)), max_dyn_blob_len=10)
+    dec = engine(reassembly=ROOMY_REASSEMBLY, max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(bytearray(4096)), max_dyn_blob_len=10)
     dec.feed(wire)
     assert asked == [100]
 
     # Its own buffer, too short: the buffer's size is the only ceiling left,
     # and overrunning it is a range error rather than a policy rejection.
     asked.clear()
-    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(bytearray(8)), max_dyn_blob_len=10)
+    dec = engine(reassembly=ROOMY_REASSEMBLY, max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(bytearray(8)), max_dyn_blob_len=10)
     with pytest.raises(SofaArgumentError):
         dec.feed(wire)
     assert asked == [100]
 
     # No buffer back: the decoder would build the ``bytes`` itself, sized by the
     # wire, and that is the allocation the cap exists to prevent.
-    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(None), max_dyn_blob_len=10)
+    dec = engine(reassembly=ROOMY_REASSEMBLY, max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Handler(None), max_dyn_blob_len=10)
     with pytest.raises(SofaLimitError):
         dec.feed(wire)
 
@@ -299,7 +299,7 @@ def test_a_limit_rejection_is_terminal(engine):
     enc.flush()
 
     rec = Recorder()
-    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, visitor=rec, max_dyn_string_len=16)
+    dec = engine(reassembly=ROOMY_REASSEMBLY, max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, visitor=rec, max_dyn_string_len=16)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
     assert rec.events == []
@@ -355,7 +355,7 @@ def test_the_rejection_is_on_the_error_channel_not_the_status(engine):
     enc = Encoder()
     enc.write_string(1, "x" * 2000)
     enc.flush()
-    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, visitor=Recorder(), max_dyn_string_len=16)
+    dec = engine(reassembly=ROOMY_REASSEMBLY, max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, visitor=Recorder(), max_dyn_string_len=16)
     with pytest.raises(SofaLimitError) as caught:
         dec.feed(enc.getvalue())
     assert dec.error is caught.value
@@ -367,7 +367,7 @@ def test_reset_clears_the_rejection(engine):
     enc = Encoder()
     enc.write_string(1, "x" * 2000)
     enc.flush()
-    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, visitor=Recorder(), max_dyn_string_len=16)
+    dec = engine(reassembly=ROOMY_REASSEMBLY, max_dyn_array_count=ARRAY_MAX, max_dyn_blob_len=FIXLEN_MAX, visitor=Recorder(), max_dyn_string_len=16)
     with pytest.raises(SofaLimitError):
         dec.feed(enc.getvalue())
     dec.reset()

@@ -28,7 +28,7 @@ import tracemalloc
 import pytest
 from vectors import DECODER_ENGINES as DECODERS
 from vectors import ENCODER_ENGINES as ENCODERS
-from vectors import NO_CAPS, Status
+from vectors import NO_CAPS, ROOMY_REASSEMBLY, Status, capped
 
 from sofab import (
     FIXLEN_MAX,
@@ -178,7 +178,7 @@ def test_the_string_route_survives_a_chunk_boundary(dec_cls, enc_cls):
     wire = _string_wire(enc_cls)
     utf8 = TEXT.encode()
     sink = StringSink(bytearray(len(utf8)))
-    dec = dec_cls(**NO_CAPS, visitor=sink, reassembly=bytearray(len(wire) + 16))
+    dec = dec_cls(**capped(reassembly=bytearray(len(wire) + 16)), visitor=sink)
     for i in range(0, len(wire), 5):
         dec.feed(wire[i : i + 5])
     assert bytes(sink.dst) == utf8
@@ -266,7 +266,7 @@ def test_the_float_route_survives_a_chunk_boundary(dec_cls, enc_cls, width):
     values = [float(i) / 8 for i in range(40)]
     wire = _farray_wire(enc_cls, values, width)
     sink = FloatSink(array.array("d", [0.0] * len(values)))
-    dec = dec_cls(**NO_CAPS, visitor=sink, reassembly=bytearray(len(wire) + 16))
+    dec = dec_cls(**capped(reassembly=bytearray(len(wire) + 16)), visitor=sink)
     for i in range(0, len(wire), 7):
         dec.feed(wire[i : i + 7])
     assert list(sink.dst) == values
@@ -300,7 +300,7 @@ def test_a_string_through_its_destination_does_not_scale(dec_cls, enc_cls):
 
         def work():
             sink = StringSink(dst)
-            dec = dec_cls(**NO_CAPS, visitor=sink, reassembly=reassembly)
+            dec = dec_cls(**capped(reassembly=reassembly), visitor=sink)
             assert dec.feed(wire) is Status.COMPLETE
 
         return _peak(work)
@@ -326,7 +326,7 @@ def test_a_float_array_through_its_destination_does_not_scale(
 
         def work():
             sink = FloatSink(dst)
-            dec = dec_cls(**NO_CAPS, visitor=sink, reassembly=reassembly)
+            dec = dec_cls(**capped(reassembly=reassembly), visitor=sink)
             assert dec.feed(wire) is Status.COMPLETE
 
         return _peak(work)
@@ -362,7 +362,7 @@ def test_a_capped_fp32_array_still_reaches_the_raw_route_verdict(dec_cls):
 
     wire = _farray_wire(Encoder, [1.0] * 8, 4)
     with pytest.raises(SofaLimitError):
-        dec_cls(max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Raw(), max_dyn_array_count=4).feed(wire)
+        dec_cls(reassembly=ROOMY_REASSEMBLY, max_dyn_blob_len=FIXLEN_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Raw(), max_dyn_array_count=4).feed(wire)
 
 
 @pytest.mark.parametrize("dec_cls", DECODERS)

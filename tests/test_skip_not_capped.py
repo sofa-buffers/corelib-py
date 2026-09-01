@@ -30,9 +30,11 @@ sized by the wire, which is exactly the allocation §6.2.1 is about.
 
 from __future__ import annotations
 
+import tracemalloc
+
 import pytest
 from vectors import DECODER_ENGINES as ENGINES
-from vectors import Recorder, Status, bound, walk
+from vectors import ROOMY_REASSEMBLY, Recorder, Status, bound, walk
 
 from sofab import ARRAY_MAX, FIXLEN_MAX, Binding, Encoder, SofaArgumentError, SofaLimitError
 
@@ -117,32 +119,52 @@ def test_the_skip_survives_a_chunk_boundary(engine, chunk):
 
 
 @pytest.mark.parametrize("engine", ENGINES)
-def test_the_callers_reassembly_buffer_is_what_bounds_a_skip(engine):
-    """What replaces the cap on this route, and why the swap is the right one.
+def test_a_skip_does_not_need_the_reassembly_buffer_at_all(engine):
+    """The other thing a skip must not be charged for, and the reason it is the
+    same rule as the cap (#139).
 
-    A skipped payload that spans a chunk boundary still has to be joined
-    somewhere, and §6.6.2 makes that somewhere the caller's buffer. So the
-    memory a skip can cost is bounded -- by the buffer the caller sized, not by
-    a policy limit -- and a payload that does not fit is refused on
-    :class:`SofaArgumentError`.
+    A payload being *built* has to be joined somewhere, and §6.6.2 makes that
+    somewhere the caller's buffer: it arrives in pieces and the value needs all
+    of them at once. A payload being *discarded* needs none of them at once. It
+    has no value to rebuild, so nothing has to be replayed from its first byte
+    -- what the bytes need is dropping, and dropping is done a chunk at a time.
 
-    That is the right channel for it: a capacity fact about the caller's own
-    storage, not a policy verdict on the message. The bytes are well formed, and
-    the same message skips cleanly through a longer buffer.
+    This port used to retain a skipped construct anyway, because its resume
+    contract replayed every construct alike, and then refused the decode once
+    the retained bytes outgrew the buffer. That turned "the receiver ignores
+    this field" (MESSAGE_SPEC §7.3) into "this field ends the decode", which is
+    the one thing §7.3 rules out -- and made it depend on where the chunks fell,
+    which §7.2 item 4 rules out separately.
+
+    So: the smallest buffer the constructor accepts, a payload six times its
+    size, and one byte at a time.
     """
     data = _msg()
-
-    roomy = bytearray(4096)
-    status, rec, dec = walk(
-        engine, data, chunk=8, max_dyn_blob_len=CAP, reassembly=roomy,
-        recorder=Recorder(decline=lambda f: f.id == 7),
+    rec = Recorder(decline=lambda f: f.id == 7)
+    dec = engine(
+        max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX,
+        max_dyn_blob_len=CAP, visitor=rec, reassembly=bytearray(16),
     )
+    status = Status.COMPLETE
+    for off in range(0, len(data), 1):
+        status = dec.feed(data[off : off + 1])
     assert status is Status.COMPLETE
+    assert dec.error is None
+    # The values on either side, not merely "it did not raise": a skip that
+    # lost its place would take a neighbour with it.
     assert rec.events == NEIGHBOURS
 
-    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, 
-        visitor=Recorder(decline=lambda f: f.id == 7),
-        max_dyn_blob_len=CAP,
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_read_that_spans_a_chunk_still_needs_the_buffer(engine):
+    """The control for the case above, so it cannot pass by the buffer having
+    stopped mattering. The same bytes, the same 16-byte buffer, a handler that
+    *takes* the blob: now there is a value to build, all hundred bytes of it are
+    needed at once, and §6.6.2's refusal is the right answer."""
+    data = _msg()
+    dec = engine(
+        max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX,
+        max_dyn_blob_len=FIXLEN_MAX, visitor=Recorder(),
         reassembly=bytearray(16),
     )
     with pytest.raises(SofaArgumentError):
@@ -156,7 +178,7 @@ def test_the_cap_still_fires_on_the_route_that_allocates(engine):
     been removed: the same bytes, the same limit, a handler that takes the
     default. Nothing but a ``bytes`` of the decoder's own can hold the payload,
     and the wire is the only size it could build one from."""
-    dec = engine(max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Recorder(), max_dyn_blob_len=CAP)
+    dec = engine(reassembly=ROOMY_REASSEMBLY, max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX, visitor=Recorder(), max_dyn_blob_len=CAP)
     with pytest.raises(SofaLimitError):
         dec.feed(_msg())
 
@@ -179,3 +201,171 @@ def test_an_array_the_handler_skips_is_not_capped_either(engine):
     assert status is Status.COMPLETE
     assert dec.error is None
     assert rec.events == NEIGHBOURS
+
+
+# --- a skipped construct of ANY size, on a chunk-fed receiver (#139) ---------
+#
+# The measured shape the rule above is really about. Everything up to here uses
+# a 100-byte payload, which fits any buffer a test would think to pass, so the
+# suite could pin "a skip is not capped" while a skip was still being charged
+# for the reassembly space it did not need. What §7.3 actually promises is that
+# a field the receiver IGNORES costs it nothing -- so the payload here is chosen
+# to be larger than any buffer a receiver would size for the fields it does
+# read, and the assertions are on the VALUES of the fields around it.
+#
+# 4 KiB was the reassembly size this library used to pick for a caller who named
+# none, so 4 KiB chunks against a payload past it is exactly the failure that
+# was reported: an ordinary two-field message plus one unknown-id field died
+# with SofaArgumentError and lost both fields.
+
+SURROUND = [("str", 1, "hi"), ("u", 2, 7)]
+
+
+def _with_unknown(kind, size, *, first=False):
+    """An ordinary in-policy message plus ONE oversized field at an id the
+    receiver below does not know."""
+    enc = Encoder()
+    if not first:
+        enc.write_string(1, "hi")
+        enc.write_unsigned(2, 7)
+    if kind == "blob":
+        enc.write_bytes(9000, b"\x5a" * size)
+    elif kind == "string":
+        enc.write_string(9000, "z" * size)
+    elif kind == "array":
+        enc.write_unsigned_array(9000, [1] * size)
+    elif kind == "sequence":
+        enc.write_sequence_begin_lazy(9000)
+        enc.write_bytes(3, b"\x5a" * size)
+        enc.write_sequence_end_keep()
+    if first:
+        enc.write_string(1, "hi")
+        enc.write_unsigned(2, 7)
+    enc.flush()
+    return enc.getvalue()
+
+
+def _known_only(engine, wire, chunk, **kw):
+    """Feed ``wire`` to a receiver that knows ids 1 and 2 and nothing else, so
+    id 9000 is an unknown id in the §7.3 sense -- not a field a visitor hook
+    happens to be offered."""
+    rec = Recorder(decline=lambda f: f.id not in (1, 2))
+    dec = engine(
+        max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX,
+        max_dyn_blob_len=FIXLEN_MAX, visitor=rec, **kw
+    )
+    status = Status.COMPLETE
+    for off in range(0, len(wire), chunk):
+        status = dec.feed(wire[off : off + chunk])
+    return status, rec, dec
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("first", [False, True], ids=["appended", "leading"])
+@pytest.mark.parametrize(
+    ("kind", "size"),
+    [
+        ("blob", 5_000),
+        ("blob", 200_000),
+        ("blob", 1 << 20),
+        ("string", 200_000),
+        ("array", 50_000),
+        ("sequence", 200_000),
+    ],
+    ids=lambda v: str(v),
+)
+def test_an_unknown_field_of_any_size_costs_the_decode_nothing(
+    engine, kind, size, first
+):
+    """§7.3 / §6.2.1: the field is ignored, so its size is not the receiver's
+    problem. Both positions, because a leading one loses *every* field."""
+    wire = _with_unknown(kind, size, first=first)
+    status, rec, dec = _known_only(engine, wire, 4096, reassembly=4096)
+    assert status is Status.COMPLETE
+    assert dec.error is None
+    assert rec.events == SURROUND
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("chunk", [1, 3, 17], ids=lambda n: f"chunk{n}")
+def test_the_outcome_does_not_depend_on_where_the_chunks_fall(engine, chunk):
+    """§7.2 item 4, which the old behaviour broke outright: the very same bytes
+    were COMPLETE in one feed and a raised SofaArgumentError in small pieces."""
+    wire = _with_unknown("blob", 40_000)
+    whole = _known_only(engine, wire, len(wire), reassembly=64)
+    split = _known_only(engine, wire, chunk, reassembly=64)
+    assert whole[0] is split[0] is Status.COMPLETE
+    assert whole[1].events == split[1].events == SURROUND
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_mistyped_field_is_skipped_at_any_size_too(engine):
+    """MESSAGE_SPEC §7.3's other half: the id IS declared, under a tag the wire
+    contradicts. Same treatment as an unknown id, so the same size must be free
+    -- and this route reaches the skip through a Binding, where no visitor hook
+    is consulted at all."""
+    enc = Encoder()
+    enc.write_unsigned(1, 5)
+    enc.write_bytes(7, b"\x5a" * 200_000)  # declared unsigned below
+    enc.write_unsigned(3, 6)
+    enc.flush()
+
+    b = Binding().unsigned(1, at=0).unsigned(7, at=1).unsigned(3, at=2)
+    words = bytearray(b.tree_words_required * 8)
+    objects: list = [None] * b.tree_objects_required
+    dec = engine(
+        binding=b, words=words, objects=objects, reassembly=512,
+        max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX,
+        max_dyn_blob_len=FIXLEN_MAX,
+    )
+    wire = enc.getvalue()
+    status = Status.COMPLETE
+    for off in range(0, len(wire), 256):
+        status = dec.feed(wire[off : off + 256])
+    assert status is Status.COMPLETE
+    assert dec.error is None
+    u = memoryview(words).cast("Q")
+    assert u[0] == 5 and u[2] == 6
+    assert u[1] == 0  # the slot the mistyped field must not have touched
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_the_memory_a_skip_costs_does_not_grow_with_the_payload(engine):
+    """§6.6's own wording for what "bounded" means -- storage that "does not
+    grow with the message". A verdict-only assertion would pass with the payload
+    retained in a buffer big enough to hold it, so measure instead: twenty-five
+    times the payload, through the same reassembly buffer, for the same money.
+
+    The control is the read of the same field, which must allocate what it
+    returns -- without it a broken measurement would pass this vacuously.
+    """
+    small = _with_unknown("blob", 40_000)
+    large = _with_unknown("blob", 1_000_000)
+
+    def peak(fn):
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            base = tracemalloc.get_traced_memory()[0]
+            fn()
+            top = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        return top - base
+
+    skipped_small = peak(lambda: _known_only(engine, small, 4096, reassembly=4096))
+    skipped_large = peak(lambda: _known_only(engine, large, 4096, reassembly=4096))
+
+    # Control: the same bytes with the field taken, in one feed, which has to
+    # build the payload it hands over.
+    taken = peak(
+        lambda: engine(
+            max_dyn_array_count=ARRAY_MAX, max_dyn_string_len=FIXLEN_MAX,
+            max_dyn_blob_len=FIXLEN_MAX, visitor=Recorder(), reassembly=4096,
+        ).feed(large)
+    )
+    if taken < 500_000:
+        pytest.skip("tracemalloc is not measuring allocation on this build")
+
+    # 25x the payload, and the skip must not have grown by anything like it.
+    assert skipped_large < skipped_small + 100_000

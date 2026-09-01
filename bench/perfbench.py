@@ -61,6 +61,12 @@ CAP_ARR = ARRAY_MAX
 CAP_STR = FIXLEN_MAX
 CAP_BLOB = FIXLEN_MAX
 
+# The reassembly buffer is the caller's too (§6.6.2), and the codec holds no
+# size of its own -- so, like the caps, it is stated here rather than defaulted.
+# Room for the largest single construct any workload below streams; nothing a
+# row SKIPS needs room at all, because a discarded construct never enters it.
+REASSEMBLY = 1 << 21
+
 
 N = 1000
 GOLDEN = 0x9E3779B97F4A7C15
@@ -131,7 +137,7 @@ class _U64ArraySink(Visitor):
 def decode_u64_array(data: bytes) -> int:
     sink = _U64ArraySink()
     Decoder(max_dyn_array_count=CAP_ARR,
-            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB, reassembly=REASSEMBLY,
             visitor=sink).feed(data)
     return sink.acc
 
@@ -165,7 +171,7 @@ class _TypicalSink(Visitor):
 def decode_typical(data: bytes) -> int:
     sink = _TypicalSink()
     Decoder(max_dyn_array_count=CAP_ARR,
-            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB, reassembly=REASSEMBLY,
             visitor=sink).feed(data)
     return sink.acc
 
@@ -354,7 +360,7 @@ def decode_composite(data: bytes) -> int:
     """Whole message, all fields read."""
     sink = _CompositeSink()
     Decoder(max_dyn_array_count=CAP_ARR,
-            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB, reassembly=REASSEMBLY,
             visitor=sink).feed(data)
     return sink.acc
 
@@ -382,7 +388,7 @@ def decode_composite_skip(data: bytes) -> int:
     filter runs: walk the message, materialize nothing."""
     sink = _SkipAllSink()
     Decoder(max_dyn_array_count=CAP_ARR,
-            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB, reassembly=REASSEMBLY,
             visitor=sink).feed(data)
     return sink.n
 
@@ -620,7 +626,7 @@ def decode_perf(data: bytes) -> int:
     """Decode the perf message, folding every value into a checksum."""
     sink = _PerfSink()
     Decoder(max_dyn_array_count=CAP_ARR,
-            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+            max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB, reassembly=REASSEMBLY,
             visitor=sink).feed(data)
     return sink.acc
 

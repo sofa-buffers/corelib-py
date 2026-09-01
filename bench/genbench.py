@@ -25,6 +25,7 @@ from decode_shapes import (  # noqa: E402
     CAP_BLOB,
     CAP_STR,
     COUNT_AT,
+    REASSEMBLY,
     SCALAR_AT,
     build_msg,
     new_storage,
@@ -69,7 +70,7 @@ def _driver(cls):
         v = cls(u)
         def body(data):
             Decoder(max_dyn_array_count=CAP_ARR,
-                    max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                    max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB, reassembly=REASSEMBLY,
                     visitor=v).feed(data)
         return body
     return make
@@ -104,7 +105,7 @@ class _Fallback(Visitor):
 def make_hybrid():
     words, u = new_storage()
     dec = Decoder(max_dyn_array_count=CAP_ARR,
-                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB,
+                  max_dyn_string_len=CAP_STR, max_dyn_blob_len=CAP_BLOB, reassembly=REASSEMBLY,
                   binding=BINDING, words=words, visitor=_Fallback())
     def body(data):
         dec.reset()

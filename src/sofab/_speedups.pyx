@@ -502,7 +502,7 @@ cdef extern from "Python.h":
 # enum objects the pure path does.
 from .types import (
     ARRAY_MAX,
-    DEFAULT_REASSEMBLY,
+    MIN_REASSEMBLY,
     FIXLEN_MAX,
     ID_MAX,
     MAX_DEPTH,
@@ -604,8 +604,8 @@ cdef int _MAX_DEPTH = _MAX_DEPTH_C
 # installed together with a flush sink. Mirrors types.MIN_OUTPUT_BUFFER.
 cdef Py_ssize_t _MIN_OUTPUT_BUFFER = MIN_OUTPUT_BUFFER
 # Reassembly space a decoder takes when the caller names no size. Mirrors
-# sofab.types.DEFAULT_REASSEMBLY; both engines bound memory the same way.
-cdef Py_ssize_t _DEFAULT_REASSEMBLY = DEFAULT_REASSEMBLY
+# sofab.types.MIN_REASSEMBLY; both engines bound memory the same way.
+cdef Py_ssize_t _MIN_REASSEMBLY = MIN_REASSEMBLY
 
 cdef inline object _fresh_bytearray(Py_ssize_t n):
     # A bytearray of n bytes whose contents are not zeroed. Only the span
@@ -753,6 +753,13 @@ cdef int _PEND_FARRAY = 4
 # destination the handler supplied, unparks it and walks on. Mirrors the pure
 # decoder's _LIMIT wrapper tuple.
 cdef int _PEND_LIMIT = 5
+# The remainder of a construct being DISCARDED, carried across feeds: _pend_size
+# is the raw byte count still to drop, _pend_count the varints still to drop and
+# _pend_subtype how many bytes of the varint in flight have gone already. Mirrors
+# the pure decoder's _DISCARD tuple — see the long note there for why a skipped
+# construct is dropped incrementally instead of being replayed from its first
+# byte (#139).
+cdef int _PEND_DISCARD = 6
 
 
 # --- ZigZag (identical math to sofab._varint) --------------------------------
@@ -2033,6 +2040,11 @@ cdef class Decoder:
     # See _arm/_suspend.
     cdef Py_ssize_t _keep
     cdef int _keep_cur_wtype
+    # The depth a sequence skip in flight is walking back to, or -1 when none is
+    # in flight. Mirrors the pure decoder's _skip_depth: a resumed skip re-enters
+    # _skip with _depth already part-way down the sub-tree, so the target cannot
+    # be re-derived from it.
+    cdef int _skip_depth
 
     # --- push mode (§5.2) ---------------------------------------------------
     cdef object _visitor
@@ -2103,20 +2115,24 @@ cdef class Decoder:
         self._running = False
         self._rstart = 0
         self._rend = 0
-        # One reassembly shape, never grown (S6.6.2) -- see the pure engine.
+        # One reassembly shape, never grown (S6.6.2), and REQUIRED for the same
+        # reason the three caps are (S6.2.1, #137) -- see the pure engine.
         if reassembly is None:
-            self._rbuf = _fresh_bytearray(_DEFAULT_REASSEMBLY)
+            raise SofaArgumentError(
+                "reassembly is required (§6.2.1/§6.6.2): the reassembly buffer "
+                "is the caller's storage and the codec holds no size of its own")
         elif type(reassembly) is bytearray:
             self._rbuf = reassembly
         elif type(reassembly) is int:
-            if reassembly < 16:
+            if reassembly < _MIN_REASSEMBLY:
                 raise SofaArgumentError(
-                    "reassembly=%d is too small; 16 bytes is the least that "
-                    "can hold a construct spanning a chunk" % reassembly)
+                    "reassembly=%d is too small; %d bytes is the least that "
+                    "can hold a construct spanning a chunk"
+                    % (reassembly, _MIN_REASSEMBLY))
             self._rbuf = _fresh_bytearray(<Py_ssize_t>reassembly)
         else:
             raise SofaArgumentError(
-                "reassembly must be a bytearray, a byte count, or omitted")
+                "reassembly must be a bytearray or a byte count")
 
         if binding is None and visitor is None:
             raise SofaArgumentError("a decoder needs a field handler (binding / visitor)")
@@ -2201,6 +2217,7 @@ cdef class Decoder:
         self._limit_msg = None
         self._keep = 0
         self._keep_cur_wtype = -1
+        self._skip_depth = -1
 
     def __dealloc__(self):
         # _vstack points into _stackmem; only the references it holds have to be
@@ -2454,18 +2471,6 @@ cdef class Decoder:
         self._pos = pos + n
         return out
 
-    cdef int _skip_exact(self, Py_ssize_t n) except -1:
-        # Consume n bytes without building the object holding them: §5.2 makes a
-        # skip pure consumption, so it must not pay for a copy of a payload it
-        # discards. Same sourcing and same suspension as _read_exact, mirroring
-        # Decoder._skip_exact in the pure engine — the bytes stay buffered on the
-        # slow path (the resume contract replays them), only the copy is gone.
-        cdef Py_ssize_t pos = self._pos
-        if pos + n > self._n:
-            raise self._suspend("truncated payload")
-        self._pos = pos + n
-        return 0
-
     cdef list _read_varints(
         self, Py_ssize_t count, bint zigzag, bint bounded, int64_t lo, int64_t hi
     ):
@@ -2544,25 +2549,6 @@ cdef class Decoder:
             i += 1
         self._pos = pos
         return out
-
-    cdef int _skip_varints(self, Py_ssize_t count) except -1:
-        cdef Py_ssize_t pos = self._pos
-        cdef const unsigned char* p = self._p
-        cdef Py_ssize_t n = self._n
-        cdef Py_ssize_t i = 0
-        while i < count:
-            if pos < n and p[pos] < 0x80:
-                pos += 1
-                i += 1
-                continue
-            self._pos = pos
-            self._varint()
-            p = self._p
-            pos = self._pos
-            n = self._n
-            i += 1
-        self._pos = pos
-        return 0
 
     # --- field iteration ----------------------------------------------------
 
@@ -2788,7 +2774,19 @@ cdef class Decoder:
         return <Py_ssize_t>total
 
     cdef int _skip_pending(self) except -1:
+        # Discard the value the last header announced (§5.2: a skip *consumes
+        # and discards*). Nothing is materialized, nothing is copied and --
+        # unlike every read -- nothing has to be replayed: the construct becomes
+        # the _PEND_DISCARD counter the moment its first byte is consumed, so it
+        # is dropped incrementally across as many feeds as it takes and never
+        # occupies the reassembly buffer. Mirrors Decoder._skip_pending.
         cdef int kind = self._pk
+        cdef Py_ssize_t nbytes
+        cdef uint64_t nvarints
+        if kind == _PEND_DISCARD:
+            # The remainder of a construct an earlier feed started discarding.
+            self._drain_discard()
+            return 0
         if kind == _PEND_LIMIT:
             # A skipped field is not capped (#128). §6.2.1 enforces a receiver
             # limit "at the count/length header — before the allocation it is
@@ -2806,53 +2804,120 @@ cdef class Decoder:
             kind = self._pk = self._pk_real
             self._limit_msg = None
         if kind == _PEND_SCALAR:
+            # Ten bytes at the outside (§4.1), and its overlong verdict is the
+            # format's rather than this field's — so it keeps the ordinary
+            # replaying read rather than earning a counter of its own.
             self._varint()
-        elif kind == _PEND_FIXLEN:
-            self._skip_exact(<Py_ssize_t>self._pend_size)
-        elif kind == _PEND_VARRAY:
-            self._skip_varints(<Py_ssize_t>self._pend_count)
-        else:  # _PEND_FARRAY
-            self._skip_exact(self._farray_nbytes(self._pend_count, self._pend_size))
-        # Cleared only now: had the value run out mid-skip, the field has to stay
-        # pending so the retry skips it again from its first byte (§5.2).
+            # Cleared only now: had the value run out mid-skip, the field has to
+            # stay pending so the retry skips it again from its first byte
+            # (§5.2).
+            self._pk = _PEND_NONE
+            return 0
+        if kind == _PEND_FIXLEN:
+            nbytes, nvarints = <Py_ssize_t>self._pend_size, 0
+        elif kind == _PEND_FARRAY:
+            # May raise (an unsatisfiable count * width) — before the value is
+            # committed to the discard, so the field stays pending for a retry.
+            nbytes, nvarints = self._farray_nbytes(self._pend_count, self._pend_size), 0
+        else:  # _PEND_VARRAY
+            nbytes, nvarints = 0, self._pend_count
+        # Committed here: from this point the construct is bytes to drop, not a
+        # value anyone can ask for, so no suspension below rewinds into it.
+        self._pk = _PEND_DISCARD
+        self._pend_size = <uint64_t>nbytes
+        self._pend_count = nvarints
+        self._pend_subtype = 0
+        self._drain_discard()
+        return 0
+
+    cdef int _drain_discard(self) except -1:
+        # Drop as much of a _PEND_DISCARD remainder as this chunk holds, clearing
+        # the pending value when the construct is finally gone. Otherwise the
+        # whole chunk is consumed, the smaller remainder written back, and
+        # INCOMPLETE reported — the message really does end inside a construct
+        # (§5.2), even though nothing is being built from it.
+        #
+        # The SofaIncompleteError is raised directly rather than through
+        # _suspend: the rewind is the one thing that must NOT happen here. _pos
+        # is left at the end of the buffer, so _retain carries nothing and the
+        # reassembly buffer stays empty however large the skipped construct is.
+        cdef Py_ssize_t nbytes = <Py_ssize_t>self._pend_size
+        cdef Py_ssize_t have, pos, end
+        cdef uint64_t left
+        cdef int vbytes
+        cdef const unsigned char* p
+        cdef unsigned char b
+        if nbytes:
+            have = self._n - self._pos
+            if have < nbytes:
+                self._pos = self._n
+                self._pend_size = <uint64_t>(nbytes - have)
+                raise SofaIncompleteError("skipped payload spans this chunk")
+            self._pos += nbytes
+            self._pend_size = 0
+        left = self._pend_count
+        if left:
+            # The elements are varints, so the end of one is found rather than
+            # computed. _pend_subtype counts the bytes of the varint in flight,
+            # so the format's 64-bit bound (§4.1.3) is enforced across a chunk
+            # boundary exactly as within one — a skip validates nothing about a
+            # *value* (§6.7.2), but an overlong varint is malformed framing and
+            # stays INVALID wherever it sits.
+            p = self._p
+            pos = self._pos
+            end = self._n
+            vbytes = self._pend_subtype
+            while left:
+                if pos >= end:
+                    self._pos = pos
+                    self._pend_count = left
+                    self._pend_subtype = vbytes
+                    raise SofaIncompleteError("skipped array spans this chunk")
+                b = p[pos]
+                pos += 1
+                vbytes += 1
+                if vbytes == 10:
+                    # The tenth byte carries bit 63 and nothing above it, and no
+                    # eleventh can follow — the verdict _varint reaches.
+                    if b > 0x01:
+                        raise SofaDecodeError("overlong varint")
+                    left -= 1
+                    vbytes = 0
+                elif b < 0x80:
+                    left -= 1
+                    vbytes = 0
+            self._pos = pos
+            self._pend_count = 0
+            self._pend_subtype = 0
         self._pk = _PEND_NONE
         return 0
 
 
     cdef int _skip(self) except -1:
-        cdef int target
-        cdef int depth, cur_wtype, pk, pend_wtype, pend_subtype
-        cdef uint64_t pend_count, pend_size
-        cdef object cur
-        if self._cur_wtype == _WT_SEQUENCE_START:
-            # Walking a whole sequence spans many fields, so unlike every other
-            # call this one moves the field state — and lets _next_wire re-arm
-            # _keep — before it can suspend. The field state is put back here,
-            # so a re-issued skip replays the whole sequence (§5.2).
-            floor = self._pos
-            depth = self._depth
-            cur_wtype = self._cur_wtype
-            pk = self._pk
-            pend_wtype = self._pend_wtype
-            pend_subtype = self._pend_subtype
-            pend_count = self._pend_count
-            pend_size = self._pend_size
-            target = depth - 1
-            try:
-                while self._depth > target:
-                    if self._next_wire() < 0:
-                        raise self._suspend("truncated sequence")
-            except SofaIncompleteError:
-                self._pos = floor
-                self._keep = floor
-                self._depth = depth
-                self._cur_wtype = cur_wtype
-                self._pk = pk
-                self._pend_wtype = pend_wtype
-                self._pend_subtype = pend_subtype
-                self._pend_count = pend_count
-                self._pend_size = pend_size
-                raise
+        # Skip an entire (nested) sequence, from the start marker just read to
+        # its matching end — or, off a sequence start, discard the value the last
+        # header announced.
+        #
+        # Resumes rather than replays: the walk keeps whatever ground it made
+        # before the bytes ran out and the next feed carries on from there. The
+        # sub-tree is being discarded, so no value's first byte has to be seen
+        # again — and replaying it would mean holding the whole sequence in the
+        # reassembly buffer at once, the same defect a single oversized skipped
+        # field had (#139). What crosses the boundary is _depth, the pending
+        # value and _skip_depth, all decoder state already; the individual header
+        # or payload in flight still rewinds, in _next_wire, exactly as outside a
+        # skip. Mirrors Decoder._skip_sequence.
+        if self._skip_depth >= 0 or self._cur_wtype == _WT_SEQUENCE_START:
+            # The depth the sequence closes back to, held on the decoder because
+            # a resumed skip re-enters with _depth already part-way down the
+            # sub-tree: re-deriving the target from it would stop the walk at the
+            # first nested end marker and let the rest decode as ordinary fields.
+            if self._skip_depth < 0:
+                self._skip_depth = self._depth - 1
+            while self._depth > self._skip_depth:
+                if self._next_wire() < 0:
+                    raise self._suspend("truncated sequence")
+            self._skip_depth = -1
             return 0
         if self._pk != _PEND_NONE:
             self._skip_pending()
@@ -3297,6 +3362,7 @@ cdef class Decoder:
         self._limit_msg = None
         self._keep = 0
         self._keep_cur_wtype = -1
+        self._skip_depth = -1
         self._status = <int>Status.COMPLETE
         self._err = None
         self._limit = None

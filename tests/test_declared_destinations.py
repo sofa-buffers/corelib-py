@@ -263,10 +263,7 @@ def test_the_declared_route_survives_a_chunk_boundary(dec_cls, enc_cls):
     complete."""
     wire = _wire(enc_cls)
     table, objs, words = _table()
-    dec = dec_cls(
-        **NO_CAPS, binding=table, words=words, objects=objs,
-        reassembly=bytearray(len(wire) + 64),
-    )
+    dec = dec_cls(**capped(reassembly=bytearray(len(wire) + 64)), binding=table, words=words, objects=objs, )
     for i in range(0, len(wire), 3):
         dec.feed(wire[i : i + 3])
     n = memoryview(words).cast("Q")

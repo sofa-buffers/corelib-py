@@ -15,7 +15,7 @@ import random
 
 import pytest
 from test_push_feed import Collect
-from vectors import ENGINE_PAIRS, NO_CAPS
+from vectors import ENGINE_PAIRS, NO_CAPS, capped
 
 from sofab import Binding, Status, Visitor
 
@@ -237,3 +237,102 @@ def test_bound_destinations_match_the_visitor(enc_cls, dec_cls, chunk):
         for key, value in want.items():
             assert key in got, (seed, key)
             assert got[key] == value, (seed, key)
+
+
+# --- the skip path, through a buffer that could never hold what it skips ------
+#
+# The two fuzzes above only ever skip what a chunk already holds: every payload
+# they generate is smaller than the smallest chunk they feed. So they said
+# nothing about a skip that has to span feeds, which is where this port kept a
+# discarded construct in the reassembly buffer until the whole of it was there
+# at once and then refused the decode (#139).
+#
+# Here the declined fields are far larger than the buffer, so every one of them
+# is discarded across several feeds -- and the discard has to leave the cursor
+# in exactly the right place, at every chunking, for the small fields around it
+# to still arrive. Sequences are declined whole, so a nested sub-tree is
+# discarded across feeds too, which is the resume path with the most state
+# behind it (the walk's own depth).
+
+#: Fewer than SEEDS: every message here is an order of magnitude larger, and
+#: one of the chunkings below feeds them a byte at a time.
+SKIP_SEEDS = 40
+SKIP_ID = 900
+SKIP_SEQ_ID = 901
+#: Nothing the receiver keeps is bigger than this, so the buffer below is only
+#: ever too small for what is skipped.
+SKIP_BUF = 256
+
+
+def _emit_skippable(rng: random.Random, enc) -> None:
+    """The ordinary generator above, with oversized fields at ids the receiver
+    does not know spliced in between."""
+    for _ in range(rng.randint(1, 5)):
+        _emit(rng, enc, allow_seq=False)
+        big = rng.randint(2 * SKIP_BUF, 3 * SKIP_BUF)
+        which = rng.randrange(4)
+        if which == 0:
+            enc.write_bytes(SKIP_ID, bytes(rng.getrandbits(8) for _ in range(big)))
+        elif which == 1:
+            enc.write_string(SKIP_ID, "z" * big)
+        elif which == 2:
+            # Varint elements, so the discard has to find each element's end
+            # rather than compute a byte span -- across chunk boundaries that
+            # fall inside a single element.
+            enc.write_unsigned_array(
+                SKIP_ID, [rng.getrandbits(rng.choice([1, 20, 64])) for _ in range(big)]
+            )
+        else:
+            enc.write_sequence_begin_lazy(SKIP_SEQ_ID)
+            _emit(rng, enc, allow_seq=False)
+            enc.write_bytes(6, bytes(rng.getrandbits(8) for _ in range(big)))
+            enc.write_sequence_end_keep()
+    _emit(rng, enc, allow_seq=False)
+
+
+class _Declining(Collect):
+    """Knows the SCHEMA ids and nothing else: SKIP_ID and SKIP_SEQ_ID are
+    unknown ids in the MESSAGE_SPEC §7.3 sense."""
+
+    def on_field(self, field):
+        return False if field.id not in SCHEMA else None
+
+    def on_sequence_begin(self, field_id):
+        # A sequence never reaches on_field, so the same test runs here.
+        if field_id != SEQ_ID:
+            return False
+        return super().on_sequence_begin(field_id)
+
+
+@pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
+# All well under SKIP_BUF: a chunk is appended into the reassembly buffer whole
+# whenever anything is carried, so the buffer has to hold a chunk plus a carry
+# whatever else it does. That is the parameter's ordinary contract and not what
+# this test is about -- what it is about is the SKIPPED constructs, every one of
+# which is several times the buffer.
+@pytest.mark.parametrize("chunk", [1, 7, 64, 128])
+def test_skipped_fields_are_chunking_independent(enc_cls, dec_cls, chunk):
+    """§7.2 item 4 over the skip path, and §7.3's promise that an ignored field
+    costs the receiver nothing: the reassembly buffer is a fraction of every
+    skipped construct, and the decode still has to come out the same as the
+    one-shot feed -- same status, same events, same values."""
+    for seed in range(SKIP_SEEDS):
+        enc = enc_cls()
+        _emit_skippable(random.Random(seed), enc)
+        enc.flush()
+        msg = enc.getvalue()
+
+        want = _Declining()
+        assert dec_cls(**capped(reassembly=len(msg) + 64), visitor=want).feed(
+            msg
+        ) is Status.COMPLETE
+
+        got = _Declining()
+        dec = dec_cls(**capped(reassembly=SKIP_BUF), visitor=got)
+        st = Status.COMPLETE
+        for off in range(0, len(msg), chunk):
+            st = dec.feed(msg[off : off + chunk])
+        assert st is Status.COMPLETE, seed
+        assert got.events == want.events, seed
+        # Not vacuous: the message really did carry fields the receiver ignored.
+        assert len(msg) > 2 * SKIP_BUF, seed

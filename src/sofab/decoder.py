@@ -60,11 +60,11 @@ from .binding import (
 )
 from .types import (
     ARRAY_MAX,
-    DEFAULT_REASSEMBLY,
     FIXLEN_MAX,
     ID_MAX,
     MASK64,
     MAX_DEPTH,
+    MIN_REASSEMBLY,
     Field,
     FixlenSubtype,
     SofaArgumentError,
@@ -96,6 +96,22 @@ _FARRAY = 3
 # sized by the wire — raises it; a path that skips the field, or that fills a
 # destination the handler supplied, unwraps it and walks on.
 _LIMIT = 4
+# The remainder of a construct that is being DISCARDED, carried across feeds:
+# ``(_DISCARD, nbytes, nvarints, vbytes)`` — raw bytes still to drop, varints
+# still to drop, and how many bytes of the varint in flight have gone already.
+#
+# Every other pending kind is a value somebody may still build, so it is
+# replayed from its first byte when the bytes run out (see "resume
+# transactions"). A skipped construct has no value to build — MESSAGE_SPEC §7.3
+# makes an unknown id and a mistyped one something the receiver IGNORES, and
+# CORELIB_PLAN §6.7.2 says the skip route "neither materializes nor validates" —
+# so replaying it buys nothing and costs everything: the bytes would have to
+# stay in the reassembly buffer until the whole construct was in it at once, and
+# a field nobody is allowed to look at would abort the decode by being large
+# (#139). Discarding is incremental instead: consume what the chunk holds, carry
+# the remainder as this counter, and drop it off the front of the next chunk.
+# Nothing is rewound, because there is nothing to rebuild.
+_DISCARD = 5
 
 # Wire-type members indexed by their integer value, so the per-field hot path
 # can recover the enum member by index (``_WT[wtype]``) instead of paying the
@@ -250,6 +266,9 @@ class Decoder:
         "_rstart",
         "_resume_kind",
         "_running",
+        # The depth a sequence skip in flight is walking back to, or -1 when no
+        # skip is in flight. See _skip_sequence.
+        "_skip_depth",
         "_status",
         "_visitor",
         "_vstack",
@@ -351,17 +370,26 @@ class Decoder:
         schema bound, and exceeding it is INVALID rather than a policy
         rejection (§6.2.1).
 
-        ``reassembly`` is where a construct split across fed chunks is joined.
-        Pass a ``bytearray`` to supply the storage, an ``int`` to have the
-        decoder take that many bytes **at construction**, or leave it out for
-        :data:`sofab.DEFAULT_REASSEMBLY` bytes. There is no other shape: §6.6.2
-        says a codec "**MUST NOT** grow a private accumulator instead", so the
-        buffer is sized once and never extended, and a construct that does not
-        fit it is :class:`SofaArgumentError` — the §6.3 tier for a well-formed
-        message that does not fit the storage this caller offered. What that
-        buys is §6.6's whole point: a caller bounds a decode's memory **by
-        construction**, and no sender can change the answer by sending different
-        bytes.
+        ``reassembly`` is where a construct split across fed chunks is joined,
+        and it is **required** for the same reason the three caps are: the size
+        decides which well-formed messages this receiver can stream, so it is
+        the receiver's number and §6.2.1 leaves the codec none to invent. Pass a
+        ``bytearray`` to supply the storage, or an ``int`` for the decoder to
+        take that many bytes **at construction** (at least
+        :data:`sofab.MIN_REASSEMBLY`). There is no other shape and no default:
+        §6.6.2 says a codec "**MUST NOT** grow a private accumulator instead",
+        so the buffer is sized once and never extended, and a construct that
+        does not fit it is :class:`SofaArgumentError` — the §6.3 tier for a
+        well-formed message that does not fit the storage this caller offered.
+        What that buys is §6.6's whole point: a caller bounds a decode's memory
+        **by construction**, and no sender can change the answer by sending
+        different bytes.
+
+        Only a construct whose **value is being built** ever goes there. A field
+        the receiver skips — an unknown id, or one MESSAGE_SPEC §7.3 says is
+        mistyped — is discarded as it arrives and needs no room at all, whatever
+        its size, so the number to pass is the largest single value this
+        receiver actually reads and not the largest field a sender might send.
 
         A message fed in **one** call never touches the buffer, whatever its
         size — nothing spans a chunk boundary when there is only one chunk. It
@@ -406,20 +434,31 @@ class Decoder:
         # and the accelerator reaches its bytes through PyByteArray_AS_STRING.
         # Widening this would mean two buffer protocols where §5.3 wants one
         # behaviour.
+        #
+        # Required, and for the same reason the three caps above are (§6.2.1,
+        # #137): the size settles which well-formed messages this receiver can
+        # stream, which makes it a receiver policy. A codec "MUST NOT hold a
+        # limit of its own" and "MUST NOT supply a default for one it was not
+        # given", so an omitted argument is a defect in the CALL (§6.3's
+        # InvalidArgument tier) and not a cue to pick a number.
         if reassembly is None:
-            self._rbuf: Any = bytearray(DEFAULT_REASSEMBLY)
-        elif isinstance(reassembly, bytearray):
-            self._rbuf = reassembly
+            raise SofaArgumentError(
+                "reassembly is required (§6.2.1/§6.6.2): the reassembly buffer "
+                "is the caller's storage and the codec holds no size of its own"
+            )
+        if isinstance(reassembly, bytearray):
+            self._rbuf: Any = reassembly
         elif isinstance(reassembly, int) and not isinstance(reassembly, bool):
-            if reassembly < 16:
+            if reassembly < MIN_REASSEMBLY:
                 raise SofaArgumentError(
-                    f"reassembly={reassembly} is too small; 16 bytes is the "
-                    "least that can hold a construct spanning a chunk"
+                    f"reassembly={reassembly} is too small; {MIN_REASSEMBLY} "
+                    "bytes is the least that can hold a construct spanning a "
+                    "chunk"
                 )
             self._rbuf = bytearray(reassembly)
         else:
             raise SofaArgumentError(
-                "reassembly must be a bytearray, a byte count, or omitted"
+                "reassembly must be a bytearray or a byte count"
             )
         self._buf: bytes | bytearray = b""
         self._bufsrc: Any = None
@@ -505,6 +544,7 @@ class Decoder:
         self._status = Status.COMPLETE
         self._error: SofaError | None = None
         self._resume_kind = _R_NONE
+        self._skip_depth = -1
         self._running = False
 
     # --- resume transactions (CORELIB_PLAN §5.2) ----------------------------
@@ -538,10 +578,16 @@ class Decoder:
     #   point a suspension rewinds to, which is what keeps a suspended
     #   construct's bytes in the buffer for the retry.
     #
-    # ``skip()`` over a whole *sequence* is the one call that spans many fields.
-    # It remembers its first byte so a suspension can put ``_pos``/``_depth``/
-    # ``_cur``/``_pending`` back — a re-issued skip then replays the sequence
-    # from its start.
+    # **Discarding is the exception, and it is not one.** Everything above is
+    # about a value someone may still be handed, which is why it has to be
+    # replayed from its first byte. A construct being SKIPPED is handed to
+    # nobody — MESSAGE_SPEC §7.3 makes an unknown or mistyped id something the
+    # receiver ignores — so it is consumed incrementally and never rewound: see
+    # ``_DISCARD`` and :meth:`_skip_sequence`. The two rules above still hold
+    # for it in the only sense that matters, that no fabricated field is ever
+    # produced: what crosses a chunk boundary is a byte count with no meaning
+    # attached, not a half-parsed construct that would be re-entered in the
+    # middle.
     #
     # INVALID is deliberately *not* rewound: it is terminal (§5.2), so no
     # continuation of bytes can make the stream valid again and there is nothing
@@ -641,21 +687,6 @@ class Decoder:
             raise self._suspend("truncated payload")
         self._pos = end
         return self._buf, pos
-
-    def _skip_exact(self, n: int) -> None:
-        """Consume the next ``n`` bytes without materialising them (§5.2: a skip
-        *consumes and discards*; it must not pay for a copy of what it throws
-        away). Same sourcing and same suspension as :meth:`_read_exact` — only
-        the result object is missing.
-
-        The bytes stay buffered either way, because they are not free to drop: a
-        suspension has to be able to replay the skipped construct from its first
-        byte, and a declined sequence replays a whole nested walk. Retention is
-        the resume contract's; the copy was pure waste."""
-        end = self._pos + n
-        if end > self._n:
-            raise self._suspend("truncated payload")
-        self._pos = end
 
     def _read_varints(
         self,
@@ -798,26 +829,6 @@ class Decoder:
                 append(result)
         self._pos = pos
         return out
-
-    def _skip_varints(self, count: int) -> None:
-        """Advance the cursor past ``count`` varints without materialising them."""
-        buf = self._buf
-        pos = self._pos
-        n = self._n
-        i = 0
-        while i < count:
-            if pos < n:
-                if buf[pos] < 0x80:
-                    pos += 1
-                    i += 1
-                    continue
-            self._pos = pos
-            self._varint()
-            buf = self._buf
-            pos = self._pos
-            n = self._n
-            i += 1
-        self._pos = pos
 
     # --- field iteration ----------------------------------------------------
 
@@ -1036,9 +1047,22 @@ class Decoder:
         return total
 
     def _skip_pending(self) -> None:
+        """Discard the value the last header announced (§5.2: a skip *consumes
+        and discards*).
+
+        Nothing is materialized and nothing is copied, and — unlike every read —
+        nothing has to be replayed either. A construct being discarded turns
+        into the ``_DISCARD`` counter the moment its first byte is consumed, so
+        it is dropped incrementally across as many feeds as it takes and never
+        occupies the reassembly buffer. See ``_DISCARD``.
+        """
         pending = self._pending
         assert pending is not None
         kind = pending[0]
+        if kind == _DISCARD:
+            # The remainder of a construct an earlier feed started discarding.
+            self._drain_discard(pending)
+            return
         if kind == _LIMIT:
             # A skipped field is not capped (#128). §6.2.1 enforces a receiver
             # limit "at the count/length header — before the allocation it is
@@ -1051,21 +1075,89 @@ class Decoder:
             # against a bound meant for one.
             #
             # Unwrapped before the walk rather than after it: should the payload
-            # run out mid-skip the field stays pending, and the retry then
-            # re-enters with the cap already gone instead of unwrapping twice.
+            # run out mid-skip the field turns into a ``_DISCARD``, and the
+            # retry then re-enters with the cap already gone.
             pending = pending[2]
             self._pending = pending
             kind = pending[0]
         if kind == _SCALAR:
+            # Ten bytes at the outside (§4.1), and its overlong verdict is the
+            # format's, not this field's — so it keeps the ordinary replaying
+            # read rather than earning a counter of its own.
             self._varint()
-        elif kind == _FIXLEN:
-            self._skip_exact(pending[2])
-        elif kind == _VARRAY:
-            self._skip_varints(pending[2])
-        else:  # _FARRAY
-            self._skip_exact(self._farray_nbytes(pending[2], pending[3]))
-        # Cleared only now: had the value run out mid-skip, the field has to
-        # stay pending so the retry skips it again from its first byte (§5.2).
+            # Cleared only now: had the value run out mid-skip, the field has to
+            # stay pending so the retry skips it again from its first byte
+            # (§5.2).
+            self._pending = None
+            return
+        if kind == _FIXLEN:
+            nbytes, nvarints = pending[2], 0
+        elif kind == _FARRAY:
+            # May raise (an unsatisfiable count * width) — before the value is
+            # committed to the discard, so the field stays pending for a retry.
+            nbytes, nvarints = self._farray_nbytes(pending[2], pending[3]), 0
+        else:  # _VARRAY
+            nbytes, nvarints = 0, pending[2]
+        # Committed here: from this point the construct is bytes to drop, not a
+        # value anyone can ask for, so no suspension below rewinds into it.
+        pending = (_DISCARD, nbytes, nvarints, 0)
+        self._pending = pending
+        self._drain_discard(pending)
+
+    def _drain_discard(self, pending: tuple[Any, ...]) -> None:
+        """Drop as much of a ``_DISCARD`` remainder as this chunk holds.
+
+        Clears the pending value when the construct is finally gone; otherwise
+        consumes the whole chunk, writes the smaller remainder back and reports
+        ``INCOMPLETE`` — the message really does end inside a construct (§5.2),
+        even though nothing is being built from it.
+
+        The ``SofaIncompleteError`` is raised directly rather than through
+        :meth:`_suspend`: the rewind is the one thing that must NOT happen here.
+        ``_pos`` is left at the end of the buffer, so :meth:`_retain` carries
+        nothing and the reassembly buffer stays empty however large the skipped
+        construct is.
+        """
+        nbytes = pending[1]
+        if nbytes:
+            have = self._n - self._pos
+            if have < nbytes:
+                self._pos = self._n
+                self._pending = (_DISCARD, nbytes - have, pending[2], pending[3])
+                raise SofaIncompleteError("skipped payload spans this chunk")
+            self._pos += nbytes
+            nbytes = 0
+        left = pending[2]
+        if left:
+            # The elements are varints, so the end of one is found rather than
+            # computed. ``vbytes`` counts the bytes of the varint in flight, so
+            # the format's 64-bit bound (§4.1.3) is enforced across a chunk
+            # boundary exactly as it is within one — a skip validates nothing
+            # about a *value* (§6.7.2), but an overlong varint is malformed
+            # framing and stays INVALID wherever it sits.
+            buf = self._buf
+            pos = self._pos
+            end = self._n
+            vbytes = pending[3]
+            while left:
+                if pos >= end:
+                    self._pos = pos
+                    self._pending = (_DISCARD, 0, left, vbytes)
+                    raise SofaIncompleteError("skipped array spans this chunk")
+                b = buf[pos]
+                pos += 1
+                vbytes += 1
+                if vbytes == 10:
+                    # The tenth byte carries bit 63 and nothing above it, and no
+                    # eleventh can follow — the same verdict _varint reaches.
+                    if b > 0x01:
+                        raise SofaDecodeError("overlong varint")
+                    left -= 1
+                    vbytes = 0
+                elif b < 0x80:
+                    left -= 1
+                    vbytes = 0
+            self._pos = pos
         self._pending = None
 
     def _skip_sequence(self) -> None:
@@ -1076,28 +1168,32 @@ class Decoder:
         a declined value needs no skip at all, because it stays pending and the
         next header discards it.
 
-        Suspends as a unit: if the bytes run out part-way, nothing is consumed
-        and the same skip can be re-issued when more arrive (§5.2).
+        Resumes rather than replays: the walk keeps whatever ground it made
+        before the bytes ran out, and the next feed carries on from there. The
+        sub-tree is being discarded, so there is no value whose first byte the
+        retry has to see again — and replaying it would mean holding the whole
+        sequence in the reassembly buffer at once, which is the same defect a
+        single oversized skipped field had (#139). What crosses the boundary is
+        ``_depth``, ``_pending`` and the target depth below, all of which are
+        decoder state already. The individual header or payload in flight when
+        the bytes ran out still rewinds, in :meth:`_next_wire`, exactly as it
+        does outside a skip.
         """
-        # Walking a whole sequence spans many fields, so unlike every other call
-        # this one moves the field state — and lets _next_wire re-arm ``_keep`` —
-        # before it can suspend. The field state is put back here, so a re-issued
-        # skip replays the whole sequence (§5.2).
-        self._keep = floor = self._pos
-        depth, pending = self._depth, self._pending
-        try:
-            target = depth - 1
-            while self._depth > target:
-                # The walk discards every field it passes, so it asks for no
-                # Field objects. Defensive: at EOF with an open sequence,
-                # _next_wire itself raises "truncated: unbalanced sequence",
-                # so it never returns -1 here.
-                if self._next_wire() < 0:  # pragma: no cover
-                    raise self._suspend("truncated sequence")
-        except SofaIncompleteError:
-            self._pos = self._keep = floor
-            self._depth, self._pending = depth, pending
-            raise
+        # The depth the sequence closes back to. Held on the decoder because a
+        # resumed skip re-enters here with ``_depth`` already part-way down the
+        # sub-tree: re-deriving the target from it would stop the walk at the
+        # first nested end marker and let the rest of the sequence decode as
+        # ordinary fields.
+        if self._skip_depth < 0:
+            self._skip_depth = self._depth - 1
+        while self._depth > self._skip_depth:
+            # The walk discards every field it passes, so it asks for no
+            # Field objects. Defensive: at EOF with an open sequence,
+            # _next_wire itself raises "truncated: unbalanced sequence",
+            # so it never returns -1 here.
+            if self._next_wire() < 0:  # pragma: no cover
+                raise self._suspend("truncated sequence")
+        self._skip_depth = -1
 
     # --- push-feed driver (CORELIB_PLAN §5.2) -------------------------------
     #
@@ -1306,6 +1402,7 @@ class Decoder:
             self._bind_visitor(self._visitor)
         self._resume_kind = _R_NONE
         self._resume_entry = None
+        self._skip_depth = -1
         if self._wu is not None:
             # A descent left mid-message: the map the caller declared is the one
             # at the bottom. The slots stay — they are construction-time state
