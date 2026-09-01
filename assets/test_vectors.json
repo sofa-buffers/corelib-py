@@ -563,6 +563,228 @@
       "serialized_sparse": { "length": 58, "hex": "0864118f03180122200000c03f2a410000000000000440323a736b6970206d653a1b01020343030a141e4e00010a3a69676e6f7265640750ac02" }
     },
     {
+      "name": "skip_empty_fixlen_payloads",
+      "group": "skip",
+      "description": "Zero-length string and blob as skipped fields: the fixlen_word is there, the payload is not, and the anchors after them must still decode (S4.6).",
+      "offset": 0,
+      "requires": ["fixlen"],
+      "skip_ids": [1, 3],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "string", "id": 1, "value": "" },
+        { "op": "unsigned", "id": 2, "value": 2000 },
+        { "op": "blob", "id": 3, "value_hex": "" },
+        { "op": "unsigned", "id": 4, "value": 3000 }
+      ],
+      "serialized": { "length": 13, "hex": "00e8070a0210d00f1a0320b817" },
+      "serialized_sparse": { "length": 9, "hex": "00e80710d00f20b817" }
+    },
+    {
+      "name": "skip_empty_int_arrays",
+      "group": "skip",
+      "description": "Zero-count integer arrays as skipped fields: the field ends after the count, with no elements and no fixlen_word (S4.7).",
+      "offset": 0,
+      "requires": ["array"],
+      "skip_ids": [1, 3],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "array", "id": 1, "element_type": "u32", "values": [] },
+        { "op": "unsigned", "id": 2, "value": 2000 },
+        { "op": "array", "id": 3, "element_type": "i32", "values": [] },
+        { "op": "unsigned", "id": 4, "value": 3000 }
+      ],
+      "serialized": { "length": 13, "hex": "00e8070b0010d00f1c0020b817" },
+      "serialized_sparse": { "length": 9, "hex": "00e80710d00f20b817" }
+    },
+    {
+      "name": "skip_empty_fixlen_arrays",
+      "group": "skip",
+      "description": "Zero-count fixlen arrays as skipped fields: count 0 KEEPS the fixlen_word (S4.8), so a skip that stops at the count desynchronises the anchor after it.",
+      "offset": 0,
+      "requires": ["fixlen", "array", "fp64"],
+      "skip_ids": [1, 3],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "array", "id": 1, "element_type": "fp32", "values": [] },
+        { "op": "unsigned", "id": 2, "value": 2000 },
+        { "op": "array", "id": 3, "element_type": "fp64", "values": [] },
+        { "op": "unsigned", "id": 4, "value": 3000 }
+      ],
+      "serialized": { "length": 15, "hex": "00e8070d002010d00f1d004120b817" },
+      "serialized_sparse": { "length": 9, "hex": "00e80710d00f20b817" }
+    },
+    {
+      "name": "skip_fp64_array",
+      "group": "skip",
+      "description": "A non-empty fp64 array skipped: element length 8 comes from the fixlen_word, and count x length must be consumed exactly (S4.8).",
+      "offset": 0,
+      "requires": ["fixlen", "array", "fp64"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "array", "id": 1, "element_type": "fp64", "values": [1.5, -2.5, 3.5] },
+        { "op": "unsigned", "id": 2, "value": 2000 }
+      ],
+      "serialized": { "length": 33, "hex": "00e8070d0341000000000000f83f00000000000004c00000000000000c4010d00f" },
+      "serialized_sparse": { "length": 33, "hex": "00e8070d0341000000000000f83f00000000000004c00000000000000c4010d00f" }
+    },
+    {
+      "name": "skip_long_fixlen_payloads",
+      "group": "skip",
+      "description": "Skipped string and blob of 130 bytes: the fixlen_word is a TWO-byte varint, so a skip that reads the length as one byte lands mid-payload (S4.1, S4.6).",
+      "offset": 0,
+      "requires": ["fixlen"],
+      "skip_ids": [1, 3],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "string", "id": 1, "value": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz" },
+        { "op": "unsigned", "id": 2, "value": 2000 },
+        { "op": "blob", "id": 3, "value_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f8081" },
+        { "op": "unsigned", "id": 4, "value": 3000 }
+      ],
+      "serialized": { "length": 275, "hex": "00e8070a92086162636465666768696a6b6c6d6e6f707172737475767778797a6162636465666768696a6b6c6d6e6f707172737475767778797a6162636465666768696a6b6c6d6e6f707172737475767778797a6162636465666768696a6b6c6d6e6f707172737475767778797a6162636465666768696a6b6c6d6e6f707172737475767778797a10d00f1a9308000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808120b817" },
+      "serialized_sparse": { "length": 275, "hex": "00e8070a92086162636465666768696a6b6c6d6e6f707172737475767778797a6162636465666768696a6b6c6d6e6f707172737475767778797a6162636465666768696a6b6c6d6e6f707172737475767778797a6162636465666768696a6b6c6d6e6f707172737475767778797a6162636465666768696a6b6c6d6e6f707172737475767778797a10d00f1a9308000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808120b817" }
+    },
+    {
+      "name": "skip_long_int_arrays",
+      "group": "skip",
+      "description": "Skipped integer arrays of 130 elements: the element count is a TWO-byte varint and the elements are skipped one varint at a time (S4.7).",
+      "offset": 0,
+      "requires": ["array"],
+      "skip_ids": [1, 3],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "array", "id": 1, "element_type": "u32", "values": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130] },
+        { "op": "unsigned", "id": 2, "value": 2000 },
+        { "op": "array", "id": 3, "element_type": "i32", "values": [-1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14, -15, -16, -17, -18, -19, -20, -21, -22, -23, -24, -25, -26, -27, -28, -29, -30, -31, -32, -33, -34, -35, -36, -37, -38, -39, -40, -41, -42, -43, -44, -45, -46, -47, -48, -49, -50, -51, -52, -53, -54, -55, -56, -57, -58, -59, -60, -61, -62, -63, -64, -65, -66, -67, -68, -69, -70, -71, -72, -73, -74, -75, -76, -77, -78, -79, -80, -81, -82, -83, -84, -85, -86, -87, -88, -89, -90, -91, -92, -93, -94, -95, -96, -97, -98, -99, -100, -101, -102, -103, -104, -105, -106, -107, -108, -109, -110, -111, -112, -113, -114, -115, -116, -117, -118, -119, -120, -121, -122, -123, -124, -125, -126, -127, -128, -129, -130] },
+        { "op": "unsigned", "id": 4, "value": 3000 }
+      ],
+      "serialized": { "length": 344, "hex": "00e8070b82010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80018101820110d00f1c820101030507090b0d0f11131517191b1d1f21232527292b2d2f31333537393b3d3f41434547494b4d4f51535557595b5d5f61636567696b6d6f71737577797b7d7f810183018501870189018b018d018f01910193019501970199019b019d019f01a101a301a501a701a901ab01ad01af01b101b301b501b701b901bb01bd01bf01c101c301c501c701c901cb01cd01cf01d101d301d501d701d901db01dd01df01e101e301e501e701e901eb01ed01ef01f101f301f501f701f901fb01fd01ff018102830220b817" },
+      "serialized_sparse": { "length": 344, "hex": "00e8070b82010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80018101820110d00f1c820101030507090b0d0f11131517191b1d1f21232527292b2d2f31333537393b3d3f41434547494b4d4f51535557595b5d5f61636567696b6d6f71737577797b7d7f810183018501870189018b018d018f01910193019501970199019b019d019f01a101a301a501a701a901ab01ad01af01b101b301b501b701b901bb01bd01bf01c101c301c501c701c901cb01cd01cf01d101d301d501d701d901db01dd01df01e101e301e501e701e901eb01ed01ef01f101f301f501f701f901fb01fd01ff018102830220b817" }
+    },
+    {
+      "name": "skip_long_fixlen_array",
+      "group": "skip",
+      "description": "Skipped fixlen array of 130 fp32 elements: a two-byte count, and 520 payload bytes to consume as count x element_length (S4.8).",
+      "offset": 0,
+      "requires": ["fixlen", "array"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "array", "id": 1, "element_type": "fp32", "values": [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 12.5, 13.5, 14.5, 15.5, 16.5, 17.5, 18.5, 19.5, 20.5, 21.5, 22.5, 23.5, 24.5, 25.5, 26.5, 27.5, 28.5, 29.5, 30.5, 31.5, 32.5, 33.5, 34.5, 35.5, 36.5, 37.5, 38.5, 39.5, 40.5, 41.5, 42.5, 43.5, 44.5, 45.5, 46.5, 47.5, 48.5, 49.5, 50.5, 51.5, 52.5, 53.5, 54.5, 55.5, 56.5, 57.5, 58.5, 59.5, 60.5, 61.5, 62.5, 63.5, 64.5, 65.5, 66.5, 67.5, 68.5, 69.5, 70.5, 71.5, 72.5, 73.5, 74.5, 75.5, 76.5, 77.5, 78.5, 79.5, 80.5, 81.5, 82.5, 83.5, 84.5, 85.5, 86.5, 87.5, 88.5, 89.5, 90.5, 91.5, 92.5, 93.5, 94.5, 95.5, 96.5, 97.5, 98.5, 99.5, 100.5, 101.5, 102.5, 103.5, 104.5, 105.5, 106.5, 107.5, 108.5, 109.5, 110.5, 111.5, 112.5, 113.5, 114.5, 115.5, 116.5, 117.5, 118.5, 119.5, 120.5, 121.5, 122.5, 123.5, 124.5, 125.5, 126.5, 127.5, 128.5, 129.5, 130.5] },
+        { "op": "unsigned", "id": 2, "value": 2000 }
+      ],
+      "serialized": { "length": 530, "hex": "00e8070d8201200000c03f0000204000006040000090400000b0400000d0400000f04000000841000018410000284100003841000048410000584100006841000078410000844100008c410000944100009c410000a4410000ac410000b4410000bc410000c4410000cc410000d4410000dc410000e4410000ec410000f4410000fc41000002420000064200000a4200000e42000012420000164200001a4200001e42000022420000264200002a4200002e42000032420000364200003a4200003e42000042420000464200004a4200004e42000052420000564200005a4200005e42000062420000664200006a4200006e42000072420000764200007a4200007e42000081420000834200008542000087420000894200008b4200008d4200008f42000091420000934200009542000097420000994200009b4200009d4200009f420000a1420000a3420000a5420000a7420000a9420000ab420000ad420000af420000b1420000b3420000b5420000b7420000b9420000bb420000bd420000bf420000c1420000c3420000c5420000c7420000c9420000cb420000cd420000cf420000d1420000d3420000d5420000d7420000d9420000db420000dd420000df420000e1420000e3420000e5420000e7420000e9420000eb420000ed420000ef420000f1420000f3420000f5420000f7420000f9420000fb420000fd420000ff4200800043008001430080024310d00f" },
+      "serialized_sparse": { "length": 530, "hex": "00e8070d8201200000c03f0000204000006040000090400000b0400000d0400000f04000000841000018410000284100003841000048410000584100006841000078410000844100008c410000944100009c410000a4410000ac410000b4410000bc410000c4410000cc410000d4410000dc410000e4410000ec410000f4410000fc41000002420000064200000a4200000e42000012420000164200001a4200001e42000022420000264200002a4200002e42000032420000364200003a4200003e42000042420000464200004a4200004e42000052420000564200005a4200005e42000062420000664200006a4200006e42000072420000764200007a4200007e42000081420000834200008542000087420000894200008b4200008d4200008f42000091420000934200009542000097420000994200009b4200009d4200009f420000a1420000a3420000a5420000a7420000a9420000ab420000ad420000af420000b1420000b3420000b5420000b7420000b9420000bb420000bd420000bf420000c1420000c3420000c5420000c7420000c9420000cb420000cd420000cf420000d1420000d3420000d5420000d7420000d9420000db420000dd420000df420000e1420000e3420000e5420000e7420000e9420000eb420000ed420000ef420000f1420000f3420000f5420000f7420000f9420000fb420000fd420000ff4200800043008001430080024310d00f" }
+    },
+    {
+      "name": "skip_large_id",
+      "group": "skip",
+      "description": "A skipped field at id 100000: its (id << 3 | type) header is a three-byte varint (S4.3), and the anchor behind it carries an equally wide header.",
+      "offset": 0,
+      "skip_ids": [100000],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "signed", "id": 100000, "value": -4242 },
+        { "op": "unsigned", "id": 100001, "value": 2000 }
+      ],
+      "serialized": { "length": 13, "hex": "00e80781ea30a34288ea30d00f" },
+      "serialized_sparse": { "length": 13, "hex": "00e80781ea30a34288ea30d00f" }
+    },
+    {
+      "name": "skip_at_message_edges",
+      "group": "skip",
+      "description": "The first and the last field of the message are both skipped: nothing precedes the one, nothing follows the other, and the message must still end at a clean boundary.",
+      "offset": 0,
+      "skip_ids": [0, 2],
+      "fields": [
+        { "op": "signed", "id": 0, "value": -1234 },
+        { "op": "unsigned", "id": 1, "value": 1000 },
+        { "op": "unsigned", "id": 2, "value": 2000 }
+      ],
+      "serialized": { "length": 9, "hex": "01a31308e80710d00f" },
+      "serialized_sparse": { "length": 9, "hex": "01a31308e80710d00f" }
+    },
+    {
+      "name": "skip_fixlen_at_message_end",
+      "group": "skip",
+      "description": "A fixlen field is the last thing in the message and is skipped: the decoder must leave the payload state and reach the message boundary (S4.6, S5.2).",
+      "offset": 0,
+      "requires": ["fixlen"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "string", "id": 1, "value": "trailing" }
+      ],
+      "serialized": { "length": 13, "hex": "00e8070a42747261696c696e67" },
+      "serialized_sparse": { "length": 13, "hex": "00e8070a42747261696c696e67" }
+    },
+    {
+      "name": "skip_int_array_at_message_end",
+      "group": "skip",
+      "description": "An integer array is the last thing in the message and is skipped: the element loop must run out exactly at the boundary (S4.7, S5.2).",
+      "offset": 0,
+      "requires": ["array"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "array", "id": 1, "element_type": "u32", "values": [10, 20, 30] }
+      ],
+      "serialized": { "length": 8, "hex": "00e8070b030a141e" },
+      "serialized_sparse": { "length": 8, "hex": "00e8070b030a141e" }
+    },
+    {
+      "name": "skip_fixlen_array_at_message_end",
+      "group": "skip",
+      "description": "A fixlen array is the last thing in the message and is skipped: count x element_length must run out exactly at the boundary (S4.8, S5.2).",
+      "offset": 0,
+      "requires": ["fixlen", "array"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "array", "id": 1, "element_type": "fp32", "values": [1.5, -2.5, 3.5] }
+      ],
+      "serialized": { "length": 18, "hex": "00e8070d03200000c03f000020c000006040" },
+      "serialized_sparse": { "length": 18, "hex": "00e8070d03200000c03f000020c000006040" }
+    },
+    {
+      "name": "skip_sequence_at_message_end",
+      "group": "skip",
+      "description": "A nested sequence is the last thing in the message and is skipped: skip_depth must unwind to zero on the closing marker, or the message never reaches a boundary (S4.9).",
+      "offset": 0,
+      "requires": ["sequence"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 7 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 8 },
+        { "op": "sequence_end" },
+        { "op": "sequence_end" }
+      ],
+      "serialized": { "length": 11, "hex": "00e8070e00070e00080707" },
+      "serialized_sparse": { "length": 11, "hex": "00e8070e00070e00080707" }
+    },
+    {
+      "name": "skip_before_sequence_end",
+      "group": "skip",
+      "description": "The last field inside a sequence the receiver DOES read is skipped, so the resync lands on the sequence-end marker rather than on a value-bearing header (S4.9).",
+      "offset": 0,
+      "requires": ["sequence"],
+      "skip_ids": [2],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 7 },
+        { "op": "signed", "id": 2, "value": -55 },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 3, "value": 2000 }
+      ],
+      "serialized": { "length": 12, "hex": "00e8070e0007116d0718d00f" },
+      "serialized_sparse": { "length": 12, "hex": "00e8070e0007116d0718d00f" }
+    },
+    {
       "name": "array_unsigned_u32",
       "group": "array/integer",
       "description": "Array of unsigned values (u32 input).",
@@ -1135,6 +1357,777 @@
       ],
       "serialized": { "length": 436, "hex": "00c80109c70110d0860319bfb8022080bcc1960b29ffa7d6b9073080c0caf384a30239ffbfcaf384a302560220c3f548400a41f1d4c853fb210940126a48656c6c6f2c20576f726c64211a23deadbeef07a606030500408001bf01ff010c05ff017f007efe01130500808001808002ffff02ffff031c05ffff03ffff0100feff01feff0323050080808080048080808008ffffffff0bffffffff0f2c05ffffffff0fffffffff0700feffffff07feffffff0f33050080808080808080804080808080808080808001ffffffffffffffffbf01ffffffffffffffffff013c05fdffffffffffffffff01ffffffffffffffff7f00feffffffffffffff7ffeffffffffffffffff01560505200000803f0000004000004040ffff7fffffff7f7f0d0541000000000000f03f00000000000000400000000000000840ffffffffffffefffffffffffffffef7f0707c60c026a48656c6c6f2c20536f666162210a021252313233343536373839301a72c3a4c3b6c3bcc384c396c39cc39f22ba03546869735f69735f615f766572795f6c6f6e675f746573745f737472696e675f776974685f21402324255e262a28295f2b2d3d5b5d7b7d07" },
       "serialized_sparse": { "length": 434, "hex": "00c80109c70110d0860319bfb8022080bcc1960b29ffa7d6b9073080c0caf384a30239ffbfcaf384a302560220c3f548400a41f1d4c853fb210940126a48656c6c6f2c20576f726c64211a23deadbeef07a606030500408001bf01ff010c05ff017f007efe01130500808001808002ffff02ffff031c05ffff03ffff0100feff01feff0323050080808080048080808008ffffffff0bffffffff0f2c05ffffffff0fffffffff0700feffffff07feffffff0f33050080808080808080804080808080808080808001ffffffffffffffffbf01ffffffffffffffffff013c05fdffffffffffffffff01ffffffffffffffff7f00feffffffffffffff7ffeffffffffffffffff01560505200000803f0000004000004040ffff7fffffff7f7f0d0541000000000000f03f00000000000000400000000000000840ffffffffffffefffffffffffffffef7f0707c60c026a48656c6c6f2c20536f666162211252313233343536373839301a72c3a4c3b6c3bcc384c396c39cc39f22ba03546869735f69735f615f766572795f6c6f6e675f746573745f737472696e675f776974685f21402324255e262a28295f2b2d3d5b5d7b7d07" }
+    },
+    {
+      "name": "skip_matrix_varint_after_varint",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 4 of the 100 (read, skipped) wire-type pairs: each of {unsigned, signed} is skipped where it directly follows a {unsigned, signed} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "skip_ids": [1, 4, 7, 10],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "unsigned", "id": 1, "value": 1001 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "unsigned", "id": 3, "value": 1003 },
+        { "op": "signed", "id": 4, "value": -1004 },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "signed", "id": 6, "value": -1006 },
+        { "op": "unsigned", "id": 7, "value": 1007 },
+        { "op": "unsigned", "id": 8, "value": 508 },
+        { "op": "signed", "id": 9, "value": -1009 },
+        { "op": "signed", "id": 10, "value": -1010 },
+        { "op": "unsigned", "id": 11, "value": 511 }
+      ],
+      "serialized": { "length": 36, "hex": "00e80708e90710f60318eb0721d70f28f90331db0f38ef0740fc0349e10f51e30f58ff03" },
+      "serialized_sparse": { "length": 36, "hex": "00e80708e90710f60318eb0721d70f28f90331db0f38ef0740fc0349e10f51e30f58ff03" }
+    },
+    {
+      "name": "skip_matrix_fixlen_after_varint",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 6 of the 100 (read, skipped) wire-type pairs: each of {fp32, string, blob} is skipped where it directly follows a {unsigned, signed} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen"],
+      "skip_ids": [1, 4, 7, 10, 13, 16],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "fp32", "id": 1, "value": 2.5 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "unsigned", "id": 3, "value": 1003 },
+        { "op": "string", "id": 4, "value": "s04" },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "unsigned", "id": 6, "value": 1006 },
+        { "op": "blob", "id": 7, "value_hex": "deadbe" },
+        { "op": "unsigned", "id": 8, "value": 508 },
+        { "op": "signed", "id": 9, "value": -1009 },
+        { "op": "fp32", "id": 10, "value": 11.5 },
+        { "op": "unsigned", "id": 11, "value": 511 },
+        { "op": "signed", "id": 12, "value": -1012 },
+        { "op": "string", "id": 13, "value": "s13" },
+        { "op": "unsigned", "id": 14, "value": 514 },
+        { "op": "signed", "id": 15, "value": -1015 },
+        { "op": "blob", "id": 16, "value_hex": "deadbe" },
+        { "op": "unsigned", "id": 17, "value": 517 }
+      ],
+      "serialized": { "length": 70, "hex": "00e8070a200000204010f60318eb07221a73303428f90330ee073a1bdeadbe40fc0349e10f52200000384158ff0361e70f6a1a73313370820479ed0f82011bdeadbe88018504" },
+      "serialized_sparse": { "length": 70, "hex": "00e8070a200000204010f60318eb07221a73303428f90330ee073a1bdeadbe40fc0349e10f52200000384158ff0361e70f6a1a73313370820479ed0f82011bdeadbe88018504" }
+    },
+    {
+      "name": "skip_matrix_fp64_after_varint",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 2 of the 100 (read, skipped) wire-type pairs: each of {fp64} is skipped where it directly follows a {unsigned, signed} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "fp64"],
+      "skip_ids": [1, 4],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "fp64", "id": 1, "value": 3.5 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "signed", "id": 3, "value": -1003 },
+        { "op": "fp64", "id": 4, "value": 6.5 },
+        { "op": "unsigned", "id": 5, "value": 505 }
+      ],
+      "serialized": { "length": 32, "hex": "00e8070a410000000000000c4010f60319d50f22410000000000001a4028f903" },
+      "serialized_sparse": { "length": 32, "hex": "00e8070a410000000000000c4010f60319d50f22410000000000001a4028f903" }
+    },
+    {
+      "name": "skip_matrix_int_array_after_varint",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 4 of the 100 (read, skipped) wire-type pairs: each of {array<unsigned>, array<signed>} is skipped where it directly follows a {unsigned, signed} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["array"],
+      "skip_ids": [1, 4, 7, 10],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "array", "id": 1, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "unsigned", "id": 3, "value": 1003 },
+        { "op": "array", "id": 4, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "signed", "id": 6, "value": -1006 },
+        { "op": "array", "id": 7, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "unsigned", "id": 8, "value": 508 },
+        { "op": "signed", "id": 9, "value": -1009 },
+        { "op": "array", "id": 10, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "unsigned", "id": 11, "value": 511 }
+      ],
+      "serialized": { "length": 56, "hex": "00e8070b03e807d00fb81710f60318eb072403cf0f9f1fef2e28f90331db0f3b03e807d00fb81740fc0349e10f5403cf0f9f1fef2e58ff03" },
+      "serialized_sparse": { "length": 56, "hex": "00e8070b03e807d00fb81710f60318eb072403cf0f9f1fef2e28f90331db0f3b03e807d00fb81740fc0349e10f5403cf0f9f1fef2e58ff03" }
+    },
+    {
+      "name": "skip_matrix_fixlen_array_after_varint",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 2 of the 100 (read, skipped) wire-type pairs: each of {array<fixlen>} is skipped where it directly follows a {unsigned, signed} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array"],
+      "skip_ids": [1, 4],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "array", "id": 1, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "signed", "id": 3, "value": -1003 },
+        { "op": "array", "id": 4, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "unsigned", "id": 5, "value": 505 }
+      ],
+      "serialized": { "length": 42, "hex": "00e8070d03200000c03f000020c00000604010f60319d50f2503200000c03f000020c00000604028f903" },
+      "serialized_sparse": { "length": 42, "hex": "00e8070d03200000c03f000020c00000604010f60319d50f2503200000c03f000020c00000604028f903" }
+    },
+    {
+      "name": "skip_matrix_sequence_after_varint",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 2 of the 100 (read, skipped) wire-type pairs: each of {sequence} is skipped where it directly follows a {unsigned, signed} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["sequence"],
+      "skip_ids": [1, 4],
+      "fields": [
+        { "op": "unsigned", "id": 0, "value": 1000 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 8 },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "signed", "id": 3, "value": -1003 },
+        { "op": "sequence_begin", "id": 4 },
+        { "op": "unsigned", "id": 0, "value": 11 },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 5, "value": 505 }
+      ],
+      "serialized": { "length": 20, "hex": "00e8070e00080710f60319d50f26000b0728f903" },
+      "serialized_sparse": { "length": 20, "hex": "00e8070e00080710f60319d50f26000b0728f903" }
+    },
+    {
+      "name": "skip_matrix_varint_after_fixlen",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 6 of the 100 (read, skipped) wire-type pairs: each of {unsigned, signed} is skipped where it directly follows a {fp32, string, blob} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen"],
+      "skip_ids": [1, 4, 7, 10, 13, 16],
+      "fields": [
+        { "op": "fp32", "id": 0, "value": 1.5 },
+        { "op": "unsigned", "id": 1, "value": 1001 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "fp32", "id": 3, "value": 4.5 },
+        { "op": "signed", "id": 4, "value": -1004 },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "string", "id": 6, "value": "s06" },
+        { "op": "unsigned", "id": 7, "value": 1007 },
+        { "op": "unsigned", "id": 8, "value": 508 },
+        { "op": "string", "id": 9, "value": "s09" },
+        { "op": "signed", "id": 10, "value": -1010 },
+        { "op": "unsigned", "id": 11, "value": 511 },
+        { "op": "blob", "id": 12, "value_hex": "deadbe" },
+        { "op": "unsigned", "id": 13, "value": 1013 },
+        { "op": "unsigned", "id": 14, "value": 514 },
+        { "op": "blob", "id": 15, "value_hex": "deadbe" },
+        { "op": "signed", "id": 16, "value": -1016 },
+        { "op": "unsigned", "id": 17, "value": 517 }
+      ],
+      "serialized": { "length": 70, "hex": "02200000c03f08e90710f6031a200000904021d70f28f903321a73303638ef0740fc034a1a73303951e30f58ff03621bdeadbe68f5077082047a1bdeadbe8101ef0f88018504" },
+      "serialized_sparse": { "length": 70, "hex": "02200000c03f08e90710f6031a200000904021d70f28f903321a73303638ef0740fc034a1a73303951e30f58ff03621bdeadbe68f5077082047a1bdeadbe8101ef0f88018504" }
+    },
+    {
+      "name": "skip_matrix_fixlen_after_fixlen",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 9 of the 100 (read, skipped) wire-type pairs: each of {fp32, string, blob} is skipped where it directly follows a {fp32, string, blob} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen"],
+      "skip_ids": [1, 4, 7, 10, 13, 16, 19, 22, 25],
+      "fields": [
+        { "op": "fp32", "id": 0, "value": 1.5 },
+        { "op": "fp32", "id": 1, "value": 2.5 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "fp32", "id": 3, "value": 4.5 },
+        { "op": "string", "id": 4, "value": "s04" },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "fp32", "id": 6, "value": 7.5 },
+        { "op": "blob", "id": 7, "value_hex": "deadbe" },
+        { "op": "unsigned", "id": 8, "value": 508 },
+        { "op": "string", "id": 9, "value": "s09" },
+        { "op": "fp32", "id": 10, "value": 11.5 },
+        { "op": "unsigned", "id": 11, "value": 511 },
+        { "op": "string", "id": 12, "value": "s12" },
+        { "op": "string", "id": 13, "value": "s13" },
+        { "op": "unsigned", "id": 14, "value": 514 },
+        { "op": "string", "id": 15, "value": "s15" },
+        { "op": "blob", "id": 16, "value_hex": "deadbe" },
+        { "op": "unsigned", "id": 17, "value": 517 },
+        { "op": "blob", "id": 18, "value_hex": "deadbe" },
+        { "op": "fp32", "id": 19, "value": 20.5 },
+        { "op": "unsigned", "id": 20, "value": 520 },
+        { "op": "blob", "id": 21, "value_hex": "deadbe" },
+        { "op": "string", "id": 22, "value": "s22" },
+        { "op": "unsigned", "id": 23, "value": 523 },
+        { "op": "blob", "id": 24, "value_hex": "deadbe" },
+        { "op": "blob", "id": 25, "value_hex": "deadbe" },
+        { "op": "unsigned", "id": 26, "value": 526 }
+      ],
+      "serialized": { "length": 134, "hex": "02200000c03f0a200000204010f6031a2000009040221a73303428f90332200000f0403a1bdeadbe40fc034a1a73303952200000384158ff03621a7331326a1a7331337082047a1a73313582011bdeadbe8801850492011bdeadbe9a01200000a441a0018804aa011bdeadbeb2011a733232b8018b04c2011bdeadbeca011bdeadbed0018e04" },
+      "serialized_sparse": { "length": 134, "hex": "02200000c03f0a200000204010f6031a2000009040221a73303428f90332200000f0403a1bdeadbe40fc034a1a73303952200000384158ff03621a7331326a1a7331337082047a1a73313582011bdeadbe8801850492011bdeadbe9a01200000a441a0018804aa011bdeadbeb2011a733232b8018b04c2011bdeadbeca011bdeadbed0018e04" }
+    },
+    {
+      "name": "skip_matrix_fp64_after_fixlen",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 3 of the 100 (read, skipped) wire-type pairs: each of {fp64} is skipped where it directly follows a {fp32, string, blob} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "fp64"],
+      "skip_ids": [1, 4, 7],
+      "fields": [
+        { "op": "fp32", "id": 0, "value": 1.5 },
+        { "op": "fp64", "id": 1, "value": 3.5 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "string", "id": 3, "value": "s03" },
+        { "op": "fp64", "id": 4, "value": 6.5 },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "blob", "id": 6, "value_hex": "deadbe" },
+        { "op": "fp64", "id": 7, "value": 9.5 },
+        { "op": "unsigned", "id": 8, "value": 508 }
+      ],
+      "serialized": { "length": 55, "hex": "02200000c03f0a410000000000000c4010f6031a1a73303322410000000000001a4028f903321bdeadbe3a41000000000000234040fc03" },
+      "serialized_sparse": { "length": 55, "hex": "02200000c03f0a410000000000000c4010f6031a1a73303322410000000000001a4028f903321bdeadbe3a41000000000000234040fc03" }
+    },
+    {
+      "name": "skip_matrix_int_array_after_fixlen",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 6 of the 100 (read, skipped) wire-type pairs: each of {array<unsigned>, array<signed>} is skipped where it directly follows a {fp32, string, blob} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array"],
+      "skip_ids": [1, 4, 7, 10, 13, 16],
+      "fields": [
+        { "op": "fp32", "id": 0, "value": 1.5 },
+        { "op": "array", "id": 1, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "fp32", "id": 3, "value": 4.5 },
+        { "op": "array", "id": 4, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "string", "id": 6, "value": "s06" },
+        { "op": "array", "id": 7, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "unsigned", "id": 8, "value": 508 },
+        { "op": "string", "id": 9, "value": "s09" },
+        { "op": "array", "id": 10, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "unsigned", "id": 11, "value": 511 },
+        { "op": "blob", "id": 12, "value_hex": "deadbe" },
+        { "op": "array", "id": 13, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "unsigned", "id": 14, "value": 514 },
+        { "op": "blob", "id": 15, "value_hex": "deadbe" },
+        { "op": "array", "id": 16, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "unsigned", "id": 17, "value": 517 }
+      ],
+      "serialized": { "length": 100, "hex": "02200000c03f0b03e807d00fb81710f6031a20000090402403cf0f9f1fef2e28f903321a7330363b03e807d00fb81740fc034a1a7330395403cf0f9f1fef2e58ff03621bdeadbe6b03e807d00fb8177082047a1bdeadbe840103cf0f9f1fef2e88018504" },
+      "serialized_sparse": { "length": 100, "hex": "02200000c03f0b03e807d00fb81710f6031a20000090402403cf0f9f1fef2e28f903321a7330363b03e807d00fb81740fc034a1a7330395403cf0f9f1fef2e58ff03621bdeadbe6b03e807d00fb8177082047a1bdeadbe840103cf0f9f1fef2e88018504" }
+    },
+    {
+      "name": "skip_matrix_fixlen_array_after_fixlen",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 3 of the 100 (read, skipped) wire-type pairs: each of {array<fixlen>} is skipped where it directly follows a {fp32, string, blob} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array"],
+      "skip_ids": [1, 4, 7],
+      "fields": [
+        { "op": "fp32", "id": 0, "value": 1.5 },
+        { "op": "array", "id": 1, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "string", "id": 3, "value": "s03" },
+        { "op": "array", "id": 4, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "blob", "id": 6, "value_hex": "deadbe" },
+        { "op": "array", "id": 7, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "unsigned", "id": 8, "value": 508 }
+      ],
+      "serialized": { "length": 70, "hex": "02200000c03f0d03200000c03f000020c00000604010f6031a1a7330332503200000c03f000020c00000604028f903321bdeadbe3d03200000c03f000020c00000604040fc03" },
+      "serialized_sparse": { "length": 70, "hex": "02200000c03f0d03200000c03f000020c00000604010f6031a1a7330332503200000c03f000020c00000604028f903321bdeadbe3d03200000c03f000020c00000604040fc03" }
+    },
+    {
+      "name": "skip_matrix_sequence_after_fixlen",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 3 of the 100 (read, skipped) wire-type pairs: each of {sequence} is skipped where it directly follows a {fp32, string, blob} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "sequence"],
+      "skip_ids": [1, 4, 7],
+      "fields": [
+        { "op": "fp32", "id": 0, "value": 1.5 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 8 },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "string", "id": 3, "value": "s03" },
+        { "op": "sequence_begin", "id": 4 },
+        { "op": "unsigned", "id": 0, "value": 11 },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "blob", "id": 6, "value_hex": "deadbe" },
+        { "op": "sequence_begin", "id": 7 },
+        { "op": "unsigned", "id": 0, "value": 14 },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 8, "value": 508 }
+      ],
+      "serialized": { "length": 37, "hex": "02200000c03f0e00080710f6031a1a73303326000b0728f903321bdeadbe3e000e0740fc03" },
+      "serialized_sparse": { "length": 37, "hex": "02200000c03f0e00080710f6031a1a73303326000b0728f903321bdeadbe3e000e0740fc03" }
+    },
+    {
+      "name": "skip_matrix_varint_after_fp64",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 2 of the 100 (read, skipped) wire-type pairs: each of {unsigned, signed} is skipped where it directly follows a {fp64} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "fp64"],
+      "skip_ids": [1, 4],
+      "fields": [
+        { "op": "fp64", "id": 0, "value": 2.5 },
+        { "op": "unsigned", "id": 1, "value": 1001 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "fp64", "id": 3, "value": 5.5 },
+        { "op": "signed", "id": 4, "value": -1004 },
+        { "op": "unsigned", "id": 5, "value": 505 }
+      ],
+      "serialized": { "length": 32, "hex": "0241000000000000044008e90710f6031a41000000000000164021d70f28f903" },
+      "serialized_sparse": { "length": 32, "hex": "0241000000000000044008e90710f6031a41000000000000164021d70f28f903" }
+    },
+    {
+      "name": "skip_matrix_fixlen_after_fp64",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 3 of the 100 (read, skipped) wire-type pairs: each of {fp32, string, blob} is skipped where it directly follows a {fp64} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "fp64"],
+      "skip_ids": [1, 4, 7],
+      "fields": [
+        { "op": "fp64", "id": 0, "value": 2.5 },
+        { "op": "fp32", "id": 1, "value": 2.5 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "fp64", "id": 3, "value": 5.5 },
+        { "op": "string", "id": 4, "value": "s04" },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "fp64", "id": 6, "value": 8.5 },
+        { "op": "blob", "id": 7, "value_hex": "deadbe" },
+        { "op": "unsigned", "id": 8, "value": 508 }
+      ],
+      "serialized": { "length": 55, "hex": "024100000000000004400a200000204010f6031a410000000000001640221a73303428f903324100000000000021403a1bdeadbe40fc03" },
+      "serialized_sparse": { "length": 55, "hex": "024100000000000004400a200000204010f6031a410000000000001640221a73303428f903324100000000000021403a1bdeadbe40fc03" }
+    },
+    {
+      "name": "skip_matrix_fp64_after_fp64",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 1 of the 100 (read, skipped) wire-type pairs: each of {fp64} is skipped where it directly follows a {fp64} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "fp64"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "fp64", "id": 0, "value": 2.5 },
+        { "op": "fp64", "id": 1, "value": 3.5 },
+        { "op": "unsigned", "id": 2, "value": 502 }
+      ],
+      "serialized": { "length": 23, "hex": "024100000000000004400a410000000000000c4010f603" },
+      "serialized_sparse": { "length": 23, "hex": "024100000000000004400a410000000000000c4010f603" }
+    },
+    {
+      "name": "skip_matrix_int_array_after_fp64",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 2 of the 100 (read, skipped) wire-type pairs: each of {array<unsigned>, array<signed>} is skipped where it directly follows a {fp64} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array", "fp64"],
+      "skip_ids": [1, 4],
+      "fields": [
+        { "op": "fp64", "id": 0, "value": 2.5 },
+        { "op": "array", "id": 1, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "fp64", "id": 3, "value": 5.5 },
+        { "op": "array", "id": 4, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "unsigned", "id": 5, "value": 505 }
+      ],
+      "serialized": { "length": 42, "hex": "024100000000000004400b03e807d00fb81710f6031a4100000000000016402403cf0f9f1fef2e28f903" },
+      "serialized_sparse": { "length": 42, "hex": "024100000000000004400b03e807d00fb81710f6031a4100000000000016402403cf0f9f1fef2e28f903" }
+    },
+    {
+      "name": "skip_matrix_fixlen_array_after_fp64",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 1 of the 100 (read, skipped) wire-type pairs: each of {array<fixlen>} is skipped where it directly follows a {fp64} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array", "fp64"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "fp64", "id": 0, "value": 2.5 },
+        { "op": "array", "id": 1, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "unsigned", "id": 2, "value": 502 }
+      ],
+      "serialized": { "length": 28, "hex": "024100000000000004400d03200000c03f000020c00000604010f603" },
+      "serialized_sparse": { "length": 28, "hex": "024100000000000004400d03200000c03f000020c00000604010f603" }
+    },
+    {
+      "name": "skip_matrix_sequence_after_fp64",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 1 of the 100 (read, skipped) wire-type pairs: each of {sequence} is skipped where it directly follows a {fp64} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "sequence", "fp64"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "fp64", "id": 0, "value": 2.5 },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 8 },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 2, "value": 502 }
+      ],
+      "serialized": { "length": 17, "hex": "024100000000000004400e00080710f603" },
+      "serialized_sparse": { "length": 17, "hex": "024100000000000004400e00080710f603" }
+    },
+    {
+      "name": "skip_matrix_varint_after_int_array",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 4 of the 100 (read, skipped) wire-type pairs: each of {unsigned, signed} is skipped where it directly follows a {array<unsigned>, array<signed>} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["array"],
+      "skip_ids": [1, 4, 7, 10],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "unsigned", "id": 1, "value": 1001 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "array", "id": 3, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "signed", "id": 4, "value": -1004 },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "array", "id": 6, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "unsigned", "id": 7, "value": 1007 },
+        { "op": "unsigned", "id": 8, "value": 508 },
+        { "op": "array", "id": 9, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "signed", "id": 10, "value": -1010 },
+        { "op": "unsigned", "id": 11, "value": 511 }
+      ],
+      "serialized": { "length": 56, "hex": "0303e807d00fb81708e90710f6031b03e807d00fb81721d70f28f9033403cf0f9f1fef2e38ef0740fc034c03cf0f9f1fef2e51e30f58ff03" },
+      "serialized_sparse": { "length": 56, "hex": "0303e807d00fb81708e90710f6031b03e807d00fb81721d70f28f9033403cf0f9f1fef2e38ef0740fc034c03cf0f9f1fef2e51e30f58ff03" }
+    },
+    {
+      "name": "skip_matrix_fixlen_after_int_array",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 6 of the 100 (read, skipped) wire-type pairs: each of {fp32, string, blob} is skipped where it directly follows a {array<unsigned>, array<signed>} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array"],
+      "skip_ids": [1, 4, 7, 10, 13, 16],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "fp32", "id": 1, "value": 2.5 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "array", "id": 3, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "string", "id": 4, "value": "s04" },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "array", "id": 6, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "blob", "id": 7, "value_hex": "deadbe" },
+        { "op": "unsigned", "id": 8, "value": 508 },
+        { "op": "array", "id": 9, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "fp32", "id": 10, "value": 11.5 },
+        { "op": "unsigned", "id": 11, "value": 511 },
+        { "op": "array", "id": 12, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "string", "id": 13, "value": "s13" },
+        { "op": "unsigned", "id": 14, "value": 514 },
+        { "op": "array", "id": 15, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "blob", "id": 16, "value_hex": "deadbe" },
+        { "op": "unsigned", "id": 17, "value": 517 }
+      ],
+      "serialized": { "length": 100, "hex": "0303e807d00fb8170a200000204010f6031b03e807d00fb817221a73303428f9033303e807d00fb8173a1bdeadbe40fc034c03cf0f9f1fef2e52200000384158ff036403cf0f9f1fef2e6a1a7331337082047c03cf0f9f1fef2e82011bdeadbe88018504" },
+      "serialized_sparse": { "length": 100, "hex": "0303e807d00fb8170a200000204010f6031b03e807d00fb817221a73303428f9033303e807d00fb8173a1bdeadbe40fc034c03cf0f9f1fef2e52200000384158ff036403cf0f9f1fef2e6a1a7331337082047c03cf0f9f1fef2e82011bdeadbe88018504" }
+    },
+    {
+      "name": "skip_matrix_fp64_after_int_array",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 2 of the 100 (read, skipped) wire-type pairs: each of {fp64} is skipped where it directly follows a {array<unsigned>, array<signed>} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array", "fp64"],
+      "skip_ids": [1, 4],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "fp64", "id": 1, "value": 3.5 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "array", "id": 3, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "fp64", "id": 4, "value": 6.5 },
+        { "op": "unsigned", "id": 5, "value": 505 }
+      ],
+      "serialized": { "length": 42, "hex": "0303e807d00fb8170a410000000000000c4010f6031c03cf0f9f1fef2e22410000000000001a4028f903" },
+      "serialized_sparse": { "length": 42, "hex": "0303e807d00fb8170a410000000000000c4010f6031c03cf0f9f1fef2e22410000000000001a4028f903" }
+    },
+    {
+      "name": "skip_matrix_int_array_after_int_array",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 4 of the 100 (read, skipped) wire-type pairs: each of {array<unsigned>, array<signed>} is skipped where it directly follows a {array<unsigned>, array<signed>} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["array"],
+      "skip_ids": [1, 4, 7, 10],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "array", "id": 1, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "array", "id": 3, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "array", "id": 4, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "array", "id": 6, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "array", "id": 7, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "unsigned", "id": 8, "value": 508 },
+        { "op": "array", "id": 9, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "array", "id": 10, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "unsigned", "id": 11, "value": 511 }
+      ],
+      "serialized": { "length": 76, "hex": "0303e807d00fb8170b03e807d00fb81710f6031b03e807d00fb8172403cf0f9f1fef2e28f9033403cf0f9f1fef2e3b03e807d00fb81740fc034c03cf0f9f1fef2e5403cf0f9f1fef2e58ff03" },
+      "serialized_sparse": { "length": 76, "hex": "0303e807d00fb8170b03e807d00fb81710f6031b03e807d00fb8172403cf0f9f1fef2e28f9033403cf0f9f1fef2e3b03e807d00fb81740fc034c03cf0f9f1fef2e5403cf0f9f1fef2e58ff03" }
+    },
+    {
+      "name": "skip_matrix_fixlen_array_after_int_array",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 2 of the 100 (read, skipped) wire-type pairs: each of {array<fixlen>} is skipped where it directly follows a {array<unsigned>, array<signed>} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array"],
+      "skip_ids": [1, 4],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "array", "id": 1, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "array", "id": 3, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "array", "id": 4, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "unsigned", "id": 5, "value": 505 }
+      ],
+      "serialized": { "length": 52, "hex": "0303e807d00fb8170d03200000c03f000020c00000604010f6031c03cf0f9f1fef2e2503200000c03f000020c00000604028f903" },
+      "serialized_sparse": { "length": 52, "hex": "0303e807d00fb8170d03200000c03f000020c00000604010f6031c03cf0f9f1fef2e2503200000c03f000020c00000604028f903" }
+    },
+    {
+      "name": "skip_matrix_sequence_after_int_array",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 2 of the 100 (read, skipped) wire-type pairs: each of {sequence} is skipped where it directly follows a {array<unsigned>, array<signed>} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["array", "sequence"],
+      "skip_ids": [1, 4],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 8 },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "array", "id": 3, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "sequence_begin", "id": 4 },
+        { "op": "unsigned", "id": 0, "value": 11 },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 5, "value": 505 }
+      ],
+      "serialized": { "length": 30, "hex": "0303e807d00fb8170e00080710f6031c03cf0f9f1fef2e26000b0728f903" },
+      "serialized_sparse": { "length": 30, "hex": "0303e807d00fb8170e00080710f6031c03cf0f9f1fef2e26000b0728f903" }
+    },
+    {
+      "name": "skip_matrix_varint_after_fixlen_array",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 2 of the 100 (read, skipped) wire-type pairs: each of {unsigned, signed} is skipped where it directly follows a {array<fixlen>} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array"],
+      "skip_ids": [1, 4],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "unsigned", "id": 1, "value": 1001 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "array", "id": 3, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "signed", "id": 4, "value": -1004 },
+        { "op": "unsigned", "id": 5, "value": 505 }
+      ],
+      "serialized": { "length": 42, "hex": "0503200000c03f000020c00000604008e90710f6031d03200000c03f000020c00000604021d70f28f903" },
+      "serialized_sparse": { "length": 42, "hex": "0503200000c03f000020c00000604008e90710f6031d03200000c03f000020c00000604021d70f28f903" }
+    },
+    {
+      "name": "skip_matrix_fixlen_after_fixlen_array",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 3 of the 100 (read, skipped) wire-type pairs: each of {fp32, string, blob} is skipped where it directly follows a {array<fixlen>} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array"],
+      "skip_ids": [1, 4, 7],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "fp32", "id": 1, "value": 2.5 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "array", "id": 3, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "string", "id": 4, "value": "s04" },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "array", "id": 6, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "blob", "id": 7, "value_hex": "deadbe" },
+        { "op": "unsigned", "id": 8, "value": 508 }
+      ],
+      "serialized": { "length": 70, "hex": "0503200000c03f000020c0000060400a200000204010f6031d03200000c03f000020c000006040221a73303428f9033503200000c03f000020c0000060403a1bdeadbe40fc03" },
+      "serialized_sparse": { "length": 70, "hex": "0503200000c03f000020c0000060400a200000204010f6031d03200000c03f000020c000006040221a73303428f9033503200000c03f000020c0000060403a1bdeadbe40fc03" }
+    },
+    {
+      "name": "skip_matrix_fp64_after_fixlen_array",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 1 of the 100 (read, skipped) wire-type pairs: each of {fp64} is skipped where it directly follows a {array<fixlen>} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array", "fp64"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "fp64", "id": 1, "value": 3.5 },
+        { "op": "unsigned", "id": 2, "value": 502 }
+      ],
+      "serialized": { "length": 28, "hex": "0503200000c03f000020c0000060400a410000000000000c4010f603" },
+      "serialized_sparse": { "length": 28, "hex": "0503200000c03f000020c0000060400a410000000000000c4010f603" }
+    },
+    {
+      "name": "skip_matrix_int_array_after_fixlen_array",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 2 of the 100 (read, skipped) wire-type pairs: each of {array<unsigned>, array<signed>} is skipped where it directly follows a {array<fixlen>} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array"],
+      "skip_ids": [1, 4],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "array", "id": 1, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "array", "id": 3, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "array", "id": 4, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "unsigned", "id": 5, "value": 505 }
+      ],
+      "serialized": { "length": 52, "hex": "0503200000c03f000020c0000060400b03e807d00fb81710f6031d03200000c03f000020c0000060402403cf0f9f1fef2e28f903" },
+      "serialized_sparse": { "length": 52, "hex": "0503200000c03f000020c0000060400b03e807d00fb81710f6031d03200000c03f000020c0000060402403cf0f9f1fef2e28f903" }
+    },
+    {
+      "name": "skip_matrix_fixlen_array_after_fixlen_array",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 1 of the 100 (read, skipped) wire-type pairs: each of {array<fixlen>} is skipped where it directly follows a {array<fixlen>} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "array", "id": 1, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "unsigned", "id": 2, "value": 502 }
+      ],
+      "serialized": { "length": 33, "hex": "0503200000c03f000020c0000060400d03200000c03f000020c00000604010f603" },
+      "serialized_sparse": { "length": 33, "hex": "0503200000c03f000020c0000060400d03200000c03f000020c00000604010f603" }
+    },
+    {
+      "name": "skip_matrix_sequence_after_fixlen_array",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 1 of the 100 (read, skipped) wire-type pairs: each of {sequence} is skipped where it directly follows a {array<fixlen>} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array", "sequence"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "array", "id": 0, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 8 },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 2, "value": 502 }
+      ],
+      "serialized": { "length": 22, "hex": "0503200000c03f000020c0000060400e00080710f603" },
+      "serialized_sparse": { "length": 22, "hex": "0503200000c03f000020c0000060400e00080710f603" }
+    },
+    {
+      "name": "skip_matrix_varint_after_sequence",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 2 of the 100 (read, skipped) wire-type pairs: each of {unsigned, signed} is skipped where it directly follows a {sequence} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["sequence"],
+      "skip_ids": [1, 4],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "unsigned", "id": 0, "value": 7 },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 1, "value": 1001 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "sequence_begin", "id": 3 },
+        { "op": "unsigned", "id": 0, "value": 10 },
+        { "op": "sequence_end" },
+        { "op": "signed", "id": 4, "value": -1004 },
+        { "op": "unsigned", "id": 5, "value": 505 }
+      ],
+      "serialized": { "length": 20, "hex": "0600070708e90710f6031e000a0721d70f28f903" },
+      "serialized_sparse": { "length": 20, "hex": "0600070708e90710f6031e000a0721d70f28f903" }
+    },
+    {
+      "name": "skip_matrix_fixlen_after_sequence",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 3 of the 100 (read, skipped) wire-type pairs: each of {fp32, string, blob} is skipped where it directly follows a {sequence} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "sequence"],
+      "skip_ids": [1, 4, 7],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "unsigned", "id": 0, "value": 7 },
+        { "op": "sequence_end" },
+        { "op": "fp32", "id": 1, "value": 2.5 },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "sequence_begin", "id": 3 },
+        { "op": "unsigned", "id": 0, "value": 10 },
+        { "op": "sequence_end" },
+        { "op": "string", "id": 4, "value": "s04" },
+        { "op": "unsigned", "id": 5, "value": 505 },
+        { "op": "sequence_begin", "id": 6 },
+        { "op": "unsigned", "id": 0, "value": 13 },
+        { "op": "sequence_end" },
+        { "op": "blob", "id": 7, "value_hex": "deadbe" },
+        { "op": "unsigned", "id": 8, "value": 508 }
+      ],
+      "serialized": { "length": 37, "hex": "060007070a200000204010f6031e000a07221a73303428f90336000d073a1bdeadbe40fc03" },
+      "serialized_sparse": { "length": 37, "hex": "060007070a200000204010f6031e000a07221a73303428f90336000d073a1bdeadbe40fc03" }
+    },
+    {
+      "name": "skip_matrix_fp64_after_sequence",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 1 of the 100 (read, skipped) wire-type pairs: each of {fp64} is skipped where it directly follows a {sequence} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "sequence", "fp64"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "unsigned", "id": 0, "value": 7 },
+        { "op": "sequence_end" },
+        { "op": "fp64", "id": 1, "value": 3.5 },
+        { "op": "unsigned", "id": 2, "value": 502 }
+      ],
+      "serialized": { "length": 17, "hex": "060007070a410000000000000c4010f603" },
+      "serialized_sparse": { "length": 17, "hex": "060007070a410000000000000c4010f603" }
+    },
+    {
+      "name": "skip_matrix_int_array_after_sequence",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 2 of the 100 (read, skipped) wire-type pairs: each of {array<unsigned>, array<signed>} is skipped where it directly follows a {sequence} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["array", "sequence"],
+      "skip_ids": [1, 4],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "unsigned", "id": 0, "value": 7 },
+        { "op": "sequence_end" },
+        { "op": "array", "id": 1, "element_type": "u32", "values": [1000, 2000, 3000] },
+        { "op": "unsigned", "id": 2, "value": 502 },
+        { "op": "sequence_begin", "id": 3 },
+        { "op": "unsigned", "id": 0, "value": 10 },
+        { "op": "sequence_end" },
+        { "op": "array", "id": 4, "element_type": "i32", "values": [-1000, -2000, -3000] },
+        { "op": "unsigned", "id": 5, "value": 505 }
+      ],
+      "serialized": { "length": 30, "hex": "060007070b03e807d00fb81710f6031e000a072403cf0f9f1fef2e28f903" },
+      "serialized_sparse": { "length": 30, "hex": "060007070b03e807d00fb81710f6031e000a072403cf0f9f1fef2e28f903" }
+    },
+    {
+      "name": "skip_matrix_fixlen_array_after_sequence",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 1 of the 100 (read, skipped) wire-type pairs: each of {array<fixlen>} is skipped where it directly follows a {sequence} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["fixlen", "array", "sequence"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "unsigned", "id": 0, "value": 7 },
+        { "op": "sequence_end" },
+        { "op": "array", "id": 1, "element_type": "fp32", "values": [1.5, -2.5, 3.5] },
+        { "op": "unsigned", "id": 2, "value": 502 }
+      ],
+      "serialized": { "length": 22, "hex": "060007070d03200000c03f000020c00000604010f603" },
+      "serialized_sparse": { "length": 22, "hex": "060007070d03200000c03f000020c00000604010f603" }
+    },
+    {
+      "name": "skip_matrix_sequence_after_sequence",
+      "group": "skip/matrix",
+      "description": "Skip matrix, 1 of the 100 (read, skipped) wire-type pairs: each of {sequence} is skipped where it directly follows a {sequence} field the receiver DOES read. Every skipped field is followed by an unsigned anchor that must still decode with its exact value -- a skip consuming one byte too few or too many is caught there (MESSAGE_SPEC S7.3, S4.3).",
+      "offset": 0,
+      "requires": ["sequence"],
+      "skip_ids": [1],
+      "fields": [
+        { "op": "sequence_begin", "id": 0 },
+        { "op": "unsigned", "id": 0, "value": 7 },
+        { "op": "sequence_end" },
+        { "op": "sequence_begin", "id": 1 },
+        { "op": "unsigned", "id": 0, "value": 8 },
+        { "op": "sequence_end" },
+        { "op": "unsigned", "id": 2, "value": 502 }
+      ],
+      "serialized": { "length": 11, "hex": "060007070e00080710f603" },
+      "serialized_sparse": { "length": 11, "hex": "060007070e00080710f603" }
     }
   ],
   "invalid_utf8": [

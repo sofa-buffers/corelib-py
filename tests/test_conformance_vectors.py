@@ -15,12 +15,24 @@ the full scenario matrix the harness mandates:
 7. **roundtrip** — encode then decode, assert the fields survive the trip.
 8. **requires gating** — vectors are skipped when they need a capability this
    port does not provide (this pure-Python port provides them all).
+
+Scenarios 5 and 6 run for **every** vector that carries ``skip_ids`` — 58 of
+them since corelib-c-cpp#160 added the skip matrix, whose 36 vectors walk the
+full cross product of "field read" x "field declined" over the ten skippable
+constructs, plus 16 more for the axes beside it (empty payloads, two-byte
+lengths and counts, an 8-byte element width, a three-byte id, the message
+edges). Nothing here enumerates a vector by name and nothing caps a list, a
+count or a payload, so the suite grows with the file; ``test_suite_metadata``,
+``test_skip_matrix_is_present_in_full`` and ``test_loader_truncates_nothing``
+below are what stop it from shrinking back unnoticed. ``tests/conftest.py``
+prints the vector and check counts a run actually executed.
 """
 
 from __future__ import annotations
 
 import math
 import struct
+from collections import Counter
 
 import pytest
 from vectors import VECTOR_DOC as _DATA
@@ -257,13 +269,17 @@ def _expected_stream(fields, skip_ids=()):
 def test_suite_metadata():
     assert _DATA["format"] == "sofabuffers-test-vectors"
     assert _DATA["version"] == 1
-    assert len(VECTORS) >= 67
+    assert len(VECTORS) >= 131
     # the new capability/skip features are actually exercised by the suite
     assert any("requires" in v for v in VECTORS)
     assert any("skip_ids" in v for v in VECTORS)
     # every capability a vector asks for is one we know how to gate on
     declared = {tag for v in VECTORS for tag in v.get("requires", ())}
     assert declared <= SUPPORTED, f"unknown capability tags: {declared - SUPPORTED}"
+    # A top-level block this file does not consume (`sequence_growth`, replayed by
+    # tests/test_sequence_growth.py) must not disturb the load: a port that reads
+    # only `vectors` ignores the rest, and adding one more is backward-compatible.
+    assert set(_DATA) >= {"vectors", "invalid_utf8", "sequence_growth"}
 
 
 # The ±0 float-special vectors store both zeros as JSON `0`, which cannot carry
@@ -324,6 +340,59 @@ def test_vector_roundtrip(vec):
 
 _SKIP_VECTORS = [v for v in VECTORS if v.get("skip_ids")]
 _SKIP_IDS = [v["name"] for v in _SKIP_VECTORS]
+
+
+def test_skip_matrix_is_present_in_full():
+    """The skip suite is the size the shared file declares — not a subset.
+
+    Skipping is driven by the wire type alone, and each type computes its length
+    differently (§4.6-§4.9), so the matrix is the full cross product of "field
+    read" x "field skipped" over the ten skippable constructs, plus the axes
+    beside it (empty payloads, two-byte counts, an 8-byte element width, a
+    three-byte id, the message edges). Pinning the counts here is what stops the
+    suite from silently shrinking back to a subset of the file: an older copy of
+    ``test_vectors.json``, or a harness change that stops feeding a group.
+    """
+    groups = Counter(v.get("group") for v in VECTORS)
+    assert groups["skip/matrix"] == 36
+    assert groups["skip"] == 16
+    assert len(_SKIP_VECTORS) == 58, "every vector carrying skip_ids runs the skip scenarios"
+    # Both scenarios (whole-message and byte-at-a-time) run over all of them.
+    assert {v["name"] for v in _SKIP_VECTORS} == set(_SKIP_IDS)
+
+
+def test_loader_truncates_nothing():
+    """No fixed-size bound in the loader may quietly test less than the file says.
+
+    The C harness carried a fixed ``MAXSKIP`` that *truncated* an over-long
+    ``skip_ids`` list: the surplus ids were read instead of skipped, so the
+    vector still passed while covering less than it claimed (fixed upstream in
+    corelib-c-cpp#160 — it refuses now). Python's loader is ``json.loads`` and
+    has no such bound anywhere; this test is what keeps it that way, by naming
+    the sizes the current file actually needs and failing loudly if a future cap
+    ever clips one of them.
+    """
+    skip_lists = [v["skip_ids"] for v in _SKIP_VECTORS]
+    ids = [f["id"] for v in VECTORS for f in v["fields"] if "id" in f]
+    arrays = [f["values"] for v in VECTORS for f in v["fields"] if f["op"] == "array"]
+    strings = [f["value"] for v in VECTORS for f in v["fields"] if f["op"] == "string"]
+    blobs = [f["value_hex"] for v in VECTORS for f in v["fields"] if f["op"] == "blob"]
+
+    assert max(len(s) for s in skip_lists) >= 9  # skip_ids lists of up to 9 entries
+    assert max(ids) >= 100001  # three-byte header varints
+    assert max(len(a) for a in arrays) >= 130  # counts needing two varint bytes
+    assert max(len(s.encode()) for s in strings) >= 130  # ditto for fixlen payloads
+    assert max(len(b) // 2 for b in blobs) >= 130
+    # an 8-byte element width read from the fixlen_word, not assumed to be 4
+    assert any(
+        f["op"] == "array" and f.get("element_type") == "fp64"
+        for v in _SKIP_VECTORS
+        for f in v["fields"]
+    )
+    # and every one of those sizes survives into a decode: the vectors carrying
+    # them are in the skip set, which the scenarios below run in full.
+    assert len(_SKIP_VECTORS) == sum(1 for v in VECTORS if v.get("skip_ids"))
+
 
 
 @pytest.mark.parametrize("vec", _SKIP_VECTORS, ids=_SKIP_IDS)

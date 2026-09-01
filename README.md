@@ -984,7 +984,32 @@ mypy --strict src/sofab      # type-check
 ```
 
 `assets/test_vectors.json` is the shared cross-language suite, copied verbatim
-from `corelib-c-cpp`. Its `sequence_growth` block describes a **wrapper array's
+from `corelib-c-cpp` (never hand-edited or merged here; its format is described
+by [`test_vectors_README.md`](https://github.com/sofa-buffers/corelib-c-cpp/blob/main/assets/test_vectors_README.md),
+which stays in that repo). `tests/test_conformance_vectors.py` replays every
+vector through encode, chunked encode, decode, byte-at-a-time decode, roundtrip
+and — for the 58 vectors carrying `skip_ids` — a **skip** pass and its
+byte-at-a-time variant, in which those ids are declined at every nesting level
+(declining a sequence drops its whole sub-tree) and the surviving fields must
+still decode to their exact values with the message fully consumed. 36 of those
+58 are the skip matrix — the cross product of the construct read against the
+construct skipped, so an off-by-one in any one length rule (§4.6–§4.9) shifts
+the anchor field behind it and fails — and 16 more are the axes beside it:
+empty payloads, lengths and counts needing two varint bytes, an 8-byte element
+width, a three-byte id, and a skip at each message edge. A run prints what it
+covered:
+
+```
+========================= shared conformance vectors =========================
+test_vectors.json: 131 vectors (36 skip/matrix, 16 skip), 58 carry skip_ids; ...
+vectors exercised: 131/131 (58 through the skip scenarios)
+checks executed: 1075 (1075 passed, 0 failed), 0 gated out by `requires`, ...
+```
+
+A vector naming a capability this port lacks is gated out by its `requires` tag
+and counted on that line; this port implements all five, so nothing is gated.
+
+Its `sequence_growth` block describes a **wrapper array's
 container** growing as elements arrive — a length no wire word announces, since
 MESSAGE_SPEC §5.1 makes it *highest present id + 1*. That container belongs to
 the layer above the codec, and this port ships that layer: `sofab.collectors`
