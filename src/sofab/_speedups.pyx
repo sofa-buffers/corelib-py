@@ -603,8 +603,9 @@ cdef int _MAX_DEPTH = _MAX_DEPTH_C
 # _put splits every atomic unit at any byte boundary; it binds only a buffer
 # installed together with a flush sink. Mirrors types.MIN_OUTPUT_BUFFER.
 cdef Py_ssize_t _MIN_OUTPUT_BUFFER = MIN_OUTPUT_BUFFER
-# Reassembly space a decoder takes when the caller names no size. Mirrors
-# sofab.types.MIN_REASSEMBLY; both engines bound memory the same way.
+# The smallest reassembly buffer a decoder accepts -- there is no default size,
+# only this floor (S6.2.1, #139). Mirrors sofab.types.MIN_REASSEMBLY; both
+# engines bound memory the same way.
 cdef Py_ssize_t _MIN_REASSEMBLY = MIN_REASSEMBLY
 
 cdef inline object _fresh_bytearray(Py_ssize_t n):
