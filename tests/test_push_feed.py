@@ -197,11 +197,15 @@ def test_a_lone_continuation_byte_is_incomplete(dec_cls):
 
 
 @pytest.mark.parametrize("dec_cls", DECODER_ENGINES)
-def test_status_reports_the_last_outcome(dec_cls):
+def test_feed_is_the_only_place_the_outcome_is_reported(dec_cls):
+    """§5.2.4: "The status ``feed``/``decode`` returns *is* the answer." Each
+    call hands back the outcome for the bytes so far, and nothing on the object
+    repeats it -- a second accessor is a second thing to keep in step, and this
+    port once had it answer COMPLETE for a message ``feed`` had refused."""
     dec = dec_cls(**NO_CAPS, visitor=Collect())
-    assert dec.status is Status.COMPLETE
-    dec.feed(b"\x80")
-    assert dec.status is Status.INCOMPLETE
+    assert dec.feed(b"\x80") is Status.INCOMPLETE  # a varint prefix, mid-header...
+    assert dec.feed(b"\x01\x05") is Status.COMPLETE  # ...finishing id 16 = 5
+    assert not hasattr(dec, "status")
 
 
 @pytest.mark.parametrize("dec_cls", DECODER_ENGINES)

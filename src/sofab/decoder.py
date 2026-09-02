@@ -1212,14 +1212,15 @@ class Decoder:
     @property
     def error(self) -> SofaError | None:
         """The failure that made :meth:`feed` return :attr:`Status.INVALID`, or
-        ``None``. Mirrors :attr:`sofab.Encoder.error`: the status is the answer,
-        this is the reason behind it."""
-        return self._error
+        ``None``. Mirrors :attr:`sofab.Encoder.error`: the status :meth:`feed`
+        returned is the answer, this is the reason behind it.
 
-    @property
-    def status(self) -> Status:
-        """The outcome of the last :meth:`feed`."""
-        return self._status
+        There is deliberately no ``status`` counterpart. The outcome is what
+        :meth:`feed` hands back and nothing repeats it: a second way to ask the
+        same question is a second thing to keep in step, and this port shipped
+        that drift once already.
+        """
+        return self._error
 
     def feed(self, data: Any) -> Status:
         """Consume ``data`` and report the outcome for the bytes so far (§5.2).
