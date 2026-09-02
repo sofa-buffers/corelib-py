@@ -36,6 +36,7 @@ from sofab import (
     FIXLEN_MAX,
     Encoder,
     SofaArgumentError,
+    SofaDecodeError,
     SofaError,
     SofaLimitError,
     Status,
@@ -350,8 +351,9 @@ def test_a_limit_a_handler_raised_is_terminal_too(engine):
 def test_the_rejection_is_on_the_error_channel_not_the_status(engine):
     """§6.3 leaves the surfacing open between "a fourth decode outcome" and "a
     terminal failure carrying the LimitExceeded code on the error channel".
-    This port takes the second: the bytes are well formed, so the status never
-    becomes INVALID, and `error` is where the rejection is."""
+    This port takes the second: the bytes are well formed, so `feed` never
+    hands back INVALID for them -- it does not return a status at all, it
+    raises, and `error` is where the rejection is."""
     enc = Encoder()
     enc.write_string(1, "x" * 2000)
     enc.flush()
@@ -359,7 +361,9 @@ def test_the_rejection_is_on_the_error_channel_not_the_status(engine):
     with pytest.raises(SofaLimitError) as caught:
         dec.feed(enc.getvalue())
     assert dec.error is caught.value
-    assert dec.status is not Status.INVALID
+    # Not InvalidMessage: §6.3 forbids reporting a limit rejection as one, and
+    # SofaDecodeError is this port's InvalidMessage / INVALID carrier.
+    assert not isinstance(caught.value, SofaDecodeError)
 
 
 @pytest.mark.parametrize("engine", ENGINES)

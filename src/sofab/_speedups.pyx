@@ -647,7 +647,6 @@ cdef int _ST_BLOB = 3
 # hand back the exact same singletons the pure path uses without paying the
 # IntEnum coercion on every field.
 cdef tuple _WT = tuple(WireType)
-cdef tuple _STATUS = tuple(Status)
 
 # The base class's no-op control hooks, to tell an overridden one from the
 # default without a getattr per decoder.
@@ -3222,10 +3221,6 @@ cdef class Decoder:
     @property
     def error(self):
         return self._err
-
-    @property
-    def status(self):
-        return _STATUS[self._status]
 
     @cython.always_allow_keywords(True)
     def feed(self, data):
