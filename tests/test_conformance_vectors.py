@@ -277,9 +277,15 @@ def test_suite_metadata():
     declared = {tag for v in VECTORS for tag in v.get("requires", ())}
     assert declared <= SUPPORTED, f"unknown capability tags: {declared - SUPPORTED}"
     # A top-level block this file does not consume (`sequence_growth`, replayed by
-    # tests/test_sequence_growth.py) must not disturb the load: a port that reads
-    # only `vectors` ignores the rest, and adding one more is backward-compatible.
-    assert set(_DATA) >= {"vectors", "invalid_utf8", "sequence_growth"}
+    # tests/test_sequence_growth.py; `header_limits`, by tests/test_header_limits.py)
+    # must not disturb the load: a port that reads only `vectors` ignores the rest,
+    # and adding one more is backward-compatible.
+    assert set(_DATA) >= {
+        "vectors",
+        "invalid_utf8",
+        "sequence_growth",
+        "header_limits",
+    }
 
 
 # The ±0 float-special vectors store both zeros as JSON `0`, which cannot carry

@@ -1039,6 +1039,19 @@ codec made, and the codec keeps no reference to anything it takes.
 — extending to at least `id + 1` in one pass, so a sparse array costs O(n) and
 not O(n²).
 
+Its `header_limits` block carries the other shape a ceiling has to answer: bytes
+that **declare** a length or a count and then end, with no payload behind them.
+The verdict is reached at that word — a claimed 100-byte string with nothing
+after it is rejected, not reported as truncated — and it is terminal, so a
+further `feed` re-issues it rather than consuming. Which ceiling speaks decides
+the category: a receiver cap (`max_dyn_string_len` and its two siblings) raises
+`SofaLimitError`, a bound the schema declared on a `Binding` is `Status.INVALID`
+(§6.2.1/§6.3 vs MESSAGE_SPEC §7.1). Every rejection in the block is paired with
+the same shape at a length the ceiling admits, which still answers
+`Status.INCOMPLETE` and completes when its payload arrives.
+`tests/test_header_limits.py` replays the block; `tests/test_schema_bounded.py`
+and `tests/test_receiver_limits.py` specify the two ceilings in full.
+
 If the compile fails or no compiler is available, the install falls back to
 pure-Python (the extension is marked *optional* in `setup.py`). Both engines
 ship, so both are run:
