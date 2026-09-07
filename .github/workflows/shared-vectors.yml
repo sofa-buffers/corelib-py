@@ -1,0 +1,45 @@
+# The shared conformance corpus is a verbatim copy of the file corelib-c-cpp
+# owns. Nothing checked that the copy was still current: an inventory guard in
+# the test suite asserts floors and structure, deliberately not equality, so a
+# block added upstream would not show up here at all. This job is the check --
+# one sha256 against the upstream file.
+name: Shared vectors
+
+on:
+  # Only PRs that touch the copy (or this job) -- other work is not blocked by
+  # an upstream change nobody in that PR made.
+  pull_request:
+    paths:
+      - 'assets/test_vectors.json'
+      - '.github/workflows/shared-vectors.yml'
+  # And once a day, which is what catches an upstream change on its own.
+  schedule:
+    - cron: '4 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verbatim:
+    name: The copy matches corelib-c-cpp
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare sha256 with corelib-c-cpp@main
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 5 -o upstream.json \
+            https://raw.githubusercontent.com/sofa-buffers/corelib-c-cpp/main/assets/test_vectors.json
+          ours=$(sha256sum assets/test_vectors.json | cut -d' ' -f1)
+          theirs=$(sha256sum upstream.json | cut -d' ' -f1)
+          echo "ours:     $ours"
+          echo "upstream: $theirs"
+          if [ "$ours" != "$theirs" ]; then
+            echo "::error file=assets/test_vectors.json::The copy is not corelib-c-cpp@main. Refresh it: curl -fsSL -o assets/test_vectors.json https://raw.githubusercontent.com/sofa-buffers/corelib-c-cpp/main/assets/test_vectors.json"
+            echo "--- what differs (upstream vs ours) ---"
+            diff <(python3 -m json.tool upstream.json) <(python3 -m json.tool assets/test_vectors.json) | head -40 || true
+            exit 1
+          fi
+          echo "The copy is current."

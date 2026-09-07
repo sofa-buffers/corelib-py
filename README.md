@@ -346,7 +346,7 @@ class Transcoder(Visitor):
         out.write_float32_bits(field_id, bits)        # verbatim, no float
 
     def on_float32_array_bits(self, field_id, count, payload):
-        out.write_float32_array_bits(field_id, payload)
+        out. A daily CI job (`.github/workflows/shared-vectors.yml`) compares the sha256 of this copy against that file on `corelib-c-cpp@main`, so a copy left behind by an upstream change shows up here rather than going unnoticed.write_float32_array_bits(field_id, payload)
 ```
 
 Both hooks are opt-in by override, and both replace their value-carrying twin
