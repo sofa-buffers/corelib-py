@@ -12,7 +12,8 @@
     "blob.value_hex": "lowercase hex of the blob payload",
     "array.element_type": "input element width/type fed to the encoder (u8..u64, i8..i64, fp32, fp64)",
     "invalid_utf8": "NEGATIVE vectors: a `string` field (id 0) whose bytes are not valid UTF-8. A strict (SOFAB_STRICT_UTF8) build MUST decode serialized_hex to the INVALID outcome and refuse to encode string_hex with the invalid-argument error. Backward-compatible: consumers that only read 'vectors' ignore this key. See test_vectors_README.md.",
-    "sequence_growth": "GROWTH cases (CORELIB_PLAN S7.2 item 8): a wrapper array's length is highest present id + 1 (MESSAGE_SPEC S5.1), so its container grows as elements arrive -- the one allocation shape where growth is conformant (ARCHITECTURE S9.5). A case is keyed by a DELIVERY SEQUENCE OF ELEMENT IDS, not by bytes, because two ports that grow differently emit identical bytes: the port builds the message from 'deliver' and asserts 'expect'. Indices are CAP-RELATIVE -- 'id_from_cap'/'length_from_cap' are offsets added to the port's own configured max_dyn_array_count, which is per-target and never a family-wide number; every case assumes a cap of at least 4. Gated by requires 'dynamic_arrays': statically bounded profiles (C, C++ corelib: c-cpp, Rust no_std) never grow and do not run this block. Expectations come from ARCHITECTURE S9.5 and CORELIB_PLAN S7.2 item 8, NOT from the generating implementation, which authors these cases without executing them. Backward-compatible: consumers that only read 'vectors' ignore this key. See test_vectors_README.md."
+    "sequence_growth": "GROWTH cases (CORELIB_PLAN S7.2 item 8): a wrapper array's length is highest present id + 1 (MESSAGE_SPEC S5.1), so its container grows as elements arrive -- the one allocation shape where growth is conformant (ARCHITECTURE S9.5). A case is keyed by a DELIVERY SEQUENCE OF ELEMENT IDS, not by bytes, because two ports that grow differently emit identical bytes: the port builds the message from 'deliver' and asserts 'expect'. Indices are CAP-RELATIVE -- 'id_from_cap'/'length_from_cap' are offsets added to the port's own configured max_dyn_array_count, which is per-target and never a family-wide number; every case assumes a cap of at least 4. Gated by requires 'dynamic_arrays': statically bounded profiles (C, C++ corelib: c-cpp, Rust no_std) never grow and do not run this block. Expectations come from ARCHITECTURE S9.5 and CORELIB_PLAN S7.2 item 8, NOT from the generating implementation, which authors these cases without executing them. Backward-compatible: consumers that only read 'vectors' ignore this key. See test_vectors_README.md.",
+    "header_limits": "HEADER-CEILING cases (CORELIB_PLAN S6.2.1/S6.3): bytes that DECLARE a length or count and then END, with no payload behind them. The ceiling is decided at that word, before the payload is asked for, so the answer is the ceiling's and TERMINAL -- never INCOMPLETE, which S5.2.1 defines as the outcome more bytes can change. Which ceiling speaks is the subject: a schema 'maxlen' answers INVALID (MESSAGE_SPEC S7.1), a receiver cap answers LIMIT_EXCEEDED (S6.2.1), and a case carries 'schema' or 'limits' but never both -- a cap MUST NOT be applied to a field the schema already bounds. Bounds are ABSOLUTE, not cap-relative as in sequence_growth: the case is a fixed byte string, so it tells the port which ceiling to configure for the run. EVERY REJECTION IS PAIRED WITH AN IN-CAP CONTROL that must still answer INCOMPLETE, so a port cannot pass by rejecting everything. An unsatisfied 'requires' tag means SKIP. Expectations come from CORELIB_PLAN S6.2.1/S6.3 and MESSAGE_SPEC S5.2, NOT from the generating implementation. Backward-compatible: consumers that only read 'vectors' ignore this key. See test_vectors_README.md."
   },
   "vectors": [
     {
@@ -2382,6 +2383,145 @@
         "outcome": "limit_exceeded",
         "terminal": true,
         "max_length": 1
+      }
+    }
+  ],
+  "header_limits": [
+    {
+      "name": "header_string_over_cap",
+      "group": "limits/header",
+      "description": "A 100-byte string is declared at id 0 and the message ends -- not one payload byte arrives. The cap is decided at the length word, before the payload is asked for, so the answer is LimitExceeded and terminal (CORELIB_PLAN S6.2.1, S6.3). INCOMPLETE would be the outcome S5.2.3's reason exists to prevent: it says more bytes can change the verdict, and after a cap has fired nothing can.",
+      "requires": ["fixlen", "receiver_caps"],
+      "field_id": 0,
+      "declared": 100,
+      "limits": { "max_dyn_string_len": 16 },
+      "serialized": "02a206",
+      "expect": {
+        "outcome": "limit_exceeded",
+        "terminal": true
+      }
+    },
+    {
+      "name": "header_string_in_cap",
+      "group": "limits/header",
+      "description": "THE CONTROL for header_string_over_cap: the same shape at a length the cap admits. Still INCOMPLETE -- the cap must not turn every short read into a rejection, and a port that passes the over-cap case by rejecting everything fails here.",
+      "requires": ["fixlen", "receiver_caps"],
+      "field_id": 0,
+      "declared": 8,
+      "limits": { "max_dyn_string_len": 16 },
+      "serialized": "0242",
+      "expect": {
+        "outcome": "incomplete"
+      }
+    },
+    {
+      "name": "header_blob_over_cap",
+      "group": "limits/header",
+      "description": "header_string_over_cap for a blob. S6.2.1 keeps blob and string on separate caps because a deployment may accept a megabyte of opaque bytes and no such quantity of text, so the enforcement point has to be asserted on both -- a port can wire one and miss the other.",
+      "requires": ["fixlen", "receiver_caps"],
+      "field_id": 0,
+      "declared": 100,
+      "limits": { "max_dyn_blob_len": 16 },
+      "serialized": "02a306",
+      "expect": {
+        "outcome": "limit_exceeded",
+        "terminal": true
+      }
+    },
+    {
+      "name": "header_blob_in_cap",
+      "group": "limits/header",
+      "description": "THE CONTROL for header_blob_over_cap.",
+      "requires": ["fixlen", "receiver_caps"],
+      "field_id": 0,
+      "declared": 8,
+      "limits": { "max_dyn_blob_len": 16 },
+      "serialized": "0243",
+      "expect": {
+        "outcome": "incomplete"
+      }
+    },
+    {
+      "name": "header_array_count_over_cap",
+      "group": "limits/header",
+      "description": "An unsigned varint array declares 100 elements at id 0 and the message ends before the first of them. A COUNT ahead of its payload is bound exactly as a length is (S6.2.1) -- and unlike a wrapper array, which has no count on the wire and is bound at the element index instead (see the sequence_growth block).",
+      "requires": ["array", "receiver_caps"],
+      "field_id": 0,
+      "declared": 100,
+      "limits": { "max_dyn_array_count": 16 },
+      "serialized": "0364",
+      "expect": {
+        "outcome": "limit_exceeded",
+        "terminal": true
+      }
+    },
+    {
+      "name": "header_array_count_in_cap",
+      "group": "limits/header",
+      "description": "THE CONTROL for header_array_count_over_cap.",
+      "requires": ["array", "receiver_caps"],
+      "field_id": 0,
+      "declared": 8,
+      "limits": { "max_dyn_array_count": 16 },
+      "serialized": "0308",
+      "expect": {
+        "outcome": "incomplete"
+      }
+    },
+    {
+      "name": "header_string_amplification",
+      "group": "limits/header",
+      "description": "Six bytes claim a 1 GiB string. The amplification shape: the verdict must not depend on the payload arriving, or the cheapest possible message buys an allocation four million times its own size (ARCHITECTURE S9.5, 'a claimed oversize fails fast even if the payload never arrives'). Its in-cap control is header_string_in_cap -- same cap, same shape.",
+      "requires": ["fixlen", "receiver_caps", "int64"],
+      "field_id": 0,
+      "declared": 1073741824,
+      "limits": { "max_dyn_string_len": 16 },
+      "serialized": "028280808020",
+      "expect": {
+        "outcome": "limit_exceeded",
+        "terminal": true
+      }
+    },
+    {
+      "name": "header_string_schema_bounded",
+      "group": "limits/header",
+      "description": "THE PAIR THAT KEEPS THE TWO CATEGORIES APART: the identical length word to header_string_over_cap, at a field the SCHEMA bounds instead. The answer is INVALID, not LimitExceeded -- a schema bound is a statement about validity, a receiver cap one about capacity (MESSAGE_SPEC S7.1 vs CORELIB_PLAN S6.2.1), and S6.2.1 forbids applying a cap to a field the schema already bounds. A port that routes both to one category passes every other case in this block and fails this one.",
+      "requires": ["fixlen"],
+      "field_id": 0,
+      "declared": 100,
+      "schema": { "maxlen": 16 },
+      "serialized": "02a206",
+      "expect": {
+        "outcome": "invalid",
+        "terminal": true
+      }
+    },
+    {
+      "name": "header_string_schema_bounded_in_bound",
+      "group": "limits/header",
+      "description": "THE CONTROL for header_string_schema_bounded: within the schema bound, so INCOMPLETE again. The schema bound no more rejects a short read than the cap does.",
+      "requires": ["fixlen"],
+      "field_id": 0,
+      "declared": 8,
+      "schema": { "maxlen": 16 },
+      "serialized": "0242",
+      "expect": {
+        "outcome": "incomplete"
+      }
+    },
+    {
+      "name": "header_string_over_cap_split",
+      "group": "limits/header",
+      "description": "header_string_over_cap fed in two chunks that divide the length varint itself, so the cap fires on a word no single feed delivered whole. The verdict is a property of the bytes, not of how they were chunked (CORELIB_PLAN S7.2 item 4); a decoder that compares before the varint is complete sees a truncated number and lets the message through.",
+      "requires": ["fixlen", "receiver_caps"],
+      "field_id": 0,
+      "declared": 100,
+      "limits": { "max_dyn_string_len": 16 },
+      "serialized": "02a206",
+      "chunks": ["02a2", "06"],
+      "expect": {
+        "outcome": "limit_exceeded",
+        "terminal": true
       }
     }
   ]

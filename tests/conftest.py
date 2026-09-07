@@ -122,7 +122,8 @@ def pytest_terminal_summary(terminalreporter) -> None:
         f"({groups.get('skip/matrix', 0)} skip/matrix, {groups.get('skip', 0)} skip), "
         f"{with_skip_ids} carry skip_ids; "
         f"{len(VECTOR_DOC.get('invalid_utf8', ()))} invalid_utf8, "
-        f"{len(VECTOR_DOC.get('sequence_growth', ()))} sequence_growth cases"
+        f"{len(VECTOR_DOC.get('sequence_growth', ()))} sequence_growth, "
+        f"{len(VECTOR_DOC.get('header_limits', ()))} header_limits cases"
     )
     write(
         f"vectors exercised: {len(_tally.vectors)}/{len(VECTORS)}"
