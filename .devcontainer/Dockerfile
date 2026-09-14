@@ -23,6 +23,12 @@ ENV PIP_NO_CACHE_DIR=1 \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    ripgrep \
+    fd-find \
+    jq \
+    shellcheck \
+    shfmt \
+    xxd \
     git \
     build-essential \
     valgrind \
