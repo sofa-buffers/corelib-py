@@ -2076,6 +2076,10 @@ cdef class Decoder:
     # when the decoder is reset, and in __dealloc__.
     cdef PyObject** _vstack         # _MAX_DEPTH borrowed-then-owned pointers
     cdef int _vsp
+    # The depth each suspended handler's child scope closes back to, so the pop
+    # is tied to the begin that pushed (#146). Lives in _stackmem after _vstack
+    # -- one malloc, not two; written only where a child is pushed.
+    cdef unsigned char* _vdepth
     cdef int _status
     cdef object _err
     cdef int _resume_kind
@@ -2104,10 +2108,11 @@ cdef class Decoder:
         self._stackmem = NULL
         self._vstack = NULL
         self._vsp = 0
-        self._stackmem = malloc(<size_t>_MAX_DEPTH_C * sizeof(PyObject*))
+        self._stackmem = malloc(<size_t>_MAX_DEPTH_C * (sizeof(PyObject*) + 1))
         if self._stackmem == NULL:
             raise MemoryError()
         self._vstack = <PyObject**>self._stackmem
+        self._vdepth = <unsigned char*>(self._vstack + _MAX_DEPTH_C)
         self._status = <int>Status.COMPLETE
         self._err = None
         self._limit = None
@@ -2230,6 +2235,7 @@ cdef class Decoder:
             free(self._stackmem)
             self._stackmem = NULL
             self._vstack = NULL
+            self._vdepth = NULL
         # _bent / _btab belong to the cached _Compiled, not to this decoder.
         if self._tstack != NULL:
             free(self._tstack)
@@ -3436,14 +3442,21 @@ cdef class Decoder:
 
             if t == _WT_SEQUENCE_END:
                 if self._tsp > 0:
+                    # Inside a scope the map descended into, a child table is
+                    # current; inside one the handler opened, -1 is (§4.9). So
+                    # `mapped` says whose scope this is, and a scope the handler
+                    # never heard open is not closed to it (#146).
                     self._tsp -= 1
                     self._tab = self._tstack[self._tsp]
+                    if mapped:
+                        mapped = self._tab >= 0
+                        continue
                     mapped = self._tab >= 0
                 # The end belongs to whoever was handling the scope, so a child
                 # hears its own scope close before it is popped.
-                if visitor is not None:
+                if has_visitor:
                     visitor.on_sequence_end()
-                if self._vsp:
+                if self._vsp and self._vdepth[self._vsp - 1] == self._depth:
                     self._vsp -= 1
                     visitor = <object>self._vstack[self._vsp]
                     Py_XDECREF(self._vstack[self._vsp])
@@ -3499,6 +3512,7 @@ cdef class Decoder:
                         # The handler named someone else for this sub-tree.
                         Py_INCREF(visitor)
                         self._vstack[self._vsp] = <PyObject*>visitor
+                        self._vdepth[self._vsp] = <unsigned char>(self._depth - 1)
                         self._vsp += 1
                         visitor = answer
                         self._bind_visitor(answer)

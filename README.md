@@ -420,8 +420,8 @@ class Doc(Visitor):
 ```
 
 Returning a `Visitor` from `on_sequence_begin` **descends**: the sub-tree's
-fields go to the visitor returned, its `on_sequence_end` fires when the scope
-closes, and the parent resumes afterwards. Returning `False` still skips the
+fields go to the visitor returned — sequences nested inside included — its
+`on_sequence_end` fires when that scope closes, and the parent resumes afterwards. Returning `False` still skips the
 sub-tree; anything else still decodes it flat.
 
 A collector places each element at the id it names and fills the gap an omitted
@@ -520,7 +520,9 @@ the rest — every hook, including the *begin* destinations and the raw `fp32`
 channel. A declaration is about *its own* field, so the two never collide: an
 `fp32` the table names lands in its slot as the widened `double` the table asked
 for, and one it does not name reaches `on_float32_bits` if the visitor overrides
-it.
+it. The same holds for scopes: a sequence the table names is the table's, so the
+visitor hears neither its `on_sequence_begin` nor its `on_sequence_end` — begins
+and ends always pair up, which is what lets a flat visitor track its depth.
 
 Declaring the slots on the handler instead is the same thing without the
 constructor keywords, and is what generated code should emit:
