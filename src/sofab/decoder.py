@@ -1601,9 +1601,13 @@ class Decoder:
                     else None
                 )
                 if answer is not False:
-                    if bmap is not None:
+                    if self._wu is not None:
                         # §4.9 opens a fresh id scope, so the enclosing map must
-                        # not match inside it.
+                        # not match inside it. Pushed even when that map is
+                        # already None -- a visitor scope inside a visitor scope
+                        # -- because every SEQUENCE_END pops one entry, and an
+                        # unmatched pop revives the table too early (#152). The
+                        # native engine pushes on the same condition.
                         self._bstack[self._bsp] = bmap
                         self._bsp += 1
                         self._bmap = None
