@@ -1859,6 +1859,7 @@ cdef struct _BTable:
     Py_ssize_t n
     int* idx                # id -> local entry index, or NULL for linear scan
     uint64_t idx_max
+    bint closed             # an id the table does not name is skipped
 
 
 @cython.final
@@ -1927,6 +1928,7 @@ cdef class _Compiled:
             self.btab[ti].first = 0
             self.btab[ti].n = 0
             self.btab[ti].idx_max = 0
+            self.btab[ti].closed = <bint>tables[ti]._closed
         # malloc(0) may legally return NULL, which would read as failure.
         self.bent = <_BEntry*>malloc((total if total else 1) * sizeof(_BEntry))
         if self.bent == NULL:
@@ -3487,6 +3489,17 @@ cdef class Decoder:
                     ei = -1
                     if t != _WT_SEQUENCE_START:
                         continue
+            if ei < 0 and mapped and self._btab[self._tab].closed:
+                # A closed table: an id it does not name is skipped exactly as a
+                # decoder with no visitor skips it. The visitor was not told the
+                # walk entered this scope, so it must not hear of its fields.
+                if t == _WT_SEQUENCE_START:
+                    try:
+                        self._skip()
+                    except SofaIncompleteError:
+                        self._resume_kind = _R_SKIP
+                        raise
+                continue
 
             if t == _WT_SEQUENCE_START:
                 if ei >= 0:
@@ -3969,6 +3982,8 @@ cdef class Decoder:
         cdef int st = self._pend_subtype
         cdef _BEntry* e = &self._bent[ei]
         cdef uint64_t got
+        cdef uint64_t u
+        cdef int64_t sv
         if e.kind >= _K_ARRAY_UNSIGNED and e.kind != _K_SEQUENCE:
             # A declared array's destination IS its schema bound.
             self._settle_bound(e.cap)
@@ -3983,9 +3998,18 @@ cdef class Decoder:
         # ``_take_bound`` this replaces.
         got = 1
         if t == _WT_UNSIGNED:
-            self._words[e.at] = self._take_scalar()
+            u = self._take_scalar()
+            if e.elem_bounded and u > e.elem_hi:
+                # S1: a 64-bit slot is wider than the declared width, so the
+                # width is checked here, at the value (S7.1).
+                raise SofaDecodeError("value outside declared width")
+            self._words[e.at] = u
         elif t == _WT_SIGNED:
-            (<int64_t*>self._words)[e.at] = _zigzag_decode(self._take_scalar())
+            sv = _zigzag_decode(self._take_scalar())
+            # A signed entry's elem_hi is at most INT64_MAX (Binding._add).
+            if e.elem_bounded and (sv < e.elem_lo or sv > <int64_t>e.elem_hi):
+                raise SofaDecodeError("value outside declared width")
+            (<int64_t*>self._words)[e.at] = sv
         elif t == _WT_FIXLEN:
             if st == _ST_FP32:
                 (<double*>self._words)[e.at] = _unpack_f32(self._take_fixlen_ptr(4))

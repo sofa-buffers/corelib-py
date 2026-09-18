@@ -279,6 +279,7 @@ class Decoder:
         # it. Both are the *caller's* answers, settled once at construction;
         # neither is a decode rule, and no rule below branches on them.
         "_bmap",
+        "_bclosed",
         "_bstack",
         "_bsp",
         "_objects",
@@ -504,6 +505,11 @@ class Decoder:
                 table, words, objects = declared
         self._visitor: Visitor | None = visitor
         self._bmap: dict[int, Entry] | None = None
+        # The maps of the tables built with ``closed=True``, by identity: asked
+        # only for an id the current map does not name, so a decode that binds
+        # nothing closed pays one falsy test on that path and nothing on any
+        # other.
+        self._bclosed: frozenset[int] = frozenset()
         self._bstack: list[Any] = [None] * MAX_DEPTH
         self._bsp = 0
         self._objects = objects
@@ -1445,7 +1451,9 @@ class Decoder:
                 f"objects holds {len(objects)} entries, "
                 f"the binding needs {table.tree_objects_required}"
             )
-        table.freeze()
+        self._bclosed = frozenset(
+            id(b._by_id) for b in table.freeze() if b._closed
+        )
         self._wu = raw.cast("Q")
         self._wq = raw.cast("q")
         self._wd = raw.cast("d")
@@ -1557,6 +1565,17 @@ class Decoder:
                 entry = None
                 if t != _WT_SEQUENCE_START:
                     continue
+            if entry is None and self._bclosed and id(bmap) in self._bclosed:
+                # A closed table: an id it does not name is skipped exactly as a
+                # decoder with no visitor skips it. The visitor was not told the
+                # walk entered this scope, so it must not hear of its fields.
+                if t == _WT_SEQUENCE_START:
+                    try:
+                        self._skip_sequence()
+                    except SofaIncompleteError:
+                        self._resume_kind = _R_SKIP
+                        raise
+                continue
 
             if t == _WT_SEQUENCE_START:
                 if entry is not None:
@@ -1757,10 +1776,18 @@ class Decoder:
         at = e.at
         got = 1
         if k == K_UNSIGNED:
-            self._wu[at] = self._take_scalar_matched()
+            raw = self._take_scalar_matched()
+            if e.elem_bounded and raw > e.elem_hi:
+                # §1: a 64-bit slot is wider than the declared width, so the
+                # width is checked here, at the value (§7.1).
+                raise SofaDecodeError("value outside declared width")
+            self._wu[at] = raw
         elif k == K_SIGNED:
             raw = self._take_scalar_matched()
-            self._wq[at] = (raw >> 1) ^ -(raw & 1)
+            val = (raw >> 1) ^ -(raw & 1)
+            if e.elem_bounded and not (e.elem_lo <= val <= e.elem_hi):
+                raise SofaDecodeError("value outside declared width")
+            self._wq[at] = val
         elif k == K_FLOAT64:
             self._wd[at] = _core.unpack_f64(self._take_fixlen_matched(8))
         elif k == K_FLOAT32:
