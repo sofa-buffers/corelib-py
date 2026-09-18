@@ -50,7 +50,10 @@ CORELIB_PLAN §6.2.1):
 
 A field the table does not name is not an error: it is dispatched to the
 :class:`sofab.Visitor` the decoder was given, or skipped. So a binding covers
-the schema's hot fields and everything else keeps working.
+the schema's hot fields and everything else keeps working. A table built with
+``closed=True`` skips such a field even when there is a visitor — which is what
+a *child* table wants, because the visitor was never told the walk descended
+into it (see :class:`Binding`).
 
 Example::
 
@@ -164,9 +167,9 @@ class Entry:
         # (:meth:`Binding.string_into` / :meth:`Binding.blob_into`): the payload
         # is copied into it and no ``str``/``bytes`` is built (§6.6.3).
         self.into = into
-        # The element width the schema declares for an array (§7.1), checked at
-        # the element, before it is stored. Absent means "as wide as the wire
-        # type allows".
+        # The width the schema declares (§1, §7.1): an integer scalar's, or each
+        # element's for an integer array. Checked at the value, before it is
+        # stored. Absent means "as wide as the wire type allows".
         self.elem_lo = elem_lo
         self.elem_hi = elem_hi
         self.elem_bounded = elem_bounded
@@ -207,14 +210,29 @@ class Binding:
     (§6.6.3). On a decode that completes the value is the same either way; a
     decode that ends INCOMPLETE or INVALID inside an array may already have
     written it.
+
+    ``closed`` decides what happens to an id this table does **not** name. Open
+    (the default), it goes to the decoder's visitor, as it would without a
+    table. Closed, it is skipped exactly as a decoder with no visitor skips it —
+    no hook, nothing materialized, no cap spent, decode stays COMPLETE — and a
+    nested sequence the table does not name is skipped whole.
+
+    That is what a **child** table wants. The decoder descends into a bound
+    sequence without telling the visitor, so the visitor still believes the walk
+    is in the parent's scope, and an id the child does not name would reach it
+    under the parent's identity: an unknown field a newer sender added inside a
+    struct would land in whichever parent field shares its id. A closed child
+    cannot hand one over. The flag belongs to the table, so a child bound from
+    two places behaves the same in both.
     """
 
     __slots__ = (
         "_entries", "_by_id", "_words_required", "_objects_required",
-        "_tree", "_compiled", "_frozen",
+        "_tree", "_compiled", "_frozen", "_closed",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, closed: bool = False) -> None:
+        self._closed = bool(closed)
         self._entries: list[Entry] = []
         self._by_id: dict[int, Entry] = {}
         self._words_required = 0
@@ -235,6 +253,12 @@ class Binding:
     def entries(self) -> tuple[Entry, ...]:
         """The rows, in the order they were bound. The engines compile this."""
         return tuple(self._entries)
+
+    @property
+    def closed(self) -> bool:
+        """Whether an id this table does not name is skipped rather than handed
+        to the visitor; see :class:`Binding`."""
+        return self._closed
 
     @property
     def words_required(self) -> int:
@@ -314,19 +338,46 @@ class Binding:
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
-            f"<Binding {len(self._entries)} fields, "
+            f"<Binding {len(self._entries)} fields"
+            f"{', closed' if self._closed else ''}, "
             f"{self._words_required} words, {self._objects_required} objects>"
         )
 
     # --- binder methods -----------------------------------------------------
 
-    def unsigned(self, field_id: int, at: int, count_at: int | None = None) -> Binding:
-        """Bind an unsigned-integer field to ``words`` slot ``at`` (``uint64``)."""
-        return self._add(K_UNSIGNED, field_id, at, 0, count_at, None)
+    def unsigned(
+        self,
+        field_id: int,
+        at: int,
+        count_at: int | None = None,
+        max_value: int | None = None,
+    ) -> Binding:
+        """Bind an unsigned-integer field to ``words`` slot ``at`` (``uint64``).
 
-    def signed(self, field_id: int, at: int, count_at: int | None = None) -> Binding:
-        """Bind a signed-integer field to ``words`` slot ``at`` (``int64``)."""
-        return self._add(K_SIGNED, field_id, at, 0, count_at, None)
+        ``max_value`` is the schema's declared width (``0xFF`` for a ``u8``, or
+        for a ``bitfield`` whose highest ``pos`` is 7). The slot is 64 bits wide
+        whatever the field declares, so nothing about the storage enforces a
+        narrower width, and MESSAGE_SPEC §1 then requires an explicit check:
+        given, a value above it is INVALID at the value, before it is stored —
+        so a message truncated behind it is INVALID, not INCOMPLETE (§5.2)."""
+        return self._add(K_UNSIGNED, field_id, at, 0, count_at, None, None, max_value)
+
+    def signed(
+        self,
+        field_id: int,
+        at: int,
+        count_at: int | None = None,
+        min_value: int | None = None,
+        max_value: int | None = None,
+    ) -> Binding:
+        """Bind a signed-integer field to ``words`` slot ``at`` (``int64``).
+
+        ``min_value``/``max_value`` are the schema's declared width (``-128`` /
+        ``127`` for an ``i8``, or for an ``enum`` whose constants all fit one);
+        see :meth:`unsigned`. Either side may be given on its own."""
+        return self._add(
+            K_SIGNED, field_id, at, 0, count_at, None, min_value, max_value
+        )
 
     def boolean(self, field_id: int, at: int, count_at: int | None = None) -> Binding:
         """Bind a boolean field. Booleans have no wire type (§4.4): this is
@@ -529,9 +580,12 @@ class Binding:
             self._words_required = max(self._words_required, slot + 1)
 
         lo = SIGNED_MIN if elem_lo is None else _index(elem_lo, "elem_min")
-        hi = (SIGNED_MAX if kind == K_ARRAY_SIGNED else UNSIGNED_MAX) \
+        signed = kind in (K_SIGNED, K_ARRAY_SIGNED)
+        hi = (SIGNED_MAX if signed else UNSIGNED_MAX) \
             if elem_hi is None else _index(elem_hi, "elem_max")
-        if not (SIGNED_MIN <= lo <= SIGNED_MAX) or not (0 <= hi <= UNSIGNED_MAX):
+        if not (SIGNED_MIN <= lo <= SIGNED_MAX) or not (
+            0 <= hi <= (SIGNED_MAX if signed else UNSIGNED_MAX)
+        ):
             raise SofaArgumentError("declared element width out of range")
         entry = Entry(kind, fid, slot, n, cnt, child, lo, hi,
                       elem_lo is not None or elem_hi is not None, into)

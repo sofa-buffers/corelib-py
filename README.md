@@ -502,6 +502,12 @@ What follows from the caller owning the storage:
   before an element is read (MESSAGE_SPEC §7.1). It is not a `SofaLimitError` —
   that is for fields the schema leaves unbounded, and declaring a bound here is
   what takes the receiver-side cap off the field.
+* **A declared integer width is checked at the value.** A slot is 64 bits
+  whatever the field declares, so the width is an explicit bound:
+  `.unsigned(…, max_value=0xFF)` for a `u8` or a narrow `bitfield`,
+  `.signed(…, min_value=-128, max_value=127)` for an `i8` or a narrow `enum`, and
+  `elem_max`/`elem_min` on the array binders. A value outside it is `INVALID`
+  before it is stored, even when the message is truncated behind it (§1, §5.2).
 * **Absence needs no sentinel.** A slot the decoder does not write keeps what you
   put there. `count_at` names a slot receiving `1` for a scalar that arrived, the
   element count for an array, the occurrence count for a sequence.
@@ -523,6 +529,13 @@ for, and one it does not name reaches `on_float32_bits` if the visitor overrides
 it. The same holds for scopes: a sequence the table names is the table's, so the
 visitor hears neither its `on_sequence_begin` nor its `on_sequence_end` — begins
 and ends always pair up, which is what lets a flat visitor track its depth.
+
+That same silence is a trap for an id a **child** table does not name: the
+visitor still thinks the walk is in the parent's scope, so it would get the id
+under the parent's identity — an unknown field a newer sender added inside a
+struct would land in the parent's field with the same id. Build child tables
+with `Binding(closed=True)` and such an id is skipped instead, exactly as if
+there were no visitor: no hook, nothing materialized, decode stays `COMPLETE`.
 
 Declaring the slots on the handler instead is the same thing without the
 constructor keywords, and is what generated code should emit:
