@@ -2944,12 +2944,12 @@ cdef class Decoder:
         self._pk = _PEND_NONE   # committed only once the value is in hand (§5.2)
         return value
 
-    def _unsigned(self):
+    cdef object _unsigned(self):
         if self._pk != _PEND_SCALAR or self._pend_wtype != _WT_UNSIGNED:
             return self._mismatch()
         return PyLong_FromUnsignedLongLong(self._take_scalar())
 
-    def _signed(self):
+    cdef object _signed(self):
         if self._pk != _PEND_SCALAR or self._pend_wtype != _WT_SIGNED:
             return self._mismatch()
         return PyLong_FromLongLong(_zigzag_decode(self._take_scalar()))
@@ -2981,13 +2981,13 @@ cdef class Decoder:
         self._pk = _PEND_NONE   # committed only once the payload is in hand
         return <const unsigned char*>PyBytes_AS_STRING(self._spill)
 
-    def _float32(self):
+    cdef object _float32(self):
         # Width is settled at header time (§4.6/§7), so _pend_size is 4 here.
         if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_FP32:
             return self._mismatch()
         return _unpack_f32(self._take_fixlen_ptr(4))
 
-    def _float32_bits(self):
+    cdef object _float32_bits(self):
         # The raw little-endian wire bits of the pending fp32, as an int -- no
         # float on the way, so nothing can quiet a signaling NaN (S6.5).
         cdef const unsigned char* p
@@ -2999,7 +2999,7 @@ cdef class Decoder:
                 | (<uint32_t>p[2] << 16) | (<uint32_t>p[3] << 24))
         return PyLong_FromUnsignedLongLong(<uint64_t>bits)
 
-    def _float64(self):
+    cdef object _float64(self):
         if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_FP64:
             return self._mismatch()
         return _unpack_f64(self._take_fixlen_ptr(8))
@@ -3025,7 +3025,7 @@ cdef class Decoder:
             return None  # §7.3: not a fixlen field, so it has no fixlen length
         return self._pend_size
 
-    def _string(self):
+    cdef object _string(self):
         cdef Py_ssize_t n
         cdef const unsigned char* p
         if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_STRING:
@@ -3039,7 +3039,7 @@ cdef class Decoder:
         except UnicodeDecodeError as exc:
             raise SofaDecodeError("invalid UTF-8 in string field") from exc
 
-    def _bytes(self):
+    cdef object _bytes(self):
         cdef Py_ssize_t n
         cdef const unsigned char* p
         if self._pk != _PEND_FIXLEN or self._pend_subtype != _ST_BLOB:
@@ -3051,8 +3051,14 @@ cdef class Decoder:
         return PyBytes_FromStringAndSize(<const char*>p, n)
 
     # --- array reads --------------------------------------------------------
+    #
+    # These and the scalar reads above are cdef: their only callers are
+    # _visit_value / _visit_varints in this module, and a def method called
+    # from C pays an attribute lookup, a vectorcall and (for the arrays)
+    # keyword parsing per value. cdef makes each a direct vtable call. elem_min
+    # / elem_max are positional objects -- None still means "not declared".
 
-    def _read_unsigned_array(self, elem_max=None):
+    cdef object _read_unsigned_array(self, object elem_max):
         # elem_max is the field's declared element width; see the pure engine's
         # Decoder.read_unsigned_array for what it buys (§7.1/§5.2, #267). The
         # pending value is cleared only once the payload has actually been
@@ -3073,7 +3079,7 @@ cdef class Decoder:
         self._pk = _PEND_NONE   # committed only once the payload is in hand
         return out
 
-    def _read_signed_array(self, elem_min=None, elem_max=None):
+    cdef object _read_signed_array(self, object elem_min, object elem_max):
         # The two halves of the declared width are independent: either may be
         # given on its own, in which case it bounds its own side and the other
         # stays at the widest an i64 element can be — passing one alone must not
@@ -3211,10 +3217,10 @@ cdef class Decoder:
             view.release()
         return 0
 
-    def _read_float32_array(self):
+    cdef object _read_float32_array(self):
         return self._read_farray(_ST_FP32, 4)
 
-    def _read_float64_array(self):
+    cdef object _read_float64_array(self):
         return self._read_farray(_ST_FP64, 8)
 
     # --- push-feed driver (CORELIB_PLAN §5.2) -------------------------------
