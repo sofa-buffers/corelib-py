@@ -682,9 +682,9 @@ def test_an_unbound_sequence_goes_to_the_fallback_flat(engine):
     dec = engine(**NO_CAPS, binding=b, words=words, visitor=rec)
     assert dec.feed(_nested()) is Status.COMPLETE
     assert Slots(words, []).u[0] == 11
-    # The fallback heard its own scope open and close, and every close: a bound
-    # sequence is descended into without asking it, but it is still told.
-    assert rec.events == [("seq}",), ("seq{", 2), ("u", 1, 22), ("seq}",)]
+    # The fallback heard its own scope open and close, and nothing of the bound
+    # one: that sequence is the table's, so neither half reaches it (#146).
+    assert rec.events == [("seq{", 2), ("u", 1, 22), ("seq}",)]
 
 
 @pytest.mark.parametrize("engine", ENGINES)

@@ -273,6 +273,7 @@ class Decoder:
         "_visitor",
         "_vstack",
         "_vsp",
+        "_vdepth",
         # --- the destination map (§6.6.3) ------------------------------------
         # Where a mapped field's value goes, and what the schema declares for
         # it. Both are the *caller's* answers, settled once at construction;
@@ -529,6 +530,11 @@ class Decoder:
         # the depth.
         self._vstack: list[Any] = [None] * MAX_DEPTH
         self._vsp = 0
+        # The depth each suspended handler's child scope closes back to, so the
+        # pop is tied to the begin that pushed (#146): a sequence nested inside
+        # the child's scope ends at a deeper depth and is still the child's.
+        # Written only where a child is pushed, read only while one is.
+        self._vdepth: list[int] = [0] * MAX_DEPTH
         self._wants_field = False
         self._wants_bound = False
         self._make_field = False
@@ -1510,14 +1516,21 @@ class Decoder:
 
             if t == _WT_SEQUENCE_END:
                 if self._bsp:
+                    # Inside a scope the map descended into, the child map is
+                    # current; inside one the handler opened, it is None (§4.9).
+                    # So the map itself says whose scope this is, and a scope
+                    # the handler never heard open is not closed to it (#146).
+                    bound = self._bmap is not None
                     self._bsp -= 1
                     self._bmap = self._bstack[self._bsp]
                     self._bstack[self._bsp] = None
+                    if bound:
+                        continue
                 # The end belongs to whoever was handling the scope, so a child
                 # hears its own scope close before it is popped.
                 if visitor is not None:
                     visitor.on_sequence_end()
-                if self._vsp:
+                if self._vsp and self._vdepth[self._vsp - 1] == self._depth:
                     self._vsp -= 1
                     visitor = self._visitor = self._vstack[self._vsp]
                     self._bind_visitor(visitor)
@@ -1578,6 +1591,7 @@ class Decoder:
                     if isinstance(answer, Visitor):
                         # The handler named someone else for this sub-tree.
                         self._vstack[self._vsp] = visitor
+                        self._vdepth[self._vsp] = self._depth - 1
                         self._vsp += 1
                         visitor = self._visitor = answer
                         self._bind_visitor(answer)
