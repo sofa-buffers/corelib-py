@@ -14,6 +14,8 @@
     "invalid_utf8": "NEGATIVE vectors: a `string` field (id 0) whose bytes are not valid UTF-8. A strict (SOFAB_STRICT_UTF8) build MUST decode serialized_hex to the INVALID outcome and refuse to encode string_hex with the invalid-argument error. Backward-compatible: consumers that only read 'vectors' ignore this key. See test_vectors_README.md.",
     "sequence_growth": "GROWTH cases (CORELIB_PLAN S7.2 item 8): a wrapper array's length is highest present id + 1 (MESSAGE_SPEC S5.1), so its container grows as elements arrive -- the one allocation shape where growth is conformant (ARCHITECTURE S9.5). A case is keyed by a DELIVERY SEQUENCE OF ELEMENT IDS, not by bytes, because two ports that grow differently emit identical bytes: the port builds the message from 'deliver' and asserts 'expect'. Indices are CAP-RELATIVE -- 'id_from_cap'/'length_from_cap' are offsets added to the port's own configured max_dyn_array_count, which is per-target and never a family-wide number; every case assumes a cap of at least 4. Gated by requires 'dynamic_arrays': statically bounded profiles (C, C++ corelib: c-cpp, Rust no_std) never grow and do not run this block. Expectations come from ARCHITECTURE S9.5 and CORELIB_PLAN S7.2 item 8, NOT from the generating implementation, which authors these cases without executing them. Backward-compatible: consumers that only read 'vectors' ignore this key. See test_vectors_README.md.",
     "header_limits": "HEADER-CEILING cases (CORELIB_PLAN S6.2.1/S6.3): bytes that DECLARE a length or count and then END, with no payload behind them. The ceiling is decided at that word, before the payload is asked for, so the answer is the ceiling's and TERMINAL -- never INCOMPLETE, which S5.2.1 defines as the outcome more bytes can change. Which ceiling speaks is the subject: a schema 'maxlen' answers INVALID (MESSAGE_SPEC S7.1), a receiver cap answers LIMIT_EXCEEDED (S6.2.1), and a case carries 'schema' or 'limits' but never both -- a cap MUST NOT be applied to a field the schema already bounds. Bounds are ABSOLUTE, not cap-relative as in sequence_growth: the case is a fixed byte string, so it tells the port which ceiling to configure for the run. EVERY REJECTION IS PAIRED WITH AN IN-CAP CONTROL that must still answer INCOMPLETE, so a port cannot pass by rejecting everything. An unsatisfied 'requires' tag means SKIP. Expectations come from CORELIB_PLAN S6.2.1/S6.3 and MESSAGE_SPEC S5.2, NOT from the generating implementation. Backward-compatible: consumers that only read 'vectors' ignore this key. See test_vectors_README.md."
+    ,"header_limits_nested": "The header_limits axis one frame deeper: the same over-ceiling header delivered INSIDE a sequence that is still open when the bytes end. The ceiling is decided at the length/count word regardless of depth (CORELIB_PLAN S6.2.1) and is terminal (S6.3). INCOMPLETE is the trap: an open frame is an independent reason to report it, so a port that never checks the ceiling produces a plausible INCOMPLETE for the wrong reason. Each case carries 'frames', the sequence field ids it is nested in, outermost first; a runner must bind its ceiling to the field at that depth. Backward-compatible: consumers that do not know this block ignore it. See test_vectors_README.md."
+    ,"boolean_tolerant": "TOLERANT-DECODE cases: a boolean whose wire value is not the canonical 0/1. CORELIB_PLAN S4.4 is canonical on encode, tolerant on decode: an encoder MUST write true as 1, and a decoder MUST read EVERY value other than 0 as true, normalize it, and re-encode it as 1. A boolean carries NO width bound, so 256 and 2^64-1 are true, never INVALID and never truncated to false. No encoder run can produce these bytes, so the block is hand-authored and its expectations come from the spec. Needs nothing beyond the plain decode API. Backward-compatible: consumers that only read 'vectors' ignore this key. See test_vectors_README.md."
   },
   "vectors": [
     {
@@ -2522,6 +2524,230 @@
       "expect": {
         "outcome": "limit_exceeded",
         "terminal": true
+      }
+    }
+  ],
+  "header_limits_nested": [
+    {
+      "name": "nested_string_over_cap",
+      "group": "limits/header-nested",
+      "description": "header_string_over_cap, one frame deeper: a 100-byte string declared at id 0 INSIDE a sequence opened at id 7, and then the message ends with that sequence still open. The ceiling is decided at the length word regardless of depth (S6.2.1), so the answer is LimitExceeded and terminal (S6.3). INCOMPLETE is the trap here, and a more convincing one than at the top level: a frame really is open, so a port that never checks the ceiling produces a plausible-looking INCOMPLETE for the wrong reason.",
+      "requires": ["sequence", "fixlen", "receiver_caps"],
+      "frames": [7],
+      "field_id": 0,
+      "declared": 100,
+      "limits": { "max_dyn_string_len": 16 },
+      "serialized": "3e02a206",
+      "expect": {
+        "outcome": "limit_exceeded",
+        "terminal": true
+      }
+    },
+    {
+      "name": "nested_string_in_cap",
+      "group": "limits/header-nested",
+      "description": "THE CONTROL for nested_string_over_cap: the same shape at a length the cap admits. INCOMPLETE -- and here that is the RIGHT answer for the right reason, which is what separates a port that enforces the ceiling from one that rejects everything nested.",
+      "requires": ["sequence", "fixlen", "receiver_caps"],
+      "frames": [7],
+      "field_id": 0,
+      "declared": 8,
+      "limits": { "max_dyn_string_len": 16 },
+      "serialized": "3e0242",
+      "expect": {
+        "outcome": "incomplete"
+      }
+    },
+    {
+      "name": "nested_string_schema_bounded",
+      "group": "limits/header-nested",
+      "description": "The schema-bounded counterpart at the same nested length word: the declaration binds the field, so breaching it is INVALID (MESSAGE_SPEC S7.1), not LimitExceeded. Pairing the two at one depth is what shows the ceiling and the bound are separate machinery -- a port can carry the schema bound into a sequence and leave the receiver cap at the top level.",
+      "requires": ["sequence", "fixlen"],
+      "frames": [7],
+      "field_id": 0,
+      "declared": 100,
+      "schema": { "maxlen": 16 },
+      "serialized": "3e02a206",
+      "expect": {
+        "outcome": "invalid",
+        "terminal": true
+      }
+    },
+    {
+      "name": "nested_string_schema_bounded_in_bound",
+      "group": "limits/header-nested",
+      "description": "THE CONTROL for nested_string_schema_bounded.",
+      "requires": ["sequence", "fixlen"],
+      "frames": [7],
+      "field_id": 0,
+      "declared": 8,
+      "schema": { "maxlen": 16 },
+      "serialized": "3e0242",
+      "expect": {
+        "outcome": "incomplete"
+      }
+    },
+    {
+      "name": "nested_array_count_over_cap",
+      "group": "limits/header-nested",
+      "description": "The nested case for a COUNT word rather than a length word: an unsigned varint array declares 100 elements inside the open sequence. A port may reach the enforcement point through a different path for counts than for lengths, so the axis is asserted on both.",
+      "requires": ["sequence", "array", "receiver_caps"],
+      "frames": [7],
+      "field_id": 0,
+      "declared": 100,
+      "limits": { "max_dyn_array_count": 16 },
+      "serialized": "3e0364",
+      "expect": {
+        "outcome": "limit_exceeded",
+        "terminal": true
+      }
+    },
+    {
+      "name": "nested_array_count_in_cap",
+      "group": "limits/header-nested",
+      "description": "THE CONTROL for nested_array_count_over_cap.",
+      "requires": ["sequence", "array", "receiver_caps"],
+      "frames": [7],
+      "field_id": 0,
+      "declared": 8,
+      "limits": { "max_dyn_array_count": 16 },
+      "serialized": "3e0308",
+      "expect": {
+        "outcome": "incomplete"
+      }
+    },
+    {
+      "name": "nested_depth2_string_over_cap",
+      "group": "limits/header-nested",
+      "description": "Two frames deep, because one level may be special-cased: the outer sequence at id 7 holds an inner one at id 3, and the over-cap string sits in that. Both frames are left open at end-of-input, so the INCOMPLETE that must NOT be reported now has two independent reasons behind it.",
+      "requires": ["sequence", "fixlen", "receiver_caps"],
+      "frames": [7, 3],
+      "field_id": 0,
+      "declared": 100,
+      "limits": { "max_dyn_string_len": 16 },
+      "serialized": "3e1e02a206",
+      "expect": {
+        "outcome": "limit_exceeded",
+        "terminal": true
+      }
+    },
+    {
+      "name": "nested_depth2_string_in_cap",
+      "group": "limits/header-nested",
+      "description": "THE CONTROL for nested_depth2_string_over_cap.",
+      "requires": ["sequence", "fixlen", "receiver_caps"],
+      "frames": [7, 3],
+      "field_id": 0,
+      "declared": 8,
+      "limits": { "max_dyn_string_len": 16 },
+      "serialized": "3e1e0242",
+      "expect": {
+        "outcome": "incomplete"
+      }
+    }
+  ],
+  "boolean_tolerant": [
+    {
+      "name": "boolean_tolerant_zero",
+      "group": "boolean/tolerant",
+      "description": "0 is the only value that reads as false.",
+      "requires": [],
+      "id": 0,
+      "serialized_hex": "0000",
+      "expect": {
+        "outcome": "complete",
+        "values": [false],
+        "reencoded_hex": "0000"
+      }
+    },
+    {
+      "name": "boolean_tolerant_one",
+      "group": "boolean/tolerant",
+      "description": "1 is the canonical true, and re-encodes unchanged.",
+      "requires": [],
+      "id": 0,
+      "serialized_hex": "0001",
+      "expect": {
+        "outcome": "complete",
+        "values": [true],
+        "reencoded_hex": "0001"
+      }
+    },
+    {
+      "name": "boolean_tolerant_two",
+      "group": "boolean/tolerant",
+      "description": "2 reads as true and is normalized away: the re-encode emits 1, not 2.",
+      "requires": [],
+      "id": 0,
+      "serialized_hex": "0002",
+      "expect": {
+        "outcome": "complete",
+        "values": [true],
+        "reencoded_hex": "0001"
+      }
+    },
+    {
+      "name": "boolean_tolerant_255",
+      "group": "boolean/tolerant",
+      "description": "255, the largest value that still fits one byte, reads as true.",
+      "requires": [],
+      "id": 0,
+      "serialized_hex": "00ff01",
+      "expect": {
+        "outcome": "complete",
+        "values": [true],
+        "reencoded_hex": "0001"
+      }
+    },
+    {
+      "name": "boolean_tolerant_256",
+      "group": "boolean/tolerant",
+      "description": "256 does not fit one byte. A boolean has no width bound (CORELIB_PLAN S4.4), so this is true -- not INVALID, and not a truncation to false.",
+      "requires": [],
+      "id": 0,
+      "serialized_hex": "008002",
+      "expect": {
+        "outcome": "complete",
+        "values": [true],
+        "reencoded_hex": "0001"
+      }
+    },
+    {
+      "name": "boolean_tolerant_u64_max",
+      "group": "boolean/tolerant",
+      "description": "2^64-1, the widest value the format admits, is still just true. Tagged int64: S4.4 lifts the width bound the TYPE carries, not the one the BUILD's varint accumulator has (S6.2.2 narrowed scalar width), so a 32-bit build rejects this message rather than reading it as true.",
+      "requires": ["int64"],
+      "id": 0,
+      "serialized_hex": "00ffffffffffffffffff01",
+      "expect": {
+        "outcome": "complete",
+        "values": [true],
+        "reencoded_hex": "0001"
+      }
+    },
+    {
+      "name": "boolean_tolerant_array",
+      "group": "boolean/tolerant",
+      "description": "The same rule one level down: every non-zero element of a boolean array is true and is normalized, including one wider than its destination.",
+      "requires": ["array"],
+      "id": 0,
+      "serialized_hex": "03050001028002ffff03",
+      "expect": {
+        "outcome": "complete",
+        "values": [false, true, true, true, true],
+        "reencoded_hex": "03050001010101"
+      }
+    },
+    {
+      "name": "boolean_tolerant_array_u64_max",
+      "group": "boolean/tolerant",
+      "description": "A boolean array element at the format's widest value. Split from the case above so the array rule still has positive coverage in a build whose accumulator cannot hold this element.",
+      "requires": ["array", "int64"],
+      "id": 0,
+      "serialized_hex": "030200ffffffffffffffffff01",
+      "expect": {
+        "outcome": "complete",
+        "values": [false, true],
+        "reencoded_hex": "03020001"
       }
     }
   ]
