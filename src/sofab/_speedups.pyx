@@ -62,6 +62,12 @@ cdef extern from "Python.h":
     int PyBUF_READ
 from cpython.long cimport PyLong_FromUnsignedLongLong, PyLong_FromLongLong
 from cpython.ref cimport PyObject, Py_INCREF, Py_XDECREF
+cdef extern from "Python.h":
+    # Declared over a borrowed PyObject* rather than cimported over ``object``:
+    # the array writers walk their list through ``_elem``, which hands back a
+    # borrowed reference, and the cimported spelling would cost an incref and a
+    # decref per element to say the same thing.
+    int PyObject_IsTrue(PyObject* o) except -1
 from libc.stdint cimport (uint8_t, uint16_t, uint32_t, uint64_t,
                           int8_t, int16_t, int32_t, int64_t)
 from libc.stdlib cimport malloc, realloc, free
@@ -768,6 +774,16 @@ cdef inline uint64_t _zigzag_encode(int64_t v) noexcept nogil:
 
 cdef inline int64_t _zigzag_decode(uint64_t u) noexcept nogil:
     return <int64_t>(u >> 1) ^ -<int64_t>(u & 1)
+
+
+cdef inline void _normalize_bools(uint64_t* dst, Py_ssize_t count) noexcept nogil:
+    # S4.4 over an array of boolean already decoded into dst: every value other
+    # than 0 means true and is stored as 1. Branchless and vectorizable, so the
+    # pass costs a streaming read-modify-write over slots the fill left hot --
+    # and the array kinds that are not booleans never reach it.
+    cdef Py_ssize_t i
+    for i in range(count):
+        dst[i] = <uint64_t>(dst[i] != 0)
 
 
 # --- varint codec ------------------------------------------------------------
@@ -1584,6 +1600,25 @@ cdef class Encoder:
         except SofaError as exc:
             self._fail(exc)
 
+    def write_bool_array(self, object field_id, values):
+        # The array half of write_bool (S4.4): each element is tested for truth
+        # and goes out as 1 or 0, so the encode stays canonical. An array of
+        # boolean IS an array of unsigned on the wire. Written here rather than
+        # by delegating to write_unsigned_array, for the reason write_bool does
+        # not delegate either: no element needs a range check.
+        if not self._begin():
+            return
+        cdef list seq
+        cdef Py_ssize_t i, count
+        try:
+            seq = _as_list(values)
+            count = PyList_GET_SIZE(seq)
+            self._array_header(field_id, _WT_ARRAY_UNSIGNED, count)
+            for i in range(count):
+                self._emit_varint(1 if PyObject_IsTrue(_elem(seq, i)) else 0)
+        except SofaError as exc:
+            self._fail(exc)
+
     def write_float32_array(self, object field_id, values):
         self._write_float_array(field_id, values, _ST_FP32, 4)
 
@@ -1822,15 +1857,38 @@ cdef int _R_VISIT = 2
 # vocabulary, not a decode path's.
 cdef int _K_UNSIGNED = 0
 cdef int _K_SIGNED = 1
-cdef int _K_FLOAT32 = 2
-cdef int _K_FLOAT64 = 3
-cdef int _K_STRING = 4
-cdef int _K_BYTES = 5
-cdef int _K_ARRAY_UNSIGNED = 6
-cdef int _K_ARRAY_SIGNED = 7
-cdef int _K_ARRAY_FLOAT32 = 8
-cdef int _K_ARRAY_FLOAT64 = 9
-cdef int _K_SEQUENCE = 10
+cdef int _K_BOOLEAN = 2
+cdef int _K_FLOAT32 = 3
+cdef int _K_FLOAT64 = 4
+cdef int _K_STRING = 5
+cdef int _K_BYTES = 6
+cdef int _K_ARRAY_UNSIGNED = 7
+cdef int _K_ARRAY_SIGNED = 8
+cdef int _K_ARRAY_BOOLEAN = 9
+cdef int _K_ARRAY_FLOAT32 = 10
+cdef int _K_ARRAY_FLOAT64 = 11
+cdef int _K_SEQUENCE = 12
+
+#: The kind numbers this extension was **compiled** with, exported so the check
+#: against ``sofab.binding`` can bind to the binary that will actually decode.
+#: Reading the ``.pyx`` beside the ``.so`` does not: a stale extension reads
+#: every kind one number off, and since the numbers still index a valid table
+#: nothing else notices — a boolean row would simply be settled as an fp32 one.
+KINDS = {
+    "K_UNSIGNED": _K_UNSIGNED,
+    "K_SIGNED": _K_SIGNED,
+    "K_BOOLEAN": _K_BOOLEAN,
+    "K_FLOAT32": _K_FLOAT32,
+    "K_FLOAT64": _K_FLOAT64,
+    "K_STRING": _K_STRING,
+    "K_BYTES": _K_BYTES,
+    "K_ARRAY_UNSIGNED": _K_ARRAY_UNSIGNED,
+    "K_ARRAY_SIGNED": _K_ARRAY_SIGNED,
+    "K_ARRAY_BOOLEAN": _K_ARRAY_BOOLEAN,
+    "K_ARRAY_FLOAT32": _K_ARRAY_FLOAT32,
+    "K_ARRAY_FLOAT64": _K_ARRAY_FLOAT64,
+    "K_SEQUENCE": _K_SEQUENCE,
+}
 
 
 #: Highest field id still worth a direct-index lookup array. Above it the table
@@ -3984,8 +4042,10 @@ cdef class Decoder:
         cdef uint64_t got
         cdef uint64_t u
         cdef int64_t sv
-        if e.kind >= _K_ARRAY_UNSIGNED and e.kind != _K_SEQUENCE:
-            # A declared array's destination IS its schema bound.
+        if _K_ARRAY_UNSIGNED <= e.kind < _K_SEQUENCE:
+            # A declared array's destination IS its schema bound. The array
+            # kinds are one contiguous block ending just below _K_SEQUENCE
+            # (sofab.binding), so the range test stands in for a membership one.
             self._settle_bound(e.cap)
         elif e.kind == _K_STRING or e.kind == _K_BYTES:
             self._settle_bound(e.cap if e.cap else -1)
@@ -4003,6 +4063,15 @@ cdef class Decoder:
                 # S1: a 64-bit slot is wider than the declared width, so the
                 # width is checked here, at the value (S7.1).
                 raise SofaDecodeError("value outside declared width")
+            if e.kind == _K_BOOLEAN:
+                # S4.4, the decode half: every value other than 0 is true, and
+                # it is normalized here rather than left for the caller. Not
+                # INVALID, and elem_bounded is never set on a boolean row --
+                # S4.4 gives a boolean no declared width at all. The dispatch
+                # above is on the WIRE type, which a boolean shares with an
+                # unsigned, so the kind is what tells them apart; one predicted
+                # compare on a struct field already in cache.
+                u = 1 if u else 0
             self._words[e.at] = u
         elif t == _WT_SIGNED:
             sv = _zigzag_decode(self._take_scalar())
@@ -4042,6 +4111,12 @@ cdef class Decoder:
         elif t == _WT_ARRAY_UNSIGNED:
             got = self._pend_count
             self._fill_varints(self._words + e.at, <Py_ssize_t>got, False, e)
+            if e.kind == _K_ARRAY_BOOLEAN:
+                # S4.4 per element. A second pass over slots the fill just left
+                # in cache, rather than a test inside _fill_varints_at's loop --
+                # that loop also serves on_array_begin's destination, and every
+                # other array kind would carry the branch.
+                _normalize_bools(self._words + e.at, <Py_ssize_t>got)
         elif t == _WT_ARRAY_SIGNED:
             got = self._pend_count
             self._fill_varints(self._words + e.at, <Py_ssize_t>got, True, e)

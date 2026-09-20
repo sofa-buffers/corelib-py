@@ -97,31 +97,42 @@ from .types import (
 # Plain module-level ints rather than an IntEnum: both engines compare them on
 # the decode hot path, and the native one lowers them to C ``int`` switches.
 
+# The array kinds are one contiguous block, and ``K_SEQUENCE`` closes the list:
+# the native engine tells an array row from a scalar one with a range test over
+# these numbers rather than a membership test, so a kind added outside that
+# block would be misread as an array. Keep new kinds inside their group.
 K_UNSIGNED = 0
 K_SIGNED = 1
-K_FLOAT32 = 2
-K_FLOAT64 = 3
-K_STRING = 4
-K_BYTES = 5
-K_ARRAY_UNSIGNED = 6
-K_ARRAY_SIGNED = 7
-K_ARRAY_FLOAT32 = 8
-K_ARRAY_FLOAT64 = 9
-K_SEQUENCE = 10
+K_BOOLEAN = 2
+K_FLOAT32 = 3
+K_FLOAT64 = 4
+K_STRING = 5
+K_BYTES = 6
+K_ARRAY_UNSIGNED = 7
+K_ARRAY_SIGNED = 8
+K_ARRAY_BOOLEAN = 9
+K_ARRAY_FLOAT32 = 10
+K_ARRAY_FLOAT64 = 11
+K_SEQUENCE = 12
 
 #: For each kind, the wire tag it accepts: ``(wire type, fixlen subtype or None)``.
 #: A field whose wire tag contradicts its binding is **not** an error — it is
 #: skipped exactly like an unknown id and the decode stays COMPLETE
 #: (MESSAGE_SPEC §7.3, CORELIB_PLAN §6.3).
+#: A boolean's tag is the unsigned one: §4.4 gives booleans no wire type of
+#: their own, so nothing distinguishes them here — the difference is what the
+#: decoder stores, not what it accepts.
 KIND_TAG: tuple[tuple[WireType, FixlenSubtype | None], ...] = (
     (WireType.UNSIGNED, None),
     (WireType.SIGNED, None),
+    (WireType.UNSIGNED, None),
     (WireType.FIXLEN, FixlenSubtype.FP32),
     (WireType.FIXLEN, FixlenSubtype.FP64),
     (WireType.FIXLEN, FixlenSubtype.STRING),
     (WireType.FIXLEN, FixlenSubtype.BLOB),
     (WireType.ARRAY_UNSIGNED, None),
     (WireType.ARRAY_SIGNED, None),
+    (WireType.ARRAY_UNSIGNED, None),
     (WireType.ARRAY_FIXLEN, FixlenSubtype.FP32),
     (WireType.ARRAY_FIXLEN, FixlenSubtype.FP64),
     (WireType.SEQUENCE_START, None),
@@ -131,7 +142,13 @@ KIND_TAG: tuple[tuple[WireType, FixlenSubtype | None], ...] = (
 _OBJECT_KINDS = frozenset((K_STRING, K_BYTES))
 #: Kinds that consume ``cap`` consecutive slots instead of one.
 _ARRAY_KINDS = frozenset(
-    (K_ARRAY_UNSIGNED, K_ARRAY_SIGNED, K_ARRAY_FLOAT32, K_ARRAY_FLOAT64)
+    (
+        K_ARRAY_UNSIGNED,
+        K_ARRAY_SIGNED,
+        K_ARRAY_BOOLEAN,
+        K_ARRAY_FLOAT32,
+        K_ARRAY_FLOAT64,
+    )
 )
 
 
@@ -380,10 +397,32 @@ class Binding:
         )
 
     def boolean(self, field_id: int, at: int, count_at: int | None = None) -> Binding:
-        """Bind a boolean field. Booleans have no wire type (§4.4): this is
-        :meth:`unsigned`, and the slot receives ``0`` or the value the sender
-        wrote — the caller tests it for truth."""
-        return self._add(K_UNSIGNED, field_id, at, 0, count_at, None)
+        """Bind a boolean field to ``words`` slot ``at`` as ``0`` or ``1``.
+
+        A boolean has no wire type of its own (§4.4) — it arrives as an unsigned
+        integer and is accepted under that tag — but it is **not** the unsigned
+        binding, because §4.4 splits the two rules that meet here:
+
+        * **canonical on encode**: :meth:`sofab.Encoder.write_bool` writes
+          ``true`` as ``1``;
+        * **tolerant on decode**: *every* value other than ``0`` reads as true.
+          Such a value is not INVALID — there is nothing to reject, only
+          something to normalize — so the slot gets ``1``, never the ``42`` the
+          sender happened to write, and a re-encode emits ``1``.
+
+        Doing that here is what keeps the rule off every caller: a slot a
+        **completed** decode filled can be tested for truth *or* compared to
+        ``1``, and both agree. (Only a completed one — like every other bound
+        kind, a decode that ends INCOMPLETE or INVALID says nothing about what
+        it has written so far; :meth:`boolean_array` spells out what that means
+        for an array caught mid-payload.) Note there is deliberately no
+        declared-width argument, the way
+        :meth:`unsigned` has ``max_value``: §4.4 gives a boolean no width bound
+        at all, unlike an ``enum`` or a ``bitfield``, so binding one with a
+        ceiling of ``1`` — which would make ``42`` INVALID — is exactly the
+        reading the clause rules out.
+        """
+        return self._add(K_BOOLEAN, field_id, at, 0, count_at, None)
 
     def float32(self, field_id: int, at: int, count_at: int | None = None) -> Binding:
         """Bind an ``fp32`` field to ``words`` slot ``at``, widened to a native
@@ -500,6 +539,30 @@ class Binding:
         return self._add(
             K_ARRAY_SIGNED, field_id, at, cap, count_at, None, elem_min, elem_max
         )
+
+    def boolean_array(
+        self, field_id: int, at: int, cap: int, count_at: int | None = None
+    ) -> Binding:
+        """Bind an array of booleans to ``words[at:at + cap]`` as ``0``/``1``.
+
+        The element half of :meth:`boolean`: an array of boolean travels as an
+        array of unsigned (§4.4 gives booleans no wire type), and §4.4's decode
+        rule applies per element, so each slot is normalized as it is stored.
+
+        ``cap`` is the schema's maximum element count and behaves exactly as it
+        does for :meth:`unsigned_array`. There is no ``elem_max``, for the reason
+        :meth:`boolean` takes no width: a boolean element outside ``0..1`` is
+        normalized, never rejected.
+
+        **The elements are normalized when the array completes**, not one at a
+        time — the pass runs once over the slots the payload filled, so the
+        element loop every other array kind shares carries no test of its own. A
+        decode that ends INCOMPLETE or INVALID *inside* this array may therefore
+        leave raw wire values in the slots it already wrote, exactly as it may
+        already have written ``count_at`` (see :class:`Binding`). The next
+        :meth:`sofab.Decoder.feed` refills the array from element zero, so what
+        a **completed** decode leaves is always ``0``/``1``."""
+        return self._add(K_ARRAY_BOOLEAN, field_id, at, cap, count_at, None)
 
     def float32_array(
         self, field_id: int, at: int, cap: int, count_at: int | None = None

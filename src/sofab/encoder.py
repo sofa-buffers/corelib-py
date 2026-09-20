@@ -820,6 +820,60 @@ class Encoder:
         except SofaError as exc:
             self._fail(exc)
 
+    def write_bool_array(
+        self, field_id: SupportsIndex, values: Iterable[object]
+    ) -> None:
+        """Write an array of booleans, each as the varint ``1`` or ``0``.
+
+        The array half of :meth:`write_bool`, and canonical for the same reason
+        (§4.4): an element is tested for truth and ``true`` goes out as ``1``,
+        so a re-encode of a tolerantly decoded array is the canonical form of
+        it. On the wire this is an array of unsigned — booleans have no wire
+        type of their own — so a zero-count array is the same empty array
+        :meth:`write_unsigned_array` writes.
+
+        Any object may be an element: it is tested for truth exactly as ``if``
+        would test it, which is what :meth:`write_bool` does for a scalar. The
+        test runs **per element, inside the loop** rather than up front, so a
+        ``__bool__`` that raises leaves the same partial write the other array
+        writers leave — the native engine reaches that state too, and the two
+        have to be indistinguishable.
+        """
+        if not self._begin():
+            return
+        try:
+            seq = list(values)
+            self._array_header(field_id, _WT_ARRAY_UNSIGNED, len(seq))
+            # A boolean element is always exactly one byte, 0x00 or 0x01, so
+            # this is write_unsigned_array's inlined codec with every varint
+            # case removed rather than a second copy of one. The view and the
+            # capacity are re-read after each drain — a sink may install a
+            # different buffer (see _put).
+            buf = self._fixed_ba
+            cap = self._cap
+            cursor = self._cursor
+            try:
+                for v in seq:
+                    if cursor >= cap:
+                        # No room for even one byte: _put drains, and may land
+                        # in a fresh buffer, so everything it touches is re-read.
+                        self._cursor = cursor
+                        try:
+                            self._put(b"\x01" if v else b"\x00")
+                        finally:
+                            cursor = self._cursor
+                        buf = self._fixed_ba
+                        cap = self._cap
+                        continue
+                    buf[cursor] = 1 if v else 0
+                    cursor += 1
+            finally:
+                # What was written stays written, on the way out of a raising
+                # element as much as on the ordinary path.
+                self._cursor = cursor
+        except SofaError as exc:
+            self._fail(exc)
+
     def write_float32_array(self, field_id: SupportsIndex, values: Iterable[float]) -> None:
         """Write an array of 32-bit floats as a packed little-endian fixlen array.
 

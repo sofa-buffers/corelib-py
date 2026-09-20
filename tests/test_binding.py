@@ -17,7 +17,16 @@ import struct
 import pytest
 from vectors import DECODER_ENGINES, ENGINE_PAIRS, NO_CAPS, ROOMY_REASSEMBLY
 
-from sofab import ARRAY_MAX, FIXLEN_MAX, Binding, SofaArgumentError, Status
+from sofab import (
+    ARRAY_MAX,
+    FIXLEN_MAX,
+    Binding,
+    FixlenSubtype,
+    SofaArgumentError,
+    Status,
+    WireType,
+)
+from sofab import binding as _binding
 
 
 def storage(b: Binding):
@@ -501,9 +510,12 @@ def test_binding_exposes_its_rows():
 
 
 @pytest.mark.parametrize(("enc_cls", "dec_cls"), ENGINE_PAIRS)
-def test_boolean_binds_as_the_unsigned_it_is_on_the_wire(enc_cls, dec_cls):
-    """§4.4: a boolean has no wire type. The slot gets the 0/1 the sender wrote
-    and the caller tests it for truth."""
+def test_boolean_rides_the_unsigned_tag_but_is_not_the_unsigned_binding(
+    enc_cls, dec_cls
+):
+    """§4.4: a boolean has no wire type of its own, so it is accepted under the
+    unsigned tag — but the slot gets a normalized 0/1, not the raw varint. The
+    non-canonical half lives in test_boolean.py; here is the ordinary shape."""
     enc = enc_cls()
     enc.write_bool(1, True)
     enc.write_bool(2, False)
@@ -542,3 +554,83 @@ def test_a_binding_with_object_fields_needs_an_objects_list(dec_cls):
     b = Binding().string(1, at=0)
     with pytest.raises(SofaArgumentError):
         dec_cls(**NO_CAPS, binding=b, words=bytearray(b.tree_words_required * 8 or 8))
+
+
+# --- the kind table itself ----------------------------------------------------
+#
+# The kind numbers are not free-floating constants: three things read them
+# positionally, and a kind added in the wrong place is silently misinterpreted
+# rather than rejected. These pin the preconditions so the next kind cannot.
+
+
+def _our_kinds() -> dict[str, int]:
+    return {
+        name: value
+        for name, value in vars(_binding).items()
+        if name.startswith("K_") and isinstance(value, int)
+    }
+
+
+def test_the_kind_numbers_are_dense_and_line_up_with_their_tags():
+    """``Entry`` does ``KIND_TAG[kind]``, so the table is indexed *by* the kind:
+    the numbers have to be 0..n-1 with no gaps, KIND_TAG exactly as long, and
+    every row the tag its kind actually accepts — a row carrying the wrong wire
+    type at the right index would decide the §7.3 tag test wrongly for that
+    kind and nothing else would notice."""
+    kinds = _our_kinds()
+    assert sorted(kinds.values()) == list(range(len(kinds))), kinds
+    assert len(_binding.KIND_TAG) == len(kinds)
+
+    K, tag = _binding, _binding.KIND_TAG
+    U, S, FX, AU, AS_, AF = (
+        WireType.UNSIGNED, WireType.SIGNED, WireType.FIXLEN,
+        WireType.ARRAY_UNSIGNED, WireType.ARRAY_SIGNED, WireType.ARRAY_FIXLEN,
+    )
+    F32, F64, ST, BL = (
+        FixlenSubtype.FP32, FixlenSubtype.FP64,
+        FixlenSubtype.STRING, FixlenSubtype.BLOB,
+    )
+    assert {
+        K.K_UNSIGNED: (U, None),
+        K.K_SIGNED: (S, None),
+        K.K_BOOLEAN: (U, None),        # §4.4: no wire type of its own
+        K.K_FLOAT32: (FX, F32),
+        K.K_FLOAT64: (FX, F64),
+        K.K_STRING: (FX, ST),
+        K.K_BYTES: (FX, BL),
+        K.K_ARRAY_UNSIGNED: (AU, None),
+        K.K_ARRAY_SIGNED: (AS_, None),
+        K.K_ARRAY_BOOLEAN: (AU, None),  # ditto, per element
+        K.K_ARRAY_FLOAT32: (AF, F32),
+        K.K_ARRAY_FLOAT64: (AF, F64),
+        K.K_SEQUENCE: (WireType.SEQUENCE_START, None),
+    } == dict(enumerate(tag))
+
+
+def test_the_array_kinds_are_one_contiguous_block_below_the_sequence():
+    """The accelerator tells an array row from a scalar one with a *range* test
+    (``_K_ARRAY_UNSIGNED <= kind < _K_SEQUENCE``), not a membership test. A kind
+    numbered outside that block would be settled as an array, with whatever
+    ``cap`` the row happens to carry."""
+    block = sorted(_binding._ARRAY_KINDS)
+    assert block == list(range(block[0], block[-1] + 1)), "array kinds have a gap"
+    assert block[0] == _binding.K_ARRAY_UNSIGNED, "the range test starts here"
+    assert _binding.K_SEQUENCE == block[-1] + 1, "the range test ends just here"
+    assert not any(k in _binding._ARRAY_KINDS for k in _binding._OBJECT_KINDS)
+
+
+def test_the_compiled_accelerator_agrees_about_every_kind_number():
+    """``_speedups.pyx`` hand-copies the kind numbers as ``cdef int _K_*`` so the
+    decode path lowers to C int compares, and nothing makes the copy follow the
+    original.
+
+    This asks the **compiled extension**, not the ``.pyx`` beside it. Those are
+    different questions: a tree whose ``.so`` was built from an older source
+    reads every kind one number off while the file on disk looks right, and
+    because the numbers still index a valid table nothing else notices — a
+    boolean row would simply be settled as an fp32 one. Module-level ``cdef``
+    ints are invisible from Python, which is why the extension exports
+    :data:`sofab._speedups.KINDS` for this.
+    """
+    native = pytest.importorskip("sofab._speedups")
+    assert native.KINDS == _our_kinds()

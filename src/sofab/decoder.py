@@ -46,9 +46,11 @@ from typing import Any
 
 from . import _core
 from .binding import (
+    K_ARRAY_BOOLEAN,
     K_ARRAY_FLOAT32,
     K_ARRAY_SIGNED,
     K_ARRAY_UNSIGNED,
+    K_BOOLEAN,
     K_BYTES,
     K_FLOAT32,
     K_FLOAT64,
@@ -1792,6 +1794,13 @@ class Decoder:
             if e.elem_bounded and not (e.elem_lo <= val <= e.elem_hi):
                 raise SofaDecodeError("value outside declared width")
             self._wq[at] = val
+        elif k == K_BOOLEAN:
+            # §4.4, the decode half: every value other than 0 is true, and it is
+            # normalized HERE rather than left for the caller to test. Not
+            # INVALID — a boolean has only two meanings, so a value the canonical
+            # form does not use still names one of them — and no declared width
+            # to check, because §4.4 gives a boolean none.
+            self._wu[at] = 1 if self._take_scalar_matched() else 0
         elif k == K_FLOAT64:
             self._wd[at] = _core.unpack_f64(self._take_fixlen_matched(8))
         elif k == K_FLOAT32:
@@ -1853,6 +1862,18 @@ class Decoder:
                     self._wq,
                     at,
                 )
+            elif k == K_ARRAY_BOOLEAN:
+                # §4.4 applies per element. The read is the unsigned one — an
+                # array of boolean IS an array of unsigned on the wire — and the
+                # normalization is a second pass over slots still in cache,
+                # rather than a test inside _read_varints' loop that every other
+                # array kind would then pay for. A canonical element, which is
+                # all an encoder writes, costs the compare and no store.
+                self._read_varints(got, None, None, False, self._wu, at)
+                wu = self._wu
+                for i in range(at, at + got):
+                    if wu[i] > 1:
+                        wu[i] = 1
             else:
                 width = 4 if k == K_ARRAY_FLOAT32 else 8
                 buf, off = self._span_exact(self._farray_nbytes(got, pending[3]))
