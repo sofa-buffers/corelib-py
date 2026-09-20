@@ -15,6 +15,8 @@ Nothing here asserts; the assertions live in ``tests/test_conformance_vectors.py
 
 from __future__ import annotations
 
+import sys
+
 #: The module whose items are counted as conformance-vector checks.
 _VECTOR_MODULE = "test_conformance_vectors.py"
 
@@ -103,9 +105,33 @@ def pytest_runtest_logreport(report) -> None:
             _tally.skip_vectors.add(vector)
 
 
+def _boolean_tolerant_line() -> str | None:
+    """The ``boolean_tolerant`` block's own §12 split, if that module ran.
+
+    The block asks for a finer report than the vector matrix: ``found`` from the
+    file, and then ``decoded`` against ``rejected``, because a capability a build
+    lacks makes a case a *negative* one rather than an absent one. A reduced
+    build should show a non-zero ``rejected``; this port compiles nothing out, so
+    it shows ``rejected 0`` and ``decoded`` equal to ``found`` per engine.
+    """
+    module = sys.modules.get("test_boolean_tolerant")
+    tally = getattr(module, "TALLY", None)
+    if not tally or not (tally["decoded"] or tally["rejected"]):
+        return None
+    return (
+        f"[boolean_tolerant] found {tally['found']}, "
+        f"decoded {tally['decoded']}, rejected {tally['rejected']}, "
+        f"checks {tally['checks']} (summed over every engine)"
+    )
+
+
 def pytest_terminal_summary(terminalreporter) -> None:
+    boolean_line = _boolean_tolerant_line()
     executed = _tally.passed + _tally.failed
     if not executed and not (_tally.gated or _tally.other_skips):
+        if boolean_line is not None:
+            terminalreporter.write_sep("=", "shared conformance vectors")
+            terminalreporter.write_line(boolean_line)
         return  # this run did not collect the conformance suite
 
     from vectors import VECTOR_DOC, VECTORS, VECTORS_PATH
@@ -123,7 +149,8 @@ def pytest_terminal_summary(terminalreporter) -> None:
         f"{with_skip_ids} carry skip_ids; "
         f"{len(VECTOR_DOC.get('invalid_utf8', ()))} invalid_utf8, "
         f"{len(VECTOR_DOC.get('sequence_growth', ()))} sequence_growth, "
-        f"{len(VECTOR_DOC.get('header_limits', ()))} header_limits cases"
+        f"{len(VECTOR_DOC.get('header_limits', ()))} header_limits, "
+        f"{len(VECTOR_DOC.get('boolean_tolerant', ()))} boolean_tolerant cases"
     )
     write(
         f"vectors exercised: {len(_tally.vectors)}/{len(VECTORS)}"
@@ -136,3 +163,5 @@ def pytest_terminal_summary(terminalreporter) -> None:
     if _tally.by_scenario:
         per = ", ".join(f"{k} {v}" for k, v in sorted(_tally.by_scenario.items()))
         write(f"  by scenario: {per}")
+    if boolean_line is not None:
+        write(boolean_line)
