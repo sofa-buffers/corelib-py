@@ -508,6 +508,16 @@ What follows from the caller owning the storage:
   `.signed(…, min_value=-128, max_value=127)` for an `i8` or a narrow `enum`, and
   `elem_max`/`elem_min` on the array binders. A value outside it is `INVALID`
   before it is stored, even when the message is truncated behind it (§1, §5.2).
+* **A boolean is not the unsigned binding, and carries no width.** `.boolean(…)`
+  and `.boolean_array(…)` are the read half of §4.4: a boolean has no wire type
+  of its own, so it arrives under the unsigned tag, but *every* value other than
+  `0` is `true` and the slot receives a normalized `0`/`1` — never the `42` the
+  sender happened to write. Such a value is **not** `INVALID`; there is nothing
+  to reject, only something to normalize. That is why neither binder takes a
+  declared width the way `.unsigned(…)` takes `max_value`: §4.4 gives a boolean
+  no width bound at all, unlike an `enum` or a `bitfield`. `Encoder.write_bool`
+  and `Encoder.write_bool_array` are the canonical-on-encode half — `true` goes
+  out as `1`, so a re-encode of a tolerantly decoded value is canonical.
 * **Absence needs no sentinel.** A slot the decoder does not write keeps what you
   put there. `count_at` names a slot receiving `1` for a scalar that arrived, the
   element count for an array, the occurrence count for a sequence.

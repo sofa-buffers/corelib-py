@@ -62,6 +62,9 @@ def _program(enc) -> None:
     enc.write_signed(1, -7)
     enc.write_sequence_end()
     enc.write_sequence_end()
+    enc.write_bool_array(24, [])                    # empty, still an array
+    enc.write_bool_array(25, [True, False, 1, 0])
+    enc.write_bool_array(26, [2, "", "x", None, [], [0]])  # truth, not __index__
 
 
 def test_encode_byte_identical():
