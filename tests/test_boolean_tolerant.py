@@ -40,24 +40,22 @@ impossible. That is this port today — see the two findings below.
 
 * Write: :meth:`sofab.Encoder.write_bool`, which maps to ``1``/``0`` (§4.4's
   encode half, and it is correct).
-* Read: :meth:`sofab.Binding.boolean` — a boolean-typed destination for one
-  field. There is **no** boolean-typed *array* destination; the C reference
-  carries one (``sofab_istream_read_array_of_bool``), and the array cases of
-  this block cannot be run without it. The unsigned array reader cannot stand in:
-  ``256`` is a perfectly ordinary unsigned element and normalization is precisely
-  the behaviour the boolean surface adds, so reading through it would test the
-  unsigned path and hide both truncation and missing normalization.
+* Read: :meth:`sofab.Binding.boolean` for one field and
+  :meth:`sofab.Binding.boolean_array` for the element half, both of which
+  normalize on store (``K_BOOLEAN`` / ``K_ARRAY_BOOLEAN``). The unsigned array
+  reader could not stand in for the latter: ``256`` is a perfectly ordinary
+  unsigned element, and normalization is precisely the behaviour the boolean
+  surface adds, so reading through it would test the unsigned path and hide both
+  truncation and missing normalization.
 
-Both gaps are conformance findings against this port, not defects in the block,
-and the assertions below are therefore left stating §4.4 rather than the current
-behaviour (sofa-buffers/crucible#189 tracks the family-wide rollout):
-
-1. ``Binding.boolean`` does not normalize. It binds as the plain unsigned it is
-   on the wire (``src/sofab/binding.py``), so the slot receives ``2`` for
-   ``0002`` and ``18446744073709551615`` for the ``u64_max`` case, where §4.4
-   requires the value to be "normalized away" to ``1``.
-2. There is no ``Binding.boolean_array``, so cases 7 and 8 have no boolean
-   destination to decode into at all.
+When this runner was first written neither surface normalized: ``Binding.boolean``
+was the plain unsigned it is on the wire, and ``Binding.boolean_array`` did not
+exist at all, so six of the eight cases failed and the array pair had no
+destination to decode into. Those were conformance gaps in this port rather than
+defects in the block, so the assertions were left stating §4.4 rather than the
+observed behaviour — and #156 then closed both. The assertions are unchanged;
+only this note and the surfaces beneath them moved. (sofa-buffers/crucible#189
+tracks the family-wide rollout.)
 
 **``requires`` here means REJECT, not skip** — the block narrows the corpus rule
 and the narrowing is normative for it. §4.4 lifts the width bound the *type*
