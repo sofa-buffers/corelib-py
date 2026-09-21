@@ -277,10 +277,10 @@ def test_suite_metadata():
     declared = {tag for v in VECTORS for tag in v.get("requires", ())}
     assert declared <= SUPPORTED, f"unknown capability tags: {declared - SUPPORTED}"
     # A top-level block this file does not consume (`sequence_growth`, replayed by
-    # tests/test_sequence_growth.py; `header_limits`, by tests/test_header_limits.py;
-    # `boolean_tolerant`, by tests/test_boolean_tolerant.py) must not disturb the
-    # load: a port that reads only `vectors` ignores the rest, and adding one more
-    # is backward-compatible.
+    # tests/test_sequence_growth.py; `header_limits` and `header_limits_nested`, by
+    # tests/test_header_limits.py; `boolean_tolerant`, by
+    # tests/test_boolean_tolerant.py) must not disturb the load: a port that reads
+    # only `vectors` ignores the rest, and adding one more is backward-compatible.
     #
     # Each block is named here as a floor of its own: a port whose copy of the file
     # predates a block looks the key up, gets nothing, iterates nothing and passes.
@@ -290,8 +290,10 @@ def test_suite_metadata():
         "invalid_utf8",
         "sequence_growth",
         "header_limits",
+        "header_limits_nested",
         "boolean_tolerant",
     }
+    assert len(_DATA["header_limits_nested"]) >= 8
     assert len(_DATA["boolean_tolerant"]) >= 8
 
 

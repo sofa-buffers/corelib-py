@@ -105,6 +105,35 @@ def pytest_runtest_logreport(report) -> None:
             _tally.skip_vectors.add(vector)
 
 
+def _report_nested_header_limits(write) -> None:
+    """``ran = N, gated = M`` for ``header_limits_nested``, in the run's summary.
+
+    The block's spec makes this mandatory rather than cosmetic: a mis-spelled
+    capability name, or a capability probe that answers "unsupported" by
+    accident, silently turns that runner into a no-op that reports green, and a
+    visible split is the cheap way to notice. A port that legitimately gates
+    cases — one without §6.2.1 receiver caps runs four of the eight — has to be
+    distinguishable in CI output from one that is broken.
+    """
+    try:
+        from test_header_limits import NESTED, SUPPORTED
+    except Exception:  # pragma: no cover - the suite was not collected
+        return
+    if not NESTED:
+        return
+    gated = {
+        c["name"]: sorted(set(c.get("requires", ())) - SUPPORTED)
+        for c in NESTED
+        if set(c.get("requires", ())) - SUPPORTED
+    }
+    write(
+        f"header_limits_nested: ran {len(NESTED) - len(gated)}, gated {len(gated)} "
+        f"of {len(NESTED)} cases"
+    )
+    for name, tags in gated.items():
+        write(f"  gated {name}: needs {', '.join(tags)}")
+
+
 def _boolean_tolerant_line() -> str | None:
     """The ``boolean_tolerant`` block's own §12 split, if that module ran.
 
@@ -152,6 +181,7 @@ def pytest_terminal_summary(terminalreporter) -> None:
         f"{len(VECTOR_DOC.get('header_limits', ()))} header_limits, "
         f"{len(VECTOR_DOC.get('boolean_tolerant', ()))} boolean_tolerant cases"
     )
+    _report_nested_header_limits(write)
     write(
         f"vectors exercised: {len(_tally.vectors)}/{len(VECTORS)}"
         f" ({len(_tally.skip_vectors)} through the skip scenarios)"
