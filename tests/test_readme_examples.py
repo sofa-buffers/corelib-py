@@ -240,3 +240,39 @@ def test_bit_exact_float_example_round_trips_a_signaling_nan(readme: str) -> Non
     assert Decoder(**NO_CAPS, visitor=ns["Transcoder"]()).feed(wire) is Status.COMPLETE
     out.flush()
     assert out.getvalue() == wire
+
+
+def test_collectors_example_runs_and_decodes(readme: str) -> None:
+    """The ``sofab.collectors`` example is a flat visitor calling the helpers the
+    way generated code does: it must place by id, fill the gap, and refuse an id
+    at the schema count as INVALID."""
+    from sofab import Decoder, SofaDecodeError, Status
+
+    ns: dict = {}
+    _run_readme_block(readme, "#### Arrays of strings, blobs or structs: `sofab.collectors`", ns)
+
+    enc = Encoder()
+    enc.write_sequence_begin_lazy(3)
+    enc.write_string(0, "a")
+    enc.write_string(2, "c")
+    enc.write_sequence_end_keep()
+    enc.write_sequence_begin_lazy(4)
+    enc.write_sequence_begin_lazy(1)
+    enc.write_unsigned(0, 7)
+    enc.write_sequence_end_keep()
+    enc.write_sequence_end_keep()
+    enc.flush()
+    doc = ns["Doc"]()
+    assert Decoder(**NO_CAPS, visitor=doc).feed(enc.getvalue()) is Status.COMPLETE
+    assert doc.tags == ["a", "", "c"]
+    assert [r.x for r in doc.rows] == [0, 7]
+
+    over = Encoder()
+    over.write_sequence_begin_lazy(4)
+    over.write_sequence_begin_lazy(16)  # the schema's count is 16
+    over.write_sequence_end_keep()
+    over.write_sequence_end_keep()
+    over.flush()
+    dec = Decoder(**NO_CAPS, visitor=ns["Doc"]())
+    assert dec.feed(over.getvalue()) is Status.INVALID
+    assert isinstance(dec.error, SofaDecodeError)

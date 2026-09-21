@@ -215,8 +215,8 @@ class SofaArgumentError(SofaError):
     performs the comparison: a codec "**MUST NOT** hold a limit of its own,
     **MUST NOT** supply a default for one it was not given, **MUST NOT** read an
     omitted argument as *unlimited*, and **MUST NOT** clamp to one". So all three
-    are required, on :class:`sofab.Decoder` and on a
-    :class:`sofab.SequenceCollector` alike, and omitting one is a mistake in the
+    are required, on :class:`sofab.Decoder` and on the
+    :mod:`sofab.collectors` helpers alike, and omitting one is a mistake in the
     **call** rather than a property of the message or of the deployment —
     which is exactly what this code is for. :class:`SofaLimitError` would say
     something untrue about it: it promises a limit to raise that was never

@@ -16,16 +16,7 @@ from typing import TYPE_CHECKING
 
 from ._varint import zigzag_decode, zigzag_encode
 from .binding import Binding
-from .collectors import (
-    BytesSeq,
-    Float32Seq,
-    Float64Seq,
-    NestedSeq,
-    SequenceCollector,
-    SignedSeq,
-    StringSeq,
-    UnsignedSeq,
-)
+from .collectors import UNBOUNDED, reserve_elem, reserve_leaf, reserve_row
 from .types import (
     API_VERSION,
     ARRAY_MAX,
@@ -81,7 +72,19 @@ elif _os.environ.get("SOFAB_PUREPYTHON") == "1":
 else:  # pragma: no cover - native branch: exercised only when the compiled
     #                        extension is present; coverage runs force pure Python.
     try:
-        from ._speedups import Decoder, Encoder, Field  # Field shadows types.Field
+        # Field shadows types.Field. The three reserve_* helpers shadow the pure
+        # sofab.collectors ones with their compiled twins: same contract, same
+        # refusals, a C call instead of a Python frame per wrapper-array element.
+        # One import, so an extension built before the twins existed falls back
+        # to the pure engine as a whole rather than mixing the two.
+        from ._speedups import (
+            Decoder,
+            Encoder,
+            Field,
+            reserve_elem,
+            reserve_leaf,
+            reserve_row,
+        )
 
         IMPL = "native"
     except ImportError:
@@ -103,14 +106,6 @@ __all__ = [
     "Decoder",
     "Visitor",
     "Binding",
-    "BytesSeq",
-    "Float32Seq",
-    "Float64Seq",
-    "NestedSeq",
-    "SequenceCollector",
-    "SignedSeq",
-    "StringSeq",
-    "UnsignedSeq",
     "Field",
     "WireType",
     "Status",
@@ -134,6 +129,10 @@ __all__ = [
     "SIGNED_MAX",
     "zigzag_encode",
     "zigzag_decode",
+    "UNBOUNDED",
+    "reserve_leaf",
+    "reserve_elem",
+    "reserve_row",
     "IMPL",
     "__version__",
 ]

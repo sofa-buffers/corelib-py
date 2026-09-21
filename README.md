@@ -399,42 +399,81 @@ means to skip, which is still buffered while it is walked.
 #### Arrays of strings, blobs or structs: `sofab.collectors`
 
 An array whose elements are not packed scalars — strings, blobs, structs — is a
-**sequence whose child ids are the array indices** (MESSAGE_SPEC §5.1). Turning
-that event stream back into a list is the same code for every schema, so it ships
-here rather than being emitted into every generated package:
+**sequence whose child ids are the array indices** (MESSAGE_SPEC §5.1). Growing a
+list from that event stream has the same shape for every schema, so it ships
+here rather than being emitted into every generated package: three functions a
+flat visitor calls from its own callbacks.
 
 ```python
-from sofab import Decoder, NestedSeq, StringSeq, Visitor
+from sofab import (UNBOUNDED, FixlenSubtype, Visitor, WireType,
+                   reserve_elem, reserve_leaf)
+
+MAX_DYN_ARRAY_COUNT = 256   # the receiver's cap, stated by you
+
+class Row:
+    def __init__(self):
+        self.x = 0
 
 class Doc(Visitor):
     def __init__(self):
-        self.tags: list[str] = []
-        self.rows: list[Row] = []
+        self.tags: list[str] = []   # array<string>, no count: the cap applies
+        self.rows: list[Row] = []   # array<Row, count 16>
+        self._scope = [None]
+        self._ix = 0
 
     def on_sequence_begin(self, field_id):
-        if field_id == 3:
-            return StringSeq(self.tags, cap=64, elem_max=128)
-        if field_id == 4:
-            return NestedSeq(self.rows, factory=Row, cap=16)
-        return None                      # decode it flat, into me
+        scope = self._scope[-1]
+        if scope is None and field_id in (3, 4):
+            self._scope.append(field_id)
+        elif scope == 4:             # a struct element: reserve, then route
+            reserve_elem(self.rows, field_id, Row, 16, MAX_DYN_ARRAY_COUNT)
+            self._ix = field_id
+            self._scope.append("row")
+        else:
+            return False
+        return None
+
+    def on_sequence_end(self):
+        self._scope.pop()
+
+    def on_field(self, field):
+        if self._scope[-1] == 3:     # a string element: reserve at its header
+            if field.type is not WireType.FIXLEN or field.subtype is not FixlenSubtype.STRING:
+                return False         # MESSAGE_SPEC §7.3: skip a mistyped element
+            reserve_leaf(self.tags, field.id, "", UNBOUNDED, MAX_DYN_ARRAY_COUNT)
+        return None
+
+    def on_string(self, field_id, value):
+        self.tags[field_id] = value
+
+    def on_unsigned(self, field_id, value):
+        if self._scope[-1] == "row" and field_id == 0:
+            self.rows[self._ix].x = value
 ```
 
-Returning a `Visitor` from `on_sequence_begin` **descends**: the sub-tree's
-fields go to the visitor returned — sequences nested inside included — its
-`on_sequence_end` fires when that scope closes, and the parent resumes afterwards. Returning `False` still skips the
-sub-tree; anything else still decodes it flat.
+`reserve_leaf` (a `string` or `blob`: the gap is a shared `""` / `b""`),
+`reserve_elem` (a struct, union or native matrix row: each new slot gets its own
+`make()`) and `reserve_row` (a row that is itself a wrapper array: replaced by a
+fresh list) are the set. Each **bounds the index, then grows the list** to
+`id + 1`, filling the gap an omitted interior element left — appending would
+shorten the array by every gap, and would take a reopened id as a second
+element. None of them stores the value: that, and the routing into a framed
+element, stay with the caller. Like `Encoder` and `Decoder`, the three resolve
+to compiled twins when the native engine is active (`sofab.IMPL == "native"`);
+the contract and the refusals are the same.
 
-A collector places each element at the id it names and fills the gap an omitted
-interior element left — appending would shorten the array by every gap, and would
-take a reopened id as a second element. `StringSeq`, `BytesSeq`, `UnsignedSeq`,
-`SignedSeq`, `Float32Seq`, `Float64Seq` and `NestedSeq` are the set.
+Which bound applies is the schema's choice, and every call states both. `cap` is
+the schema's declared element count — a capacity, not a length — and an id at
+or past it is `INVALID` (`SofaDecodeError`); pass `UNBOUNDED` where the schema
+declares none. `rcap` is the receiver limit and applies only then, because
+§6.2.1 forbids a receiver limit on a field the schema already bounds; an id past
+it raises `SofaLimitError`, and an `rcap` that states no number (negative,
+`None`, not an `int`) raises `SofaArgumentError`. Either way the id is judged
+**before** the list grows, so an index near 2³¹ costs a comparison and not an
+allocation, and a refused id leaves the list as it was.
 
-Which bound applies is the schema's choice. `cap` is the schema's declared
-element count and an id past it is `INVALID`; `max_dyn_array_count` is the
-receiver limit and applies only where the schema declares none, because §6.2.1
-forbids a receiver limit on a field the schema already bounds. Either way the id
-is judged **before** the list grows, so an index near 2³¹ costs a comparison and
-not an allocation.
+An element's `maxlen` is not an argument here: declare it from
+`on_schema_bound` and the decoder judges it at the length word.
 
 These are the **static helper layer** of CORELIB_PLAN §6.6.1 — beside the codec,
 not part of it. They allocate on the generated layer's behalf; the codec does not
@@ -1054,11 +1093,11 @@ Its `sequence_growth` block describes a **wrapper array's
 container** growing as elements arrive — a length no wire word announces, since
 MESSAGE_SPEC §5.1 makes it *highest present id + 1*. That container belongs to
 the layer above the codec, and this port ships that layer: `sofab.collectors`
-(`StringSeq`, `BytesSeq`, `UnsignedSeq`, `SignedSeq`, `Float32Seq`,
-`Float64Seq`, `NestedSeq`). **It allocates, on the generated layer's behalf**
-(CORELIB_PLAN §6.6.1) — its lists are not a §6.6 breach, because the codec never
-calls into it: a collector is reached only from inside a visitor callback the
-codec made, and the codec keeps no reference to anything it takes.
+(`reserve_leaf`, `reserve_elem`, `reserve_row`). **It allocates, on the
+generated layer's behalf** (CORELIB_PLAN §6.6.1) — its lists are not a §6.6
+breach, because the codec never calls into it: a helper is reached only from
+inside a visitor callback the codec made, and the codec keeps no reference to
+anything it takes.
 `tests/test_sequence_growth.py` replays every case in the block against it, and
 `tests/test_collectors.py` measures the growth **geometry** with `tracemalloc`
 — extending to at least `id + 1` in one pass, so a sparse array costs O(n) and

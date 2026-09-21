@@ -3,10 +3,11 @@
 A wrapper array carries no length: MESSAGE_SPEC §5.1 makes it *highest present
 id + 1*, so its container grows as elements arrive. The growth itself belongs to
 the static helper / generated layer (§6.6.1) and never to the codec — this port
-ships that layer as ``sofab.collectors``, so the container below is the
-library's own, driven through the public visitor API exactly as generated code
-drives it ("the port builds the message from `deliver` and asserts `expect`").
-Its growth **geometry** is measured in ``tests/test_collectors.py``.
+ships that layer as ``sofab.collectors``, so the growth below is the library's
+own: :func:`sofab.reserve_leaf` / :func:`sofab.reserve_elem`, called from a flat
+visitor exactly as generated code calls them ("the port builds the message from
+`deliver` and asserts `expect`"). Their growth **geometry** is measured in
+``tests/test_collectors.py``.
 
 What the codec owes, and what these cases pin, is §6.2.1's other half:
 
@@ -34,7 +35,16 @@ from vectors import DECODER_ENGINES as ENGINES
 from vectors import ENCODER_ENGINES as ENCODERS
 from vectors import NO_CAPS
 
-from sofab import NestedSeq, SofaLimitError, Status, StringSeq, Visitor
+from sofab import (
+    UNBOUNDED,
+    FixlenSubtype,
+    SofaLimitError,
+    Status,
+    Visitor,
+    WireType,
+    reserve_elem,
+    reserve_leaf,
+)
 
 _VECTORS = json.loads(
     (Path(__file__).resolve().parent.parent / "assets" / "test_vectors.json").read_text()
@@ -47,50 +57,74 @@ IDS = [c["name"] for c in CASES]
 CAP = 8
 
 
-class Element(Visitor):
+class Element:
     """One struct element: an ``unsigned`` at id 0, per the block's note."""
 
     def __init__(self) -> None:
         self.fields: dict[int, int] = {}
 
-    def on_unsigned(self, field_id, value):
-        self.fields[field_id] = value
-
 
 class Root(Visitor):
-    """The object that holds the array field, handing its scope to a collector.
+    """A flat visitor holding the array field, in the shape generated code takes.
 
-    This is the shape generated code takes: a wrapper array's scope is delegated
-    to the collector for that field, so the ids the collector sees are that
-    array's indices.
+    It routes the wrapper's scope itself and grows the list through the
+    library's helpers: the schema declares no count for the array, so the
+    receiver cap ``CAP`` is the bound that applies.
     """
 
     def __init__(self, case: dict, out: list) -> None:
         self._case = case
+        self._struct = case.get("element_type") == "struct"
         self._out = out
+        self._depth = 0  # 0: root, 1: the wrapper, 2: a struct element
+        self._ix = 0
 
     def on_sequence_begin(self, field_id):
-        if field_id != self._case["field_id"]:
-            return None
-        if self._case.get("element_type") == "struct":
-            return NestedSeq(self._out, factory=Element, max_dyn_array_count=CAP)
-        return StringSeq(self._out, max_dyn_array_count=CAP)
+        if self._depth == 0:
+            if field_id != self._case["field_id"]:
+                return False
+        elif self._depth == 1 and self._struct:
+            reserve_elem(self._out, field_id, Element, UNBOUNDED, CAP)
+            self._ix = field_id
+        else:
+            return False
+        self._depth += 1
+        return None
+
+    def on_sequence_end(self):
+        self._depth -= 1
+
+    def on_field(self, field):
+        if self._depth == 1 and not self._struct:
+            if field.type is not WireType.FIXLEN or field.subtype is not FixlenSubtype.STRING:
+                return False
+            reserve_leaf(self._out, field.id, "", UNBOUNDED, CAP)
+        return None
+
+    def on_string(self, field_id, value):
+        self._out[field_id] = value
+
+    def on_unsigned(self, field_id, value):
+        if self._depth == 2:
+            self._out[self._ix].fields[field_id] = value
 
 
 def collector_for(case: dict, out: list):
-    """The library's own collector for this case's element type.
+    """The library's own growth for this case's element type.
 
-    This is the point of the block for a codec-only port: the container is
-    ``sofab.collectors``' — the static helper layer §6.6.1 puts beside the codec
-    for exactly this — driven through the public visitor API the generated layer
-    uses. Nothing here is written for the test.
+    This is the point of the block for a codec-only port: the container is grown
+    by ``sofab.collectors`` — the static helper layer §6.6.1 puts beside the
+    codec for exactly this — called from a flat visitor as the generated layer
+    calls it. Nothing about the growth is written for the test.
     """
     return Root(case, out)
 
 
-def _element_default(case: dict):
+def _is_element_default(case: dict, el) -> bool:
     """What an omitted interior element leaves behind (MESSAGE_SPEC §2)."""
-    return None if case.get("element_type") == "struct" else ""
+    if case.get("element_type") == "struct":
+        return isinstance(el, Element) and el.fields == {}
+    return el == ""
 
 
 def _resolve(entry: dict, key: str) -> int:
@@ -146,7 +180,7 @@ def test_sequence_growth_case(case, enc_cls, dec_cls):
     assert dec.feed(wire) is Status.COMPLETE
     assert len(out) == _resolve(expect, "length")
     for gap in expect.get("default_ids", []):
-        assert out[gap] == _element_default(case), (
+        assert _is_element_default(case, out[gap]), (
             f"id {gap} should have kept the element default"
         )
 
