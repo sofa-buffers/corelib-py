@@ -1074,8 +1074,20 @@ the category: a receiver cap (`max_dyn_string_len` and its two siblings) raises
 (§6.2.1/§6.3 vs MESSAGE_SPEC §7.1). Every rejection in the block is paired with
 the same shape at a length the ceiling admits, which still answers
 `Status.INCOMPLETE` and completes when its payload arrives.
-`tests/test_header_limits.py` replays the block; `tests/test_schema_bounded.py`
-and `tests/test_receiver_limits.py` specify the two ceilings in full.
+Its `header_limits_nested` block is that same assertion one or two sequence
+frames deeper, which is its own axis rather than more of the same: those bytes
+end with their frames still **open**, so a decoder has a second, unrelated reason
+to answer `Status.INCOMPLETE`, and a ceiling wired only into the top-level scope
+produces a plausible-looking one. The runner pairs every rejection with a
+**negative control** — the same bytes and the same receiver with that one ceiling
+lifted out of reach, which must change the answer — because otherwise a rejection
+coming from some unrelated guard would be indistinguishable from the ceiling
+firing at depth. All eight nested cases run here, none gated.
+
+`tests/test_header_limits.py` replays both blocks off one shared leaf, so a
+nested case cannot pass by a different route than its flat twin;
+`tests/test_schema_bounded.py` and `tests/test_receiver_limits.py` specify the
+two ceilings in full.
 
 If the compile fails or no compiler is available, the install falls back to
 pure-Python (the extension is marked *optional* in `setup.py`). Both engines
