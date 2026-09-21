@@ -177,10 +177,10 @@ class Visitor:
         another :class:`Visitor`
             **descend into it**: every field of that sub-tree goes to the visitor
             returned, its :meth:`on_sequence_end` fires when the scope closes,
-            and this visitor resumes afterwards. That is how a wrapper array's
-            elements each get a handler of their own (see
-            :mod:`sofab.collectors`), and how a generated object hands a nested
-            message to the object that models it.
+            and this visitor resumes afterwards. That is how a hand-written
+            object hands a nested message to the object that models it.
+            Generated code is flat and does not descend; it grows a wrapper
+            array's list with the helpers in :mod:`sofab.collectors`.
         anything else
             decode the sub-tree into this same visitor, as a flat event stream.
 

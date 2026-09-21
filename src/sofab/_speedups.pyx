@@ -4202,5 +4202,83 @@ cdef class Decoder:
         return 0
 
 
+# --- the static helper layer's native twins (sofab.collectors) ---------------
+#
+# ``reserve_leaf`` / ``reserve_elem`` / ``reserve_row`` exactly as
+# ``sofab.collectors`` defines them — the rationale, the index rules and the two
+# bounds are documented there, once — compiled so that a generated visitor's
+# call per wrapper-array element is a C call rather than a Python frame. They
+# are not codec code: nothing here touches the wire and the decoder never calls
+# them. ``sofab`` re-exports these in place of the pure ones whenever the native
+# engine is the active one, the same selection ``Encoder``/``Decoder`` get.
+#
+# Measured on ``vehicle_telemetry`` (17 wrapper-array elements per message,
+# callgrind, native engine): the pure functions cost +2.5% Ir/op over the old
+# inline emitted code, these twins cost nothing measurable.
+#
+# The refusal itself is built by the pure module's ``_refusal``, so both
+# implementations raise the same class with the same text.
+
+from .collectors import _refusal
+
+
+cdef inline bint _past_rcap(Py_ssize_t id, object rcap) except -1:
+    """True when ``id`` may not be admitted under the receiver cap ``rcap``:
+    at or past it, or ``rcap`` states no ``int`` at all (``_refusal`` then
+    picks ``SofaArgumentError``). An ``rcap`` wider than ``Py_ssize_t`` is
+    compared exactly, never clamped."""
+    if type(rcap) is not int:
+        return True
+    try:
+        return id >= <Py_ssize_t>rcap
+    except OverflowError:
+        return rcap < 0
+
+
+def reserve_leaf(object out, Py_ssize_t id, object default, Py_ssize_t cap, object rcap):
+    """Native twin of :func:`sofab.collectors.reserve_leaf`."""
+    if cap >= 0:
+        if id >= cap:
+            raise _refusal(id, cap, rcap)
+    elif _past_rcap(id, rcap):
+        raise _refusal(id, cap, rcap)
+    if type(out) is list:
+        while PyList_GET_SIZE(<list>out) <= id:
+            PyList_Append(<list>out, default)
+    else:  # a list subclass: what the pure twin accepts, this one does too
+        while len(out) <= id:
+            out.append(default)
+
+
+def reserve_elem(object out, Py_ssize_t id, object make, Py_ssize_t cap, object rcap):
+    """Native twin of :func:`sofab.collectors.reserve_elem`."""
+    if cap >= 0:
+        if id >= cap:
+            raise _refusal(id, cap, rcap)
+    elif _past_rcap(id, rcap):
+        raise _refusal(id, cap, rcap)
+    if type(out) is list:
+        while PyList_GET_SIZE(<list>out) <= id:
+            PyList_Append(<list>out, make())
+    else:
+        while len(out) <= id:
+            out.append(make())
+
+
+def reserve_row(object rows, Py_ssize_t id, Py_ssize_t cap, object rcap):
+    """Native twin of :func:`sofab.collectors.reserve_row`."""
+    if cap >= 0:
+        if id >= cap:
+            raise _refusal(id, cap, rcap)
+    elif _past_rcap(id, rcap):
+        raise _refusal(id, cap, rcap)
+    while len(rows) < id:
+        rows.append([])
+    if len(rows) == id:
+        rows.append([])
+    else:
+        rows[id] = []
+
+
 # Marker so callers / tests can assert which implementation is active.
 IMPL = "native"

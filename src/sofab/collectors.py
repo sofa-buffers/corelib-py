@@ -1,261 +1,288 @@
-"""The static helper layer: turning a wrapper-array's events back into a list.
+"""The static helper layer: a wrapper array's element placement and growth.
 
 CORELIB_PLAN §6.6.1 names it — "the reassembly buffers, **sequence collectors
 and array builders** a port holds so the generator need not emit them into every
-generated package". It ships beside the codec and is **not part of it**: the
-generated layer calls a collector, the collector calls the codec, never the other
-way round, and *this* layer is the one allowed to allocate (§6.6).
+generated package". It ships beside the codec and is **not part of it**: nothing
+here touches the wire, the codec never calls into it, and *this* layer is the one
+allowed to allocate (§6.6). Generated code calls these functions from inside its
+own flat :class:`~sofab.Visitor` callbacks; a hand-written visitor calls them the
+same way.
 
 A wrapper-sequence array (MESSAGE_SPEC §5.1) is an array whose elements are not
-native scalars — strings, blobs, structs — and it reaches a visitor as a nested
-sequence **whose child ids are the array indices**. Turning that back into a list
-is the same code for every schema: place at the id, fill the gap the omitted
-interior elements left, refuse an id past the bound. Only the bounds differ, and
-a bound is an argument.
+native scalars — strings, blobs, structs, unions, nested rows — and it reaches a
+visitor as a nested sequence **whose child ids are the array indices**. Turning
+that back into a list has the same shape for every schema. Its schema dependence
+is exactly three things, and each arrives as an argument: a **bound** (the
+schema's ``count``, or the receiver cap where there is none), an **element type**
+(the factory) and an **element default**. That is why the code lives here,
+written once, rather than being re-emitted into every generated package.
 
-Two conventions run through the file.
+Three reservations, one shape
+-----------------------------
 
-**Place, never append.** An interior element equal to the element default is
-omitted on the wire (MESSAGE_SPEC §2), so appending would shorten the array by
-every such gap and would take a reopened id as a second element instead of
-overwriting the first. The array's *last* element is always written, which is
-what makes the decoded length — highest present id + 1 — exact.
+Every wrapper array a schema can declare reaches this module through one of three
+calls, which differ only in what a new slot holds:
 
-**Which bound applies is the schema's choice.** ``cap`` is the schema's declared
-element count: an id at or past it is a schema-bound violation and therefore
-INVALID (§7.1). ``max_dyn_array_count`` is the receiver's limit and applies only
-where the schema declares none — §6.2.1 forbids a receiver limit on a field the
-schema already bounds — and exceeding it is a policy rejection, not INVALID.
-Either way the id is judged **before** the list grows, so an index near 2**31
-costs a comparison and not an allocation.
+:func:`reserve_leaf`
+    a ``string`` or ``blob`` element: the gap value is a **shared immutable
+    default** (``""`` / ``b""``), so a gap costs no allocation.
+:func:`reserve_elem`
+    a ``struct`` / ``union`` element, or a native-integer matrix row: each new
+    slot gets **its own object** from ``make()``, because a shared mutable
+    default would alias every element of the array onto one object.
+:func:`reserve_row`
+    a row that is itself a wrapper array (``array<array<string>>`` and kin):
+    gaps are fresh empty rows and the row at the id is **replaced** by a fresh
+    empty list, because an array wrapper *is* the array's value (§7.4).
+
+Each call bounds the index, then grows the list. None of them places the value:
+generated code stores ``out[id] = value`` from the value hook, or binds its own
+element-index register and keeps routing the element's fields into ``out[id]``.
+**The helper owns growth and the bound; the routing stays generated**, because
+the routing is what differs per schema.
+
+The index rules of MESSAGE_SPEC §5.1
+------------------------------------
+
+None of these is visible in the bytes — two implementations can disagree about
+every one and still emit an identical message — which is why they are written
+here once (CORELIB_PLAN §7.2 item 8 asks for them separately for the same reason).
+
+* **Ids are positions; gaps are legal.** An interior element equal to the element
+  default is omitted on the wire (MESSAGE_SPEC §2), so a missing id fills a gap
+  rather than shifting every later element down by one. Place, never append.
+* **The length is highest present id + 1.** The last element is never elided,
+  so growing to ``id + 1`` is exactly right and no trailing fill is ever needed.
+* **A repeated id replaces** (§7.4). An indexed store does that by construction.
+  :func:`reserve_leaf` and :func:`reserve_elem` never overwrite a slot already
+  present — the value store that follows does, and a re-opened framed element
+  *merges* into the object its earlier fields built.
+* **A rejected id extends nothing.** The index is judged **before** the list
+  grows, so an index near 2**31 costs a comparison and not an allocation, and a
+  refused id leaves the list exactly as it was — a lower id delivered afterwards
+  still lands at its own index (§7.2 item 8).
+
+The two bounds of CORELIB_PLAN §6.2.1
+-------------------------------------
+
+Every call takes **both** numbers, and exactly one of them applies. The schema
+picks which:
+
+``cap``
+    the array's schema ``count``, or :data:`UNBOUNDED` where the schema declares
+    none. A ``count`` is a **capacity**, not a length: the list starts empty and
+    the wire carries the length. An id at or past a declared ``cap`` contradicts
+    the schema both peers agreed on — malformed input,
+    :class:`~sofab.SofaDecodeError`, the decoder's ``Status.INVALID`` (§7.1). A
+    receiver cap is then **not applied at all** (§6.2.1 forbids a receiver limit
+    on a field the schema already bounds).
+``rcap``
+    the receiver's ``max_dyn_array_count``, compared only where ``cap`` is
+    :data:`UNBOUNDED`. An id at or past it is well-formed input this receiver
+    declines: :class:`~sofab.SofaLimitError`, the policy category (§6.3) — the
+    same element decodes for a receiver configured more loosely.
+
+Neither number is this module's. Both are **passed in** on every call, used for
+that one comparison and never retained. §6.2.1: a port "**MUST NOT** hold a limit
+of its own, **MUST NOT** supply a default for one it was not given, **MUST NOT**
+read an omitted argument as *unlimited*, and **MUST NOT** clamp to one". So
+``rcap`` is a required positional argument, and on a schema-unbounded array a
+value that states no cap — a negative number, ``None``, ``float('inf')``,
+anything but an ``int`` — admits no element and is refused as
+:class:`~sofab.SofaArgumentError` (§6.3's ``InvalidArgument``): the mistake is in
+the **call**, and :class:`~sofab.SofaLimitError` would name a receiver policy
+nobody configured.
+
+What these bounds do not cover
+------------------------------
+
+A ``string`` or ``blob`` element's own ``maxlen`` is not an argument here. It is
+a bound on the payload's **wire byte length** and must be judged at the length
+word, before a payload byte is read — so that a message truncated right after
+that word is INVALID rather than INCOMPLETE (MESSAGE_SPEC §5.2), and so that a
+``str`` is never measured in code points. The codec owns that check: a visitor
+declares the bound from :meth:`~sofab.Visitor.on_schema_bound`, and the decoder
+applies it at the length word.
+
+Where to call
+-------------
+
+A leaf element is reserved from :meth:`~sofab.Visitor.on_field` — at the
+element's **header** — and its value stored from ``on_string`` / ``on_bytes``.
+The index verdict therefore lands at the header, where §5.2 wants it: a check in
+the value hook would never fire for a payload the message truncates behind, and
+INVALID outranks INCOMPLETE. Reserving at the header is safe to repeat (the call
+is idempotent), and a reserved slot whose value never arrives exists only in a
+decode that has already failed. A framed element or a row is reserved from
+:meth:`~sofab.Visitor.on_sequence_begin`. The caller runs its own §7.3
+type-mismatch decline **before** the reserve, so a mistyped element at an
+over-bound index is skipped rather than refused.
+
+Why functions, not collector objects
+------------------------------------
+
+A generated visitor is flat (CORELIB_PLAN §5.3.1): it routes every scope itself
+and hands no child visitor back, so a collector *object* would have to be held
+and forwarded to. On CPython a plain module function costs less per element than
+a bound method on a held instance, and allocates nothing per array opening — so
+this layer is three functions, and a flat visitor is its only intended caller.
+
+Two implementations, one contract
+---------------------------------
+
+These are the reference definitions, and what the pure engine uses. The compiled
+accelerator (``sofab._speedups``) carries a twin of each, and ``sofab``
+re-exports the twins whenever the native engine is active — the same selection
+``Encoder`` and ``Decoder`` get. The reason is measured: generated code calls one
+of these per wrapper-array element, and on ``vehicle_telemetry`` a Python-level
+call there cost the native engine +2.5% Ir per decode where the compiled twin
+costs nothing measurable. The twins build their refusals with :func:`_refusal`
+below, and ``tests/test_collectors.py`` runs every direct case against both.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Final, TypeVar
 
-from .types import (
-    Field,
-    FixlenSubtype,
-    SofaArgumentError,
-    SofaDecodeError,
-    SofaLimitError,
-    WireType,
-)
-from .visitor import Visitor
+from .types import SofaArgumentError, SofaDecodeError, SofaError, SofaLimitError
 
 __all__ = [
-    "BytesSeq",
-    "Float32Seq",
-    "Float64Seq",
-    "NestedSeq",
-    "SequenceCollector",
-    "SignedSeq",
-    "StringSeq",
-    "UnsignedSeq",
+    "UNBOUNDED",
+    "reserve_elem",
+    "reserve_leaf",
+    "reserve_row",
 ]
 
+T = TypeVar("T")
 
-class SequenceCollector(Visitor):
-    """Base for the collectors: the bound check and the gap-filling placement.
+#: The ``cap`` a caller passes where the schema declares no ``count`` for the
+#: array — the receiver cap ``rcap`` then applies instead.
+UNBOUNDED: Final[int] = -1
 
-    ``out`` is the caller's list and is written in place. ``cap`` is the schema's
-    declared count, or ``None`` where the schema declares none;
-    ``max_dyn_array_count`` is the receiver limit that then applies. ``default``
-    is what an omitted interior element leaves behind.
 
-    ``max_dyn_array_count`` is **required**, and required whether or not ``cap``
-    is given. §6.2.1 lets this layer perform the comparison but not own the
-    number: it "**MUST NOT** hold a limit of its own, **MUST NOT** supply a
-    default for one it was not given, **MUST NOT** read an omitted argument as
-    *unlimited*, and **MUST NOT** clamp to one" — and a format ceiling (§6.2)
-    standing in for an unstated cap is the format's bound, not a receiver cap.
-    Omitting it is a defect in the call and raises
-    :class:`~sofab.SofaArgumentError` (§6.3's ``InvalidArgument`` tier), never
-    :class:`~sofab.SofaLimitError`. It is required alongside ``cap`` because
-    ``cap=None`` is how a caller says "the schema bounds nothing here", and that
-    is exactly the case in which a silently-defaulted receiver limit would leave
-    the array unbounded in practice.
+def reserve_leaf(out: list[T], id: int, default: T, cap: int, rcap: int) -> None:
+    """**Reserve a leaf element's slot** — a wrapper array's ``string`` or
+    ``blob`` — at the index its wire id names.
+
+    Bounds ``id`` first, then grows ``out`` to at least ``id + 1``, filling every
+    new slot with ``default``. A slot already present is left alone; the caller
+    stores the value with ``out[id] = value`` once it has arrived.
+
+    ``default`` is **shared, not copied**: ``""`` or ``b""``, immutable, so a gap
+    costs no allocation. An element whose default is mutable belongs in
+    :func:`reserve_elem`.
+
+    :param out: the destination list, which this grows
+    :param id: the element's wire id, which is its index
+    :param default: the element default, filling any gap up to ``id``
+    :param cap: the array's schema ``count``, or :data:`UNBOUNDED`
+    :param rcap: the receiver's ``max_dyn_array_count``, compared only where
+        ``cap`` is :data:`UNBOUNDED`
+    :raises SofaDecodeError: ``id`` reaches a declared ``cap`` (INVALID, §7.1)
+    :raises SofaLimitError: ``id`` reaches ``rcap`` on a schema-unbounded array
+    :raises SofaArgumentError: a schema-unbounded array was handed no cap
     """
-
-    default: Any = None
-
-    def __init__(
-        self,
-        out: list[Any],
-        *,
-        cap: int | None = None,
-        max_dyn_array_count: int | None = None,
-    ) -> None:
-        if max_dyn_array_count is None:
-            raise SofaArgumentError(
-                "max_dyn_array_count is required (§6.2.1): a collector holds no "
-                "limit of its own and reads no omitted argument as unlimited"
-            )
-        self.out = out
-        self.cap = cap
-        self.max_dyn_array_count = max_dyn_array_count
-
-    def _slot(self, index: int) -> None:
-        """Judge the index, then make room for it — in that order (§6.2.1)."""
-        if self.cap is not None:
-            if index >= self.cap:
-                # The schema bounded this array, so an id past it is a statement
-                # about validity, not about capacity (§7.1).
-                raise SofaDecodeError(
-                    f"element index {index} exceeds the {self.cap} the schema declares"
-                )
-        elif index >= self.max_dyn_array_count:
-            raise SofaLimitError(
-                f"element index {index} exceeds "
-                f"max_dyn_array_count {self.max_dyn_array_count}"
-            )
-        out = self.out
-        while len(out) <= index:
-            out.append(self.default)
-
-    def _place(self, index: int, value: Any) -> None:
-        self._slot(index)
-        self.out[index] = value
+    if cap >= 0:
+        if id >= cap:
+            raise _refusal(id, cap, rcap)
+    elif rcap.__class__ is not int or id >= rcap:
+        raise _refusal(id, cap, rcap)
+    while len(out) <= id:
+        out.append(default)
 
 
-class _LeafSeq(SequenceCollector):
-    """Elements that arrive as a single value in the wrapper's own scope.
+def reserve_elem(
+    out: list[T], id: int, make: Callable[[], T], cap: int, rcap: int
+) -> None:
+    """**Reserve a framed element's slot** — a wrapper array's ``struct`` or
+    ``union`` element, or a native-integer matrix row.
 
-    Like every collector, an instance handles **one wrapper scope** — the object
-    holding the array field returns it from ``on_sequence_begin`` — so the ids it
-    sees are that array's indices and nothing else's.
+    Bounds ``id`` first, then grows ``out`` to at least ``id + 1``, giving each
+    new slot **its own** ``make()`` — the element class, or ``list`` for a row.
+    A shared default would alias every element onto one object, which is the
+    single reason this is a second function rather than :func:`reserve_leaf`.
+
+    A slot already present is left alone: a framed element's fields arrive one
+    at a time into the object reserved here, so a re-opened element id merges
+    into what its earlier fields built (§7.4). ``make`` is never called for a
+    refused ``id``.
+
+    Nothing is returned: the caller binds ``id`` in its own element-index
+    register and reaches the element as ``out[id]``.
+
+    :param out: the destination list, which this grows
+    :param id: the element's wire id, which is its index
+    :param make: the element factory, called once per slot this creates
+    :param cap: the array's schema ``count``, or :data:`UNBOUNDED`
+    :param rcap: the receiver's ``max_dyn_array_count``, compared only where
+        ``cap`` is :data:`UNBOUNDED`
+    :raises SofaDecodeError: ``id`` reaches a declared ``cap`` (INVALID, §7.1)
+    :raises SofaLimitError: ``id`` reaches ``rcap`` on a schema-unbounded array
+    :raises SofaArgumentError: a schema-unbounded array was handed no cap
     """
+    if cap >= 0:
+        if id >= cap:
+            raise _refusal(id, cap, rcap)
+    elif rcap.__class__ is not int or id >= rcap:
+        raise _refusal(id, cap, rcap)
+    while len(out) <= id:
+        out.append(make())
 
 
-class _PayloadSeq(_LeafSeq):
-    """Elements whose schema bound is a **byte length**: ``string`` and ``blob``.
+def reserve_row(rows: list[list[Any]], id: int, cap: int, rcap: int) -> None:
+    """**Reserve a matrix row** whose elements are themselves a wrapper array.
 
-    ``maxlen`` is a bound on the payload's **wire byte length** (MESSAGE_SPEC
-    §1), and MESSAGE_SPEC §7 makes a payload longer than it INVALID. So the
-    bound is judged at the ``fixlen_word`` — in :meth:`on_field`, before a byte
-    of the element is decoded — which is where the wire length is still in hand
-    and where §7.1 wants the verdict.
+    Bounds ``id`` first, fills every gap below it with a fresh empty row, and
+    then **rebinds** ``rows[id]`` to a fresh empty list: an array wrapper *is*
+    the array's value, so a later occurrence of its id replaces the row whole
+    (§7.4) rather than merging into it. Rebinding rather than ``clear()`` leaves
+    a list a caller took out of an earlier decode intact.
 
-    Measuring the decoded element instead would be wrong for exactly one of the
-    two: ``len()`` on a ``str`` counts **code points**, so every element whose
-    UTF-8 is longer than its code-point count slipped a bound it violated. The
-    check also now fires for a payload the message truncates behind, and it
-    costs nothing where the element is over-long — the ``str``/``bytes`` is
-    never built.
+    The row's own elements are then reserved with :func:`reserve_leaf` or
+    :func:`reserve_elem` against ``rows[id]`` and the row's own bound.
 
-    ``_subtype`` names which fixlen subtype the bound belongs to, so a field of
-    the other one — which MESSAGE_SPEC §7.3 has this collector skip — is not
-    judged against a bound that is not its.
+    :param rows: the outer list, one entry per row
+    :param id: the row's wire id, which is its index
+    :param cap: the outer array's schema ``count``, or :data:`UNBOUNDED`
+    :param rcap: the receiver's ``max_dyn_array_count``, compared only where
+        ``cap`` is :data:`UNBOUNDED`
+    :raises SofaDecodeError: ``id`` reaches a declared ``cap`` (INVALID, §7.1)
+    :raises SofaLimitError: ``id`` reaches ``rcap`` on a schema-unbounded array
+    :raises SofaArgumentError: a schema-unbounded array was handed no cap
     """
-
-    _subtype: FixlenSubtype
-
-    def __init__(
-        self, out: list[Any], *, elem_max: int | None = None, **kw: Any
-    ) -> None:
-        super().__init__(out, **kw)
-        self.elem_max = elem_max
-
-    def on_field(self, field: Field) -> bool | None:
-        cap = self.elem_max
-        if (
-            cap is not None
-            and field.type is WireType.FIXLEN
-            and field.subtype is self._subtype
-            and field.size > cap
-        ):
-            raise SofaDecodeError(
-                f"{self._subtype.name.lower()} length {field.size} exceeds "
-                f"the {cap} the schema declares"
-            )
-        return None
+    if cap >= 0:
+        if id >= cap:
+            raise _refusal(id, cap, rcap)
+    elif rcap.__class__ is not int or id >= rcap:
+        raise _refusal(id, cap, rcap)
+    while len(rows) < id:
+        rows.append([])
+    if len(rows) == id:
+        rows.append([])
+    else:
+        rows[id] = []
 
 
-class StringSeq(_PayloadSeq):
-    """``string`` elements. ``elem_max`` is the schema's ``maxlen``, if any —
-    a bound on the element's **UTF-8 byte length**, not on its character
-    count."""
+def _refusal(id: int, cap: int, rcap: Any) -> SofaError:
+    """The refusal a rejected ``id`` has earned, built out of line so the three
+    hot bodies above stay one comparison and one ``raise``.
 
-    default = ""
-    _subtype = FixlenSubtype.STRING
-
-    def on_string(self, field_id: int, value: str) -> None:
-        self._place(field_id, value)
-
-
-class BytesSeq(_PayloadSeq):
-    """``blob`` elements — the string twin, with no UTF-8 to check."""
-
-    default = b""
-    _subtype = FixlenSubtype.BLOB
-
-    def on_bytes(self, field_id: int, value: bytes) -> None:
-        self._place(field_id, value)
-
-
-class UnsignedSeq(_LeafSeq):
-    """Unsigned elements, for the wrapper form an integer array takes when its
-    elements are not packed into one ARRAY_UNSIGNED field."""
-
-    default = 0
-
-    def on_unsigned(self, field_id: int, value: int) -> None:
-        self._place(field_id, value)
-
-
-class SignedSeq(_LeafSeq):
-    default = 0
-
-    def on_signed(self, field_id: int, value: int) -> None:
-        self._place(field_id, value)
-
-
-class Float32Seq(_LeafSeq):
-    default = 0.0
-
-    def on_float32(self, field_id: int, value: float) -> None:
-        self._place(field_id, value)
-
-
-class Float64Seq(_LeafSeq):
-    default = 0.0
-
-    def on_float64(self, field_id: int, value: float) -> None:
-        self._place(field_id, value)
-
-
-class NestedSeq(SequenceCollector):
-    """Elements that are themselves framed — a struct, a union, a nested row.
-
-    Each element reaches the decoder as a sub-sequence whose id is the array
-    index, so this hands that scope to a handler of its own: ``factory()`` is
-    called once per element and its return value both receives the element's
-    fields and is what lands in ``out``.
-
-    Like every collector it is the handler **for the wrapper's scope**, which the
-    object holding the field hands over::
-
-        class Doc(Visitor):
-            def __init__(self):
-                self.rows: list[Row] = []
-            def on_sequence_begin(self, field_id):
-                if field_id == 4:
-                    return NestedSeq(self.rows, factory=Row, cap=16)
-                return None
-
-    The element is placed **before** it is filled, so the list's shape is settled
-    at the index — which is where §6.2.1 wants the judgement — and a handler that
-    keeps a reference sees the same object the list holds.
+    The categories are not interchangeable. INVALID (``SofaDecodeError``) says
+    the message contradicts its schema. ``SofaLimitError`` says *"raise my limit,
+    or the sender must send less"*. ``SofaArgumentError`` says the call stated no
+    receiver cap at all — the absence of the number §6.2.1 requires, which is
+    neither a small limit nor an unlimited one.
     """
-
-    def __init__(
-        self, out: list[Any], *, factory: Callable[[], Visitor], **kw: Any
-    ) -> None:
-        super().__init__(out, **kw)
-        self.factory = factory
-
-    def on_sequence_begin(self, field_id: int) -> Visitor | None:
-        element = self.factory()
-        self._place(field_id, element)
-        return element
+    if cap >= 0:
+        return SofaDecodeError(
+            f"element index {id} exceeds the count {cap} the schema declares"
+        )
+    if rcap.__class__ is not int or rcap < 0:
+        return SofaArgumentError(
+            f"max_dyn_array_count not stated ({rcap!r}) for element index {id} "
+            "(§6.2.1): the helper holds no limit of its own and reads no "
+            "missing cap as unlimited"
+        )
+    return SofaLimitError(
+        f"element index {id} exceeds the receiver limit max_dyn_array_count {rcap}"
+    )
