@@ -88,19 +88,34 @@ gh pr merge <n> --rebase --delete-branch
 
 ### 2b. Check that the merge actually started CI on `main`
 
-Usually it does. Once it did not: merging the v0.11.0 bump (#160) produced a new
-commit on `main` and GitHub created **no** workflow run for it at all, while the
-very next merge (#161) — same kind of rebase onto an unmoved base — started CI
-and Docs normally. So this is not a property of rebase merges, and not a `paths`
-filter (`ci.yml` has none); it is something that can simply fail to happen.
+Usually it does, but not always: merging the v0.11.0 bump (#160) produced a new
+commit on `main` and GitHub created **no** workflow run for it — still none
+thirteen minutes later. The two merges after it started CI and Docs normally.
+It is not a property of rebase merges and not a `paths` filter (`ci.yml` has
+none); it is rare and unexplained.
 
 It matters because the PR's green run belongs to the *pre-rebase* SHA. When the
 push event goes missing, the commit about to be tagged has no CI of its own, and
-nothing says so. Check rather than assume:
+nothing says so.
+
+**Give the check a grace period.** A run takes a few tens of seconds to appear,
+so asking immediately after the merge reports `0` on a perfectly healthy merge —
+and dispatching on that answer wastes runner slots on a duplicate. Poll for a
+couple of minutes before concluding anything:
 
 ```sh
-gh api "repos/sofa-buffers/corelib-py/actions/runs?head_sha=$(git rev-parse HEAD)" --jq .total_count
-gh workflow run ci.yml   --ref main    # if that printed 0
+sha=$(git rev-parse HEAD)
+for i in $(seq 1 6); do
+  n=$(gh api "repos/sofa-buffers/corelib-py/actions/runs?head_sha=$sha" --jq .total_count)
+  [ "$n" != "0" ] && { echo "runs: $n"; break; }
+  sleep 30
+done
+```
+
+Only if that loop ends at `0` is the push event genuinely missing:
+
+```sh
+gh workflow run ci.yml   --ref main
 gh workflow run docs.yml --ref main    # docs deploy on push to main, same gap
 ```
 
