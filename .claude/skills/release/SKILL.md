@@ -86,13 +86,17 @@ fails with `Squash merges are not allowed on this repository`:
 gh pr merge <n> --rebase --delete-branch
 ```
 
-### 2b. A rebase merge does not start CI on `main`
+### 2b. Check that the merge actually started CI on `main`
 
-Observed on v0.11.0: after `--rebase`, `main` carried a new commit and GitHub
-created **no** workflow run for it — `ci.yml` has no `paths` filter, the push
-event simply did not fire. The PR's green run belongs to the pre-rebase SHA, so
-the commit about to be tagged has no CI of its own. Check, and start one if it
-is missing:
+Usually it does. Once it did not: merging the v0.11.0 bump (#160) produced a new
+commit on `main` and GitHub created **no** workflow run for it at all, while the
+very next merge (#161) — same kind of rebase onto an unmoved base — started CI
+and Docs normally. So this is not a property of rebase merges, and not a `paths`
+filter (`ci.yml` has none); it is something that can simply fail to happen.
+
+It matters because the PR's green run belongs to the *pre-rebase* SHA. When the
+push event goes missing, the commit about to be tagged has no CI of its own, and
+nothing says so. Check rather than assume:
 
 ```sh
 gh api "repos/sofa-buffers/corelib-py/actions/runs?head_sha=$(git rev-parse HEAD)" --jq .total_count
@@ -101,10 +105,11 @@ gh workflow run docs.yml --ref main    # docs deploy on push to main, same gap
 ```
 
 The rebased commit usually has the same tree *and* the same parent as the
-tested PR head (`git rev-parse <pr-sha>^{tree} HEAD^{tree}` — compare them), so
-this is a paperwork gap rather than a risk. Run it anyway: the `coverage` job
-publishes the badge only from `main`, and the skill's own rule is that the
-commit being tagged is green.
+tested PR head — compare them with
+`git rev-parse <pr-sha>^{tree} HEAD^{tree}` — so a missing run is a paperwork
+gap rather than a risk to what gets published. Dispatch the runs regardless:
+the `coverage` job publishes the badge only from `main`, and the rule in step 1
+is that the commit being tagged is green.
 
 ### 3. Tag the merged commit
 
