@@ -54,7 +54,7 @@ to equal a Python version literal verbatim:
 `release.yml` checks the part after the `v` against
 `^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$` and refuses anything else.
 
-Existing tags: `v0.9.0`, `v0.10.0`, `v0.10.1`.
+Existing tags: `v0.9.0`, `v0.10.0`, `v0.10.1`, `v0.11.0`.
 
 ## Procedure
 
@@ -78,7 +78,33 @@ git commit -am "chore(release): X.Y.Z"
 gh pr create --fill
 ```
 
-Wait for green CI, merge, then delete the branch (remote + local).
+Wait for green CI, then merge. **The repo allows rebase merges only** —
+`allow_squash_merge` and `allow_merge_commit` are both off, so `--squash`
+fails with `Squash merges are not allowed on this repository`:
+
+```sh
+gh pr merge <n> --rebase --delete-branch
+```
+
+### 2b. A rebase merge does not start CI on `main`
+
+Observed on v0.11.0: after `--rebase`, `main` carried a new commit and GitHub
+created **no** workflow run for it — `ci.yml` has no `paths` filter, the push
+event simply did not fire. The PR's green run belongs to the pre-rebase SHA, so
+the commit about to be tagged has no CI of its own. Check, and start one if it
+is missing:
+
+```sh
+gh api "repos/sofa-buffers/corelib-py/actions/runs?head_sha=$(git rev-parse HEAD)" --jq .total_count
+gh workflow run ci.yml   --ref main    # if that printed 0
+gh workflow run docs.yml --ref main    # docs deploy on push to main, same gap
+```
+
+The rebased commit usually has the same tree *and* the same parent as the
+tested PR head (`git rev-parse <pr-sha>^{tree} HEAD^{tree}` — compare them), so
+this is a paperwork gap rather than a risk. Run it anyway: the `coverage` job
+publishes the badge only from `main`, and the skill's own rule is that the
+commit being tagged is green.
 
 ### 3. Tag the merged commit
 
@@ -89,7 +115,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z"      # lowercase v, PEP 440 after it
 git push origin vX.Y.Z
 ```
 
-Annotated (`-a`) matches the most recent tag, `v0.10.1`.
+Annotated (`-a`) matches the most recent tags, `v0.10.1` and `v0.11.0`.
 
 ### 4. Watch the publish
 
@@ -109,9 +135,13 @@ Wheels take ~15–25 min per runner; the whole run is roughly 30–40 min.
 
 ### 5. Confirm by hand
 
+Use a throwaway venv, so the project's `.venv` is not repointed at a released
+build:
+
 ```sh
-pip install sofa-buffers-corelib==X.Y.Z
-python -c "import sofab; print(sofab.__version__, sofab.IMPL)"
+python3 -m venv /tmp/v-check
+/tmp/v-check/bin/python -m pip install --no-cache-dir "sofa-buffers-corelib==X.Y.Z"
+/tmp/v-check/bin/python -c "import sofab; print(sofab.__version__, sofab.IMPL)"
 ```
 
 `IMPL` must print `native` on any platform that has a wheel — that is the point
@@ -146,6 +176,10 @@ gh release create vX.Y.Z --generate-notes
   a real build break, not a flake.
 - **`verify-published` cannot install yet** — the job already retries 20× at 15 s
   for CDN propagation. A failure after that is real.
+- **`tests/test_version.py` fails locally right after the bump** — only the
+  editable install's *metadata* is stale, still built at the old version. The
+  assertion says so. `pip install -e .` and re-run; CI installs fresh and never
+  sees this.
 
 ## Not part of a release
 
