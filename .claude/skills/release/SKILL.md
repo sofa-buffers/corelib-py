@@ -1,0 +1,135 @@
+---
+name: release
+description: Cut a release of sofa-buffers-corelib (corelib-py) — bump the single version literal via PR, tag the merged commit, and watch release.yml publish to PyPI. Use when the user asks to release, cut a version, bump the version, tag a release, or publish to PyPI.
+---
+
+# Release corelib-py
+
+Publishes `sofa-buffers-corelib` to PyPI. The long-form reasoning lives in
+[`PUBLISHING.md`](../../../PUBLISHING.md); this is the procedure.
+
+## The one thing that makes this repo different
+
+**The tag is compared verbatim against the version literal** — the literal is
+bumped *first*, the tag follows. (The generator repo is the opposite: there the
+tag is injected into a placeholder. Do not carry that habit over.)
+
+There is exactly **one** place a version lives:
+
+- `src/sofab/__init__.py` → `__version__ = "X.Y.Z"`
+
+`pyproject.toml` declares `dynamic = ["version"]` and reads it from there
+(`[tool.setuptools.dynamic] version = { attr = "sofab.__version__" }`). Nothing
+else in the tree carries a version — not the README, not `docs/conf.py`, and
+there is no CHANGELOG. Confirm before bumping:
+
+```sh
+grep -rn "$(grep -oP '^__version__\s*=\s*"\K[^"]+' src/sofab/__init__.py)" \
+  --include='*.py' --include='*.toml' --include='*.md' --include='*.yml' . \
+  | grep -v '\.venv\|/build/\|uv\.lock\|\.claude/'
+```
+
+Only `src/sofab/__init__.py` should come back. If a second hit appears, someone
+added a version literal — bump it too, or better, wire it to `__version__`.
+
+## Version spelling
+
+`vX.Y.Z`, or a pre-release spelled the **PEP 440** way: `v0.11.0rc1`,
+**never** `v0.11.0-rc1`. The tag has to equal a Python version literal, and
+`release.yml` rejects anything else with
+`^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$`.
+
+Existing tags: `v0.9.0`, `v0.10.0`, `v0.10.1`.
+
+## Procedure
+
+### 1. Preconditions
+
+```sh
+git checkout main && git pull -p
+git status --short                      # must be clean
+gh run list --branch main --limit 5     # CI green on the commit you will tag
+```
+
+Never tag a commit whose CI is red or still running. A PyPI version is
+immutable: a bad upload can only be yanked, never replaced.
+
+### 2. Bump the literal — via PR, not on main
+
+```sh
+git checkout -b release/vX.Y.Z origin/main
+sed -i 's/^__version__ = ".*"/__version__ = "X.Y.Z"/' src/sofab/__init__.py
+git commit -am "chore(release): X.Y.Z"
+gh pr create --fill
+```
+
+Wait for green CI, merge, then delete the branch (remote + local).
+
+### 3. Tag the merged commit
+
+```sh
+git checkout main && git pull -p
+grep -n '^__version__' src/sofab/__init__.py   # must read X.Y.Z
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+Annotated (`-a`) matches the most recent tag, `v0.10.1`.
+
+### 4. Watch the publish
+
+The tag fires two workflows:
+
+- **`version-consistency.yml`** — tag vs. the literal vs. what an editable
+  install reports through `importlib.metadata`.
+- **`release.yml`** — the real one: `check-version` → `sdist` + `wheels`
+  (5 runners, CPython 3.9–3.14 × platforms) → `publish` (OIDC trusted
+  publishing, no token) → `verify-published` + `verify-file-set`.
+
+```sh
+gh run watch "$(gh run list --workflow release.yml --limit 1 --json databaseId -q '.[0].databaseId')"
+```
+
+Wheels take ~15–25 min per runner; the whole run is roughly 30–40 min.
+
+### 5. Confirm by hand
+
+```sh
+pip install sofa-buffers-corelib==X.Y.Z
+python -c "import sofab; print(sofab.__version__, sofab.IMPL)"
+```
+
+`IMPL` must print `native` on any platform that has a wheel — that is the point
+of shipping them. `python` means the wheel is a dud.
+
+### 6. GitHub Release (optional)
+
+`release.yml` does **not** create one. Only `v0.10.0` has a GitHub Release, so
+this is not established practice — ask before doing it.
+
+```sh
+gh release create vX.Y.Z --generate-notes
+```
+
+## When it fails
+
+- **After a failed publish, do not re-tag.** Fix the cause and re-run:
+  `gh run rerun <run-id> --repo sofa-buffers/corelib-py --failed`
+- **`invalid-publisher` on upload** — the OIDC identity is the matched triple
+  repo + workflow *filename* `release.yml` + environment `pypi`. Renaming or
+  moving `release.yml`, or changing the job's `environment:`, breaks publishing.
+  Never rename that file as part of a release.
+- **`sofab.__version__ != tag`** — the literal was not merged before tagging.
+  Delete the tag locally and remotely, merge the bump, tag again.
+- **sdist or wheel builds without the accelerator** — `setup.py` is deliberately
+  tolerant (`optional=True`) and degrades to pure Python. The build asserts
+  `IMPL == "native"` to turn that silent degradation into a failure; treat it as
+  a real build break, not a flake.
+- **`verify-published` cannot install yet** — the job already retries 20× at 15 s
+  for CDN propagation. A failure after that is real.
+
+## Not part of a release
+
+- **Docs** deploy from `docs.yml` on every push to `main`, not on a tag.
+- **`assets/test_vectors.json`** is synced by `shared-vectors.yml` (daily and on
+  PRs that touch it) — refresh it in its own PR, never inside a release PR.
