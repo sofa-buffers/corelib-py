@@ -32,12 +32,27 @@ grep -rn "$(grep -oP '^__version__\s*=\s*"\K[^"]+' src/sofab/__init__.py)" \
 Only `src/sofab/__init__.py` should come back. If a second hit appears, someone
 added a version literal — bump it too, or better, wire it to `__version__`.
 
-## Version spelling
+## Tag spelling
 
-`vX.Y.Z`, or a pre-release spelled the **PEP 440** way: `v0.11.0rc1`,
-**never** `v0.11.0-rc1`. The tag has to equal a Python version literal, and
-`release.yml` rejects anything else with
-`^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$`.
+**A release tag always begins with a lowercase `v`: `v1.2.3`.** Not `1.2.3`,
+not `V1.2.3`. The prefix is load-bearing in both directions — `release.yml` and
+`version-consistency.yml` trigger on `tags: ['v*']` (a case-sensitive glob) and
+then strip exactly that one character with `${GITHUB_REF_NAME#v}` to get the
+version. A tag spelled any other way is the worst kind of mistake here: nothing
+fails, because nothing runs at all. No build, no publish, no error — just a tag
+sitting in the repo and no release.
+
+After the `v`, the version is spelled the **PEP 440** way, because the tag has
+to equal a Python version literal verbatim:
+
+| Want | Tag |
+|---|---|
+| Release | `v1.2.3` |
+| Release candidate | `v1.2.3rc1` — **never** `v1.2.3-rc1` |
+| Alpha / beta | `v1.2.3a1`, `v1.2.3b1` |
+
+`release.yml` checks the part after the `v` against
+`^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$` and refuses anything else.
 
 Existing tags: `v0.9.0`, `v0.10.0`, `v0.10.1`.
 
@@ -70,7 +85,7 @@ Wait for green CI, merge, then delete the branch (remote + local).
 ```sh
 git checkout main && git pull -p
 grep -n '^__version__' src/sofab/__init__.py   # must read X.Y.Z
-git tag -a vX.Y.Z -m "vX.Y.Z"
+git tag -a vX.Y.Z -m "vX.Y.Z"      # lowercase v, PEP 440 after it
 git push origin vX.Y.Z
 ```
 
@@ -119,6 +134,10 @@ gh release create vX.Y.Z --generate-notes
   repo + workflow *filename* `release.yml` + environment `pypi`. Renaming or
   moving `release.yml`, or changing the job's `environment:`, breaks publishing.
   Never rename that file as part of a release.
+- **The tag is pushed and no workflow starts** — almost always the `v` prefix:
+  `tags: ['v*']` matched nothing. Check `gh run list --limit 5`; if it shows no
+  run for the tag, delete it and re-tag with the right spelling:
+  `git tag -d <tag> && git push origin :refs/tags/<tag>`
 - **`sofab.__version__ != tag`** — the literal was not merged before tagging.
   Delete the tag locally and remotely, merge the bump, tag again.
 - **sdist or wheel builds without the accelerator** — `setup.py` is deliberately
