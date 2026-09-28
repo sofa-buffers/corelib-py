@@ -158,7 +158,7 @@ class Entry:
 
     __slots__ = (
         "kind", "field_id", "at", "cap", "count_at", "child", "wt", "st",
-        "elem_lo", "elem_hi", "elem_bounded", "declared", "into",
+        "elem_lo", "elem_hi", "elem_bounded", "declared", "into", "which_at",
     )
 
     def __init__(
@@ -180,6 +180,11 @@ class Entry:
         self.cap = cap
         self.count_at = count_at
         self.child = child
+        # The ``words`` slot this row's *field id* is written to when the value
+        # arrives, or -1. Set by :meth:`Binding.freeze` from the owning table's
+        # ``which_at``, so the hot path reads it off the row it has already
+        # loaded rather than carrying a per-scope register (MESSAGE_SPEC §7.4.1).
+        self.which_at = -1
         # A string/blob row whose ``objects`` slot already holds the destination
         # (:meth:`Binding.string_into` / :meth:`Binding.blob_into`): the payload
         # is copied into it and no ``str``/``bytes`` is built (§6.6.3).
@@ -234,6 +239,26 @@ class Binding:
     no hook, nothing materialized, no cap spent, decode stays COMPLETE — and a
     nested sequence the table does not name is skipped whole.
 
+    ``which_at`` makes the table a **one-of**: its rows are alternatives, not
+    siblings, which is what a union is (MESSAGE_SPEC §4.2). The decoder writes the
+    arriving option's **field id** into that ``words`` slot on every correctly
+    typed arrival — after the §7.3 tag test, so a mistyped option and an id the
+    table does not name neither switch nor discard the held option — and the last
+    arrival wins (§7.4.1). Prepare the slot with the schema's ``default_id``: a
+    union that never arrives leaves it untouched, which is the same value an empty
+    union frame decodes to (§4.2), so absence needs no sentinel.
+
+    Every option kind here is **replaced whole** by its own arrival — a scalar and
+    a string/blob by their value, an array by its count and elements (§7.4) — so
+    nothing of a discarded option can reach a reader that consults ``which_at``
+    first. A ``struct``/``union`` option is the exception, because a later arrival
+    rewrites only the children it carries; :meth:`sequence` therefore refuses a
+    one-of table until the reset §7.4.1 asks for is implemented.
+
+    A one-of table should also be ``closed``: an option id a newer sender added is
+    an unknown id inside the union's scope, and an open table would hand it to the
+    visitor under the *parent's* identity (below).
+
     That is what a **child** table wants. The decoder descends into a bound
     sequence without telling the visitor, so the visitor still believes the walk
     is in the parent's scope, and an id the child does not name would reach it
@@ -245,11 +270,18 @@ class Binding:
 
     __slots__ = (
         "_entries", "_by_id", "_words_required", "_objects_required",
-        "_tree", "_compiled", "_frozen", "_closed",
+        "_tree", "_compiled", "_frozen", "_closed", "_which_at",
     )
 
-    def __init__(self, closed: bool = False) -> None:
+    def __init__(self, closed: bool = False, which_at: Any = None) -> None:
         self._closed = bool(closed)
+        if which_at is None:
+            self._which_at = -1
+        else:
+            slot = _index(which_at, "which slot")
+            if slot < 0:
+                raise SofaArgumentError(f"which slot {slot} out of range")
+            self._which_at = slot
         self._entries: list[Entry] = []
         self._by_id: dict[int, Entry] = {}
         self._words_required = 0
@@ -258,6 +290,8 @@ class Binding:
         # one-shot path, and walking the tree per decode would cost more than
         # the decode.
         self._tree: tuple[int, int] | None = None
+        if self._which_at >= 0:
+            self._words_required = self._which_at + 1
         # The native engine's compiled destination map, built on first use and
         # cached here: a Binding is build-once, so every Decoder over it reuses
         # the same map instead of recompiling per message.
@@ -270,6 +304,12 @@ class Binding:
     def entries(self) -> tuple[Entry, ...]:
         """The rows, in the order they were bound. The engines compile this."""
         return tuple(self._entries)
+
+    @property
+    def which_at(self) -> int:
+        """The ``words`` slot the arriving option's field id is written to, or
+        ``-1``. See :class:`Binding`."""
+        return self._which_at
 
     @property
     def closed(self) -> bool:
@@ -333,6 +373,13 @@ class Binding:
         reachable = self._reachable()
         for b in reachable:
             b._frozen = True
+            if b._which_at >= 0:
+                # Pushed onto the rows here rather than read off the table in
+                # the walk: at the store the row is already in hand, while the
+                # table is one indirection away and would have to live in a
+                # register across the whole field loop (corelib-py#164).
+                for e in b._entries:
+                    e.which_at = b._which_at
         return reachable
 
     def _reachable(self) -> list[Binding]:
@@ -621,6 +668,15 @@ class Binding:
             raise SofaArgumentError(f"field id {fid} out of range")
         if fid in self._by_id:
             raise SofaArgumentError(f"field id {fid} is already bound")
+        if kind == K_SEQUENCE and self._which_at >= 0:
+            # A struct/union option is the one option kind whose storage a later
+            # arrival does not fully rewrite, so MESSAGE_SPEC §7.4.1's "starts
+            # from its own default" needs an actual reset. Every other kind is
+            # replaced whole by its own arrival, which is why they need none.
+            raise SofaArgumentError(
+                "a sequence option in a one-of table is not supported yet "
+                "(MESSAGE_SPEC §7.4.1 needs the option reset)"
+            )
         slot = _index(at, "slot index")
         if slot < 0:
             raise SofaArgumentError(f"slot index {slot} out of range")
