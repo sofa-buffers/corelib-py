@@ -1777,6 +1777,20 @@ class Decoder:
         retry redoes the whole value — including refilling a partly written
         array from element zero (§5.2).
         """
+        if e.which_at >= 0:
+            # MESSAGE_SPEC §7.4.1: the held option of a union is the last
+            # correctly-typed occurrence of any option id, so the arriving
+            # option's id is what the caller needs. Written at the field: the
+            # §7.3 tag test is already behind us (a mistyped option never
+            # reaches here, so it neither switches nor discards the held one)
+            # and nothing below can un-arrive the option. Idempotent, which is
+            # what makes the resume path free.
+            #
+            # Read off the row, not off a per-scope register: measured both
+            # ways, this engine pays the same either way (~150 Ir a mapped
+            # field), and this is the same mechanism the accelerator uses, where
+            # the row is already in cache and the compare is free.
+            self._wu[e.which_at] = e.field_id
         self._settle_bound(e.declared)
         k = e.kind
         at = e.at

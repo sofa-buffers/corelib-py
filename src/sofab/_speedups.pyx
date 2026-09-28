@@ -1905,6 +1905,7 @@ cdef struct _BEntry:
     Py_ssize_t at           # slot in words[] (or objects[] for string/blob)
     Py_ssize_t cap          # array capacity / declared fixlen maxlen, 0 = none
     Py_ssize_t count_at     # slot to write arrival into, or -1
+    Py_ssize_t which_at     # one-of: slot to write the arriving option id, or -1
     int child               # table index of a sequence's child, or -1
     bint into               # string/blob: objects[at] already holds the buffer
     bint elem_bounded       # the schema declares the array's element width
@@ -2006,6 +2007,7 @@ cdef class _Compiled:
                 self.bent[k].at = <Py_ssize_t>e.at
                 self.bent[k].cap = <Py_ssize_t>e.cap
                 self.bent[k].count_at = <Py_ssize_t>e.count_at
+                self.bent[k].which_at = <Py_ssize_t>e.which_at
                 self.bent[k].child = <int>seen[id(e.child)] if e.child is not None else -1
                 self.bent[k].into = <bint>e.into
                 self.bent[k].elem_bounded = <bint>e.elem_bounded
@@ -4042,6 +4044,12 @@ cdef class Decoder:
         cdef uint64_t got
         cdef uint64_t u
         cdef int64_t sv
+        if e.which_at >= 0:
+            # MESSAGE_SPEC §7.4.1: the held option is the last correctly-typed
+            # occurrence of any option id. One store off the row already in
+            # hand -- no per-scope state, so a field outside a one-of scope pays
+            # a single compare against a value the cache line already carries.
+            self._words[e.which_at] = e.field_id
         if _K_ARRAY_UNSIGNED <= e.kind < _K_SEQUENCE:
             # A declared array's destination IS its schema bound. The array
             # kinds are one contiguous block ending just below _K_SEQUENCE
