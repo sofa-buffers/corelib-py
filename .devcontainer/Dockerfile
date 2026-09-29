@@ -89,8 +89,16 @@ RUN python${PYTHON_VERSION} -m ensurepip --upgrade 2>/dev/null || true \
 # this layer the container builds the package but cannot lint, type-check, test,
 # or measure coverage out of the box. Versions are left unpinned to track CI,
 # whose mypy floor is set by the oldest (3.9) leg — see the repo CI notes.
+#
+# Cython is the one exception: its constraint must be the SAME as the build
+# system's in pyproject.toml, because this layer is what `setup.py build_ext`
+# resolves against. Unpinned, the image picks up the 3.3.0 that pyproject
+# excludes by name, and the recompile this layer exists for fails outright
+# ("zero width for bit-field 'length'") — the container installs the package
+# through PEP 517, where the exclusion applies, and then cannot rebuild the
+# accelerator by hand.
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
-        "Cython>=3.0" \
+        "Cython>=3.0,!=3.3.0" \
         pytest \
         pytest-cov \
         coverage \
