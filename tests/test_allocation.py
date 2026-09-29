@@ -615,3 +615,57 @@ def _memoryviews(obj) -> int:
         if isinstance(v, memoryview):
             seen.add(id(v))
     return len(seen)
+
+
+# --- §7.4.1's option reset (#167) --------------------------------------------
+
+
+@pytest.mark.parametrize("enc_cls", ENCODERS)
+@pytest.mark.parametrize("dec_cls", DECODERS)
+def test_resetting_a_union_option_allocates_nothing_that_scales(dec_cls, enc_cls):
+    """A re-selected union option starts from its own default (MESSAGE_SPEC
+    §7.4.1), and the slots it starts from are ``Binding.freeze``'s, derived once
+    when the table is frozen.
+
+    So the reset is a walk over a prepared list: switching options a thousand
+    times must cost what switching twice costs. Measured rather than read,
+    because the native engine's own state is `malloc`'d and `tracemalloc` cannot
+    see it (§6.6.4, and the lesson corelib-py#131 left) — what this pins is that
+    nothing per switch is built on the Python heap either.
+    """
+
+    def run(switches):
+        enc = enc_cls()
+        for i in range(switches):
+            enc.write_sequence_begin_lazy(21)
+            # Alternating options: every frame but the first is a switch, which
+            # is the path this measures.
+            if i % 2:
+                enc.write_unsigned(0, i)
+            else:
+                enc.write_sequence_begin_lazy(1)
+                enc.write_signed(0, i)
+                enc.write_sequence_end()
+            enc.write_sequence_end()
+        enc.flush()
+        wire = enc.getvalue()
+
+        member = Binding(closed=True).signed(0, at=2, default=-7).signed(1, at=3)
+        option = Binding(closed=True, which_at=0, default_id=0)
+        option.unsigned(0, at=1)
+        option.sequence(1, member, count_at=4)
+        table = Binding(closed=True).sequence(21, option)
+        words = bytearray(table.tree_words_required * 8)
+
+        def work():
+            dec = dec_cls(**NO_CAPS, binding=table, words=words)
+            assert dec.feed(wire) is Status.COMPLETE
+
+        return _peak(work)
+
+    few = run(2)
+    many = run(2000)
+    assert many - few < FLAT, (
+        f"2000 option switches cost {many - few} bytes more than 2; the reset "
+        "is building something per switch"
+    )

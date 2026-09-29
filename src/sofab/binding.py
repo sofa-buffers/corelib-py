@@ -78,6 +78,7 @@ Example::
 
 from __future__ import annotations
 
+import struct
 from typing import Any
 
 from .types import (
@@ -138,6 +139,11 @@ KIND_TAG: tuple[tuple[WireType, FixlenSubtype | None], ...] = (
     (WireType.SEQUENCE_START, None),
 )
 
+#: Kinds that are one ``words`` slot holding one value -- the kinds that can
+#: carry a declared ``default`` for MESSAGE_SPEC §7.4.1's reset.
+_SCALAR_KINDS = frozenset(
+    (K_UNSIGNED, K_SIGNED, K_BOOLEAN, K_FLOAT32, K_FLOAT64)
+)
 #: Kinds whose ``at`` indexes ``objects`` rather than ``words``.
 _OBJECT_KINDS = frozenset((K_STRING, K_BYTES))
 #: Kinds that consume ``cap`` consecutive slots instead of one.
@@ -159,6 +165,7 @@ class Entry:
     __slots__ = (
         "kind", "field_id", "at", "cap", "count_at", "child", "wt", "st",
         "elem_lo", "elem_hi", "elem_bounded", "declared", "into", "which_at",
+        "own_words", "own_objects", "reset_words", "reset_objects",
     )
 
     def __init__(
@@ -173,6 +180,7 @@ class Entry:
         elem_hi: int = 0,
         elem_bounded: bool = False,
         into: bool = False,
+        default_bits: int = 0,
     ) -> None:
         self.kind = kind
         self.field_id = field_id
@@ -185,6 +193,32 @@ class Entry:
         # ``which_at``, so the hot path reads it off the row it has already
         # loaded rather than carrying a per-scope register (MESSAGE_SPEC §7.4.1).
         self.which_at = -1
+        # What this row starts from when its option is re-selected (§7.4.1). The
+        # slots are the row's own; ``reset_*`` is the same over the row's whole
+        # subtree and is what the decoder walks, filled by :meth:`Binding.freeze`
+        # for the rows of a one-of table and left empty for every other row.
+        own_words: list[tuple[int, int]] = []
+        own_objects: list[tuple[int, Any]] = []
+        if kind in _SCALAR_KINDS:
+            # One 64-bit pattern, whatever the kind: a signed default in two's
+            # complement and a float's as its ``double`` bits, so the reset is
+            # one loop over ``words`` rather than a branch per row.
+            own_words.append((at, default_bits))
+        elif kind in _OBJECT_KINDS and not into:
+            # §4.2 admits no non-empty default for a string/blob option, so the
+            # value it starts from is the empty one. An ``into`` row keeps the
+            # buffer the caller put there -- its length is ``count_at``, below.
+            own_objects.append((at, "" if kind == K_STRING else b""))
+        # An array starts empty and a string/blob ``into`` starts zero-length,
+        # which is what a count slot of 0 says; an array's elements are not
+        # touched, because ``count_at`` is what says how many of them are the
+        # value (§4.2: an array option's default is the empty array).
+        if count_at >= 0:
+            own_words.append((count_at, 0))
+        self.own_words = tuple(own_words)
+        self.own_objects = tuple(own_objects)
+        self.reset_words: tuple[tuple[int, int], ...] = ()
+        self.reset_objects: tuple[tuple[int, Any], ...] = ()
         # A string/blob row whose ``objects`` slot already holds the destination
         # (:meth:`Binding.string_into` / :meth:`Binding.blob_into`): the payload
         # is copied into it and no ``str``/``bytes`` is built (§6.6.3).
@@ -270,10 +304,15 @@ class Binding:
 
     __slots__ = (
         "_entries", "_by_id", "_words_required", "_objects_required",
-        "_tree", "_compiled", "_frozen", "_closed", "_which_at",
+        "_tree", "_compiled", "_frozen", "_closed", "_which_at", "_default_id",
     )
 
-    def __init__(self, closed: bool = False, which_at: Any = None) -> None:
+    def __init__(
+        self,
+        closed: bool = False,
+        which_at: Any = None,
+        default_id: Any = 0,
+    ) -> None:
         self._closed = bool(closed)
         if which_at is None:
             self._which_at = -1
@@ -282,6 +321,12 @@ class Binding:
             if slot < 0:
                 raise SofaArgumentError(f"which slot {slot} out of range")
             self._which_at = slot
+        # The option this union holds when none has arrived (§4.2). The caller
+        # prepares the top-level ``which_at`` slot with it, so the decoder needs
+        # it only for the reset of a *nested* union inside a re-selected option.
+        self._default_id = _index(default_id, "default id")
+        if self._default_id < 0 or self._default_id > ID_MAX:
+            raise SofaArgumentError(f"default id {self._default_id} out of range")
         self._entries: list[Entry] = []
         self._by_id: dict[int, Entry] = {}
         self._words_required = 0
@@ -310,6 +355,11 @@ class Binding:
         """The ``words`` slot the arriving option's field id is written to, or
         ``-1``. See :class:`Binding`."""
         return self._which_at
+
+    @property
+    def default_id(self) -> int:
+        """The option a one-of table holds when none has arrived (§4.2)."""
+        return self._default_id
 
     @property
     def closed(self) -> bool:
@@ -380,6 +430,7 @@ class Binding:
                 # register across the whole field loop (corelib-py#164).
                 for e in b._entries:
                     e.which_at = b._which_at
+                    e.reset_words, e.reset_objects = _option_reset(e)
         return reachable
 
     def _reachable(self) -> list[Binding]:
@@ -415,6 +466,7 @@ class Binding:
         at: int,
         count_at: int | None = None,
         max_value: int | None = None,
+        default: int | None = None,
     ) -> Binding:
         """Bind an unsigned-integer field to ``words`` slot ``at`` (``uint64``).
 
@@ -423,8 +475,18 @@ class Binding:
         whatever the field declares, so nothing about the storage enforces a
         narrower width, and MESSAGE_SPEC §1 then requires an explicit check:
         given, a value above it is INVALID at the value, before it is stored —
-        so a message truncated behind it is INVALID, not INCOMPLETE (§5.2)."""
-        return self._add(K_UNSIGNED, field_id, at, 0, count_at, None, None, max_value)
+        so a message truncated behind it is INVALID, not INCOMPLETE (§5.2).
+
+        ``default`` is the schema's declared default for this field, and it
+        matters for one thing only: a **union option** that is re-selected
+        starts from it (MESSAGE_SPEC §7.4.1). Outside a one-of table it is
+        ignored — an absent field leaves the slot exactly as the caller prepared
+        it, which is how a decode reports absence, and inventing a value there
+        would take that away."""
+        return self._add(
+            K_UNSIGNED, field_id, at, 0, count_at, None, None, max_value,
+            default=default,
+        )
 
     def signed(
         self,
@@ -433,17 +495,32 @@ class Binding:
         count_at: int | None = None,
         min_value: int | None = None,
         max_value: int | None = None,
+        default: int | None = None,
     ) -> Binding:
         """Bind a signed-integer field to ``words`` slot ``at`` (``int64``).
 
         ``min_value``/``max_value`` are the schema's declared width (``-128`` /
         ``127`` for an ``i8``, or for an ``enum`` whose constants all fit one);
-        see :meth:`unsigned`. Either side may be given on its own."""
+        see :meth:`unsigned`. Either side may be given on its own.
+
+        ``default`` is the schema's declared default for this field, and it
+        matters for one thing only: a **union option** that is re-selected
+        starts from it (MESSAGE_SPEC §7.4.1). Outside a one-of table it is
+        ignored — an absent field leaves the slot exactly as the caller prepared
+        it, which is how a decode reports absence, and inventing a value there
+        would take that away."""
         return self._add(
-            K_SIGNED, field_id, at, 0, count_at, None, min_value, max_value
+            K_SIGNED, field_id, at, 0, count_at, None, min_value, max_value,
+            default=default,
         )
 
-    def boolean(self, field_id: int, at: int, count_at: int | None = None) -> Binding:
+    def boolean(
+        self,
+        field_id: int,
+        at: int,
+        count_at: int | None = None,
+        default: int | None = None,
+    ) -> Binding:
         """Bind a boolean field to ``words`` slot ``at`` as ``0`` or ``1``.
 
         A boolean has no wire type of its own (§4.4) — it arrives as an unsigned
@@ -468,17 +545,60 @@ class Binding:
         at all, unlike an ``enum`` or a ``bitfield``, so binding one with a
         ceiling of ``1`` — which would make ``42`` INVALID — is exactly the
         reading the clause rules out.
+
+        ``default`` is the schema's declared default for this field, and it
+        matters for one thing only: a **union option** that is re-selected
+        starts from it (MESSAGE_SPEC §7.4.1). Outside a one-of table it is
+        ignored — an absent field leaves the slot exactly as the caller prepared
+        it, which is how a decode reports absence, and inventing a value there
+        would take that away.
+
+        A ``default`` follows the same tolerance: anything other than ``0`` is
+        stored as ``1``.
         """
-        return self._add(K_BOOLEAN, field_id, at, 0, count_at, None)
+        return self._add(K_BOOLEAN, field_id, at, 0, count_at, None,
+                         default=default)
 
-    def float32(self, field_id: int, at: int, count_at: int | None = None) -> Binding:
+    def float32(
+        self,
+        field_id: int,
+        at: int,
+        count_at: int | None = None,
+        default: float | None = None,
+    ) -> Binding:
         """Bind an ``fp32`` field to ``words`` slot ``at``, widened to a native
-        ``double`` (read it back through a ``.cast("d")`` view)."""
-        return self._add(K_FLOAT32, field_id, at, 0, count_at, None)
+        ``double`` (read it back through a ``.cast("d")`` view).
 
-    def float64(self, field_id: int, at: int, count_at: int | None = None) -> Binding:
-        """Bind an ``fp64`` field to ``words`` slot ``at`` as a ``double``."""
-        return self._add(K_FLOAT64, field_id, at, 0, count_at, None)
+        ``default`` is the schema's declared default for this field, and it
+        matters for one thing only: a **union option** that is re-selected
+        starts from it (MESSAGE_SPEC §7.4.1). Outside a one-of table it is
+        ignored — an absent field leaves the slot exactly as the caller prepared
+        it, which is how a decode reports absence, and inventing a value there
+        would take that away.
+
+        An ``fp32`` ``default`` is rounded through single precision, because
+        that is the value the field can hold.
+        """
+        return self._add(K_FLOAT32, field_id, at, 0, count_at, None,
+                         default=default)
+
+    def float64(
+        self,
+        field_id: int,
+        at: int,
+        count_at: int | None = None,
+        default: float | None = None,
+    ) -> Binding:
+        """Bind an ``fp64`` field to ``words`` slot ``at`` as a ``double``.
+
+        ``default`` is the schema's declared default for this field, and it
+        matters for one thing only: a **union option** that is re-selected
+        starts from it (MESSAGE_SPEC §7.4.1). Outside a one-of table it is
+        ignored — an absent field leaves the slot exactly as the caller prepared
+        it, which is how a decode reports absence, and inventing a value there
+        would take that away."""
+        return self._add(K_FLOAT64, field_id, at, 0, count_at, None,
+                         default=default)
 
     def string(
         self, field_id: int, at: int, maxlen: int = 0, count_at: int | None = None
@@ -657,6 +777,7 @@ class Binding:
         elem_lo: Any = None,
         elem_hi: Any = None,
         into: bool = False,
+        default: Any = None,
     ) -> Binding:
         if self._frozen:
             raise SofaArgumentError(
@@ -668,15 +789,6 @@ class Binding:
             raise SofaArgumentError(f"field id {fid} out of range")
         if fid in self._by_id:
             raise SofaArgumentError(f"field id {fid} is already bound")
-        if kind == K_SEQUENCE and self._which_at >= 0:
-            # A struct/union option is the one option kind whose storage a later
-            # arrival does not fully rewrite, so MESSAGE_SPEC §7.4.1's "starts
-            # from its own default" needs an actual reset. Every other kind is
-            # replaced whole by its own arrival, which is why they need none.
-            raise SofaArgumentError(
-                "a sequence option in a one-of table is not supported yet "
-                "(MESSAGE_SPEC §7.4.1 needs the option reset)"
-            )
         slot = _index(at, "slot index")
         if slot < 0:
             raise SofaArgumentError(f"slot index {slot} out of range")
@@ -706,11 +818,96 @@ class Binding:
             0 <= hi <= (SIGNED_MAX if signed else UNSIGNED_MAX)
         ):
             raise SofaArgumentError("declared element width out of range")
+        bits = 0 if default is None else _default_bits(kind, default, lo, hi)
         entry = Entry(kind, fid, slot, n, cnt, child, lo, hi,
-                      elem_lo is not None or elem_hi is not None, into)
+                      elem_lo is not None or elem_hi is not None, into, bits)
         self._entries.append(entry)
         self._by_id[fid] = entry
         return self
+
+
+def _default_bits(kind: int, default: Any, lo: int, hi: int) -> int:
+    """One 64-bit pattern for a declared ``default`` (§7.4.1, §2).
+
+    Stored the way the decode path stores the value it replaces — a signed
+    default in two's complement, a float's as its ``double`` bits — so the reset
+    writes ``words`` without knowing the kind. An ``fp32`` default is rounded
+    through single precision first, because that is the value an ``fp32`` field
+    can actually hold and therefore what its own arrival would leave.
+    """
+    if kind not in _SCALAR_KINDS:
+        raise SofaArgumentError(
+            "a default belongs to a scalar row: an array and a string/blob "
+            "option start empty, and a sequence option from its children (§4.2)"
+        )
+    if kind == K_FLOAT64 or kind == K_FLOAT32:
+        try:
+            # ``__float__`` rather than ``float()``, for the same reason
+            # :func:`_index` asks for ``__index__``: a string that happens to
+            # parse is a mistake, not a default.
+            value = default.__float__()
+        except AttributeError as exc:
+            raise SofaArgumentError(
+                f"default must be a real number, got {type(default).__name__}"
+            ) from exc
+        if kind == K_FLOAT32:
+            value = struct.unpack("<f", struct.pack("<f", value))[0]
+        packed: int = struct.unpack("<Q", struct.pack("<d", value))[0]
+        return packed
+    number = _index(default, "default")
+    if kind == K_BOOLEAN:
+        # §4.4: a boolean has two values and no declared width, so anything
+        # other than 0 is true -- the same normalisation the decode half does.
+        return 1 if number else 0
+    if not (lo <= number <= hi):
+        raise SofaArgumentError(
+            f"default {number} is outside the declared width {lo}..{hi}"
+        )
+    return number & 0xFFFF_FFFF_FFFF_FFFF
+
+
+def _option_reset(
+    e: Entry,
+) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, Any], ...]]:
+    """Every slot an option owns, and the value it starts from (§7.4.1).
+
+    Walked only when a *different* option arrives, which a conformant producer
+    never causes (§4.2 emits one child, §7.4 calls a repeated id not
+    well-formed), so this is built once here and the decode path just replays
+    it. Flat rather than recursive: a ``struct``/``union`` option's children —
+    and their children — are slots like any other, and a nested union's
+    ``which_at`` starts at its own ``default_id``.
+    """
+    words = list(e.own_words)
+    objects = list(e.own_objects)
+    child = e.child
+    if child is not None:
+        # A schema may be recursive, so each table is visited once: its rows
+        # write the same slots however often the cycle is walked.
+        seen = {id(child)}
+        stack = [child]
+        while stack:
+            table = stack.pop()
+            rows: tuple[Entry, ...] | list[Entry] = table._entries
+            if table._which_at >= 0:
+                words.append((table._which_at, table._default_id))
+                # §4.2: "A new union holds ``default_id`` at that option's own
+                # default", so a nested union contributes its which slot and the
+                # storage of *that one* option -- not of all of them. It matters
+                # whenever two options share a slot, which a union invites: only
+                # one of them is ever held, so overlapping them is legitimate,
+                # and writing every option's default would then leave whichever
+                # row came last.
+                held = table._by_id.get(table._default_id)
+                rows = () if held is None else (held,)
+            for row in rows:
+                words.extend(row.own_words)
+                objects.extend(row.own_objects)
+                grandchild = row.child
+                if grandchild is not None and id(grandchild) not in seen:
+                    seen.add(id(grandchild))
+                    stack.append(grandchild)
+    return tuple(words), tuple(objects)
 
 
 def _index(value: Any, what: str) -> int:

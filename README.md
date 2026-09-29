@@ -575,10 +575,17 @@ What follows from the caller owning the storage:
   option and an id the table does not name are skipped under §7.3 and therefore
   neither switch nor discard the held option. Read `words[N]` first, then only
   that option's slots: whatever a discarded option left behind is unreachable.
-  Every option kind a later arrival replaces *whole* works today — a scalar, a
-  `string`/`blob`, an array; a `struct`/`union` option is refused for now,
-  because §7.4.1 has it start again from its own default and that reset is not
-  built yet.
+  A **re-selected** option starts from its own default, which is the rest of
+  §7.4.1: a scalar, a `string`/`blob` and an array are replaced whole by their
+  own arrival, so they need nothing, while a `struct`/`union` option carries only
+  the children it sends — the ones it leaves out have to read as their defaults
+  again rather than as what the option held before it was discarded. Tell the
+  table those defaults: `default=` on the scalar binders, `default_id=` for a
+  union's own (a `string`/`blob`/`array` option needs none — §4.2 admits no
+  non-empty default for those). Outside a one-of table `default=` is ignored,
+  because an absent field must leave its slot exactly as you prepared it. The
+  reset walks a list derived once when the table is frozen, and only ever on
+  input a conformant sender never produces.
 * **A binding is build-once.** Building a decoder freezes the table and derives
   its destination map, so a table changed afterwards cannot leave a decoder
   reading a stale copy. The map is cached on the `Binding`, so building a decoder
