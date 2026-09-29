@@ -1794,6 +1794,24 @@ class Decoder:
         if objects is not None:
             for slot, value in e.reset_objects:
                 objects[slot] = value
+            for slot, payload in e.reset_into:
+                # A ``string_into``/``blob_into`` member with a declared default:
+                # the slot holds the caller's buffer, so the default is copied in
+                # and the length slot (written above, with ``reset_words``) already
+                # says how much of it is live. The buffer is checked exactly as an
+                # arriving payload's destination is (§6.3) -- one rule, one
+                # verdict, whichever put the bytes there (§5.3.1).
+                view = _writable(objects[slot], "a declared default")
+                if view.itemsize != 1:
+                    raise SofaArgumentError(
+                        "a declared default's destination must hold single bytes"
+                    )
+                if view.nbytes < len(payload):
+                    raise SofaArgumentError(
+                        f"a declared default's destination gave {view.nbytes} "
+                        f"bytes for a default of {len(payload)}"
+                    )
+                view[:len(payload)] = payload
 
     def _mapped_field(self, e: Entry) -> None:
         """A field the handler's declared destination map names.

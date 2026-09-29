@@ -79,6 +79,7 @@ Example::
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 from typing import Any
 
 from .types import (
@@ -92,6 +93,10 @@ from .types import (
     SofaArgumentError,
     WireType,
 )
+
+#: ``bytes`` under a name the class body does not shadow -- :meth:`Binding.bytes`
+#: is a binder method, so a ``bytes`` annotation inside the class means that.
+_Bytes = bytes
 
 # --- entry kinds -------------------------------------------------------------
 #
@@ -165,7 +170,8 @@ class Entry:
     __slots__ = (
         "kind", "field_id", "at", "cap", "count_at", "child", "wt", "st",
         "elem_lo", "elem_hi", "elem_bounded", "declared", "into", "which_at",
-        "own_words", "own_objects", "reset_words", "reset_objects",
+        "own_words", "own_objects", "own_into", "reset_words", "reset_objects",
+        "reset_into",
     )
 
     def __init__(
@@ -181,6 +187,7 @@ class Entry:
         elem_bounded: bool = False,
         into: bool = False,
         default_bits: int = 0,
+        default_value: Any = None,
     ) -> None:
         self.kind = kind
         self.field_id = field_id
@@ -199,26 +206,56 @@ class Entry:
         # for the rows of a one-of table and left empty for every other row.
         own_words: list[tuple[int, int]] = []
         own_objects: list[tuple[int, Any]] = []
+        own_into: list[tuple[int, bytes]] = []
         if kind in _SCALAR_KINDS:
             # One 64-bit pattern, whatever the kind: a signed default in two's
             # complement and a float's as its ``double`` bits, so the reset is
             # one loop over ``words`` rather than a branch per row.
             own_words.append((at, default_bits))
         elif kind in _OBJECT_KINDS and not into:
-            # §4.2 admits no non-empty default for a string/blob option, so the
-            # value it starts from is the empty one. An ``into`` row keeps the
-            # buffer the caller put there -- its length is ``count_at``, below.
-            own_objects.append((at, "" if kind == K_STRING else b""))
-        # An array starts empty and a string/blob ``into`` starts zero-length,
-        # which is what a count slot of 0 says; an array's elements are not
-        # touched, because ``count_at`` is what says how many of them are the
-        # value (§4.2: an array option's default is the empty array).
+            # The declared ``default`` if the row has one, else the empty value.
+            # §4.2 refuses a non-empty default for a string/blob *option*, but a
+            # *member* of a struct option is an ordinary field and may declare
+            # one; the value object is immutable and prepared here, so the reset
+            # stores a reference and allocates nothing (CORELIB_PLAN §6.6). An
+            # ``into`` row keeps the buffer the caller put there -- its length is
+            # ``count_at``, below.
+            if default_value is None:
+                own_objects.append((at, "" if kind == K_STRING else b""))
+            else:
+                own_objects.append((at, default_value))
+        elif kind in _OBJECT_KINDS and default_value is not None:
+            # An ``into`` row: the slot holds the caller's buffer, not the value,
+            # so the default cannot be stored -- it has to be *copied in*, and the
+            # length slot says how much of the buffer is live. Prepared as bytes
+            # here (a string default UTF-8-encoded once), so the reset is a slice
+            # assignment with nothing to build.
+            own_into.append((at, default_value))
+        elif kind in _ARRAY_KINDS and default_value is not None:
+            # An array's declared default, element by element, in the same
+            # ``words`` encoding the decode path stores: the elements are slots
+            # like any other, so the reset stays one loop with no branch per row.
+            for offset, word in enumerate(default_value):
+                own_words.append((at + offset, word))
+        # Without a declared default an array starts empty and a string/blob
+        # ``into`` starts zero-length, which is what a count slot of 0 says; with
+        # one, the count is the default's own length. An array's untouched
+        # elements past that length are not written, because ``count_at`` is what
+        # says how many of them are the value (§4.2, §5.1).
         if count_at >= 0:
-            own_words.append((count_at, 0))
+            n_arrived = 0
+            if default_value is not None and (
+                kind in _ARRAY_KINDS or (kind in _OBJECT_KINDS and into)
+            ):
+                # An array's element count, or an ``into`` default's byte length.
+                n_arrived = len(default_value)
+            own_words.append((count_at, n_arrived))
         self.own_words = tuple(own_words)
         self.own_objects = tuple(own_objects)
+        self.own_into = tuple(own_into)
         self.reset_words: tuple[tuple[int, int], ...] = ()
         self.reset_objects: tuple[tuple[int, Any], ...] = ()
+        self.reset_into: tuple[tuple[int, bytes], ...] = ()
         # A string/blob row whose ``objects`` slot already holds the destination
         # (:meth:`Binding.string_into` / :meth:`Binding.blob_into`): the payload
         # is copied into it and no ``str``/``bytes`` is built (§6.6.3).
@@ -430,7 +467,8 @@ class Binding:
                 # register across the whole field loop (corelib-py#164).
                 for e in b._entries:
                     e.which_at = b._which_at
-                    e.reset_words, e.reset_objects = _option_reset(e)
+                    (e.reset_words, e.reset_objects,
+                     e.reset_into) = _option_reset(e)
         return reachable
 
     def _reachable(self) -> list[Binding]:
@@ -601,7 +639,12 @@ class Binding:
                          default=default)
 
     def string(
-        self, field_id: int, at: int, maxlen: int = 0, count_at: int | None = None
+        self,
+        field_id: int,
+        at: int,
+        maxlen: int = 0,
+        count_at: int | None = None,
+        default: str | None = None,
     ) -> Binding:
         """Bind a UTF-8 ``string`` field to ``objects[at]``.
 
@@ -610,17 +653,29 @@ class Binding:
         a longer payload is INVALID (MESSAGE_SPEC §7.1) and the receiver-side
         ``max_dyn_string_len`` cap no longer applies to it (§6.2.1). Left at ``0``
         the cap applies as usual."""
-        return self._add(K_STRING, field_id, at, maxlen, count_at, None)
+        return self._add(K_STRING, field_id, at, maxlen, count_at, None,
+                         default=default)
 
     def bytes(
-        self, field_id: int, at: int, maxlen: int = 0, count_at: int | None = None
+        self,
+        field_id: int,
+        at: int,
+        maxlen: int = 0,
+        count_at: int | None = None,
+        default: _Bytes | None = None,
     ) -> Binding:
         """Bind a ``blob`` field to ``objects[at]``; see :meth:`string` for
         ``maxlen``."""
-        return self._add(K_BYTES, field_id, at, maxlen, count_at, None)
+        return self._add(K_BYTES, field_id, at, maxlen, count_at, None,
+                         default=default)
 
     def string_into(
-        self, field_id: int, at: int, maxlen: int = 0, count_at: int | None = None
+        self,
+        field_id: int,
+        at: int,
+        maxlen: int = 0,
+        count_at: int | None = None,
+        default: str | None = None,
     ) -> Binding:
         """Bind a UTF-8 ``string`` field **into the buffer already in**
         ``objects[at]`` — no ``str`` is built.
@@ -657,16 +712,23 @@ class Binding:
         buffer there sized it itself. What bounds this field is the buffer, and a
         payload past it is refused at the length word before a byte is copied.
         """
-        return self._add(K_STRING, field_id, at, maxlen, count_at, None, into=True)
+        return self._add(K_STRING, field_id, at, maxlen, count_at, None,
+                         into=True, default=default)
 
     def blob_into(
-        self, field_id: int, at: int, maxlen: int = 0, count_at: int | None = None
+        self,
+        field_id: int,
+        at: int,
+        maxlen: int = 0,
+        count_at: int | None = None,
+        default: _Bytes | None = None,
     ) -> Binding:
         """Bind a ``blob`` field into the buffer already in ``objects[at]``; see
         :meth:`string_into`. The only difference is the one :meth:`bytes` has
         from :meth:`string` — the payload is copied verbatim and not validated as
         UTF-8."""
-        return self._add(K_BYTES, field_id, at, maxlen, count_at, None, into=True)
+        return self._add(K_BYTES, field_id, at, maxlen, count_at, None,
+                         into=True, default=default)
 
     def unsigned_array(
         self,
@@ -675,6 +737,7 @@ class Binding:
         cap: int,
         count_at: int | None = None,
         elem_max: int | None = None,
+        default: Sequence[int] | None = None,
     ) -> Binding:
         """Bind an unsigned-integer array to ``words[at:at + cap]``.
 
@@ -687,7 +750,8 @@ class Binding:
         before the element is stored, so a too-wide value is INVALID at the
         element that carries it rather than after the array completes."""
         return self._add(
-            K_ARRAY_UNSIGNED, field_id, at, cap, count_at, None, 0, elem_max
+            K_ARRAY_UNSIGNED, field_id, at, cap, count_at, None, 0, elem_max,
+            default=default
         )
 
     def signed_array(
@@ -698,17 +762,24 @@ class Binding:
         count_at: int | None = None,
         elem_min: int | None = None,
         elem_max: int | None = None,
+        default: Sequence[int] | None = None,
     ) -> Binding:
         """Bind a signed-integer array to ``words[at:at + cap]`` (``int64``).
 
         The two halves of the declared width are independent: either may be
         given on its own and bounds its own side (see :meth:`unsigned_array`)."""
         return self._add(
-            K_ARRAY_SIGNED, field_id, at, cap, count_at, None, elem_min, elem_max
+            K_ARRAY_SIGNED, field_id, at, cap, count_at, None, elem_min, elem_max,
+            default=default
         )
 
     def boolean_array(
-        self, field_id: int, at: int, cap: int, count_at: int | None = None
+        self,
+        field_id: int,
+        at: int,
+        cap: int,
+        count_at: int | None = None,
+        default: Sequence[bool] | None = None,
     ) -> Binding:
         """Bind an array of booleans to ``words[at:at + cap]`` as ``0``/``1``.
 
@@ -729,20 +800,33 @@ class Binding:
         already have written ``count_at`` (see :class:`Binding`). The next
         :meth:`sofab.Decoder.feed` refills the array from element zero, so what
         a **completed** decode leaves is always ``0``/``1``."""
-        return self._add(K_ARRAY_BOOLEAN, field_id, at, cap, count_at, None)
+        return self._add(K_ARRAY_BOOLEAN, field_id, at, cap, count_at, None,
+                         default=default)
 
     def float32_array(
-        self, field_id: int, at: int, cap: int, count_at: int | None = None
+        self,
+        field_id: int,
+        at: int,
+        cap: int,
+        count_at: int | None = None,
+        default: Sequence[float] | None = None,
     ) -> Binding:
         """Bind an ``fp32`` array to ``words[at:at + cap]``, widened to
         ``double`` per element."""
-        return self._add(K_ARRAY_FLOAT32, field_id, at, cap, count_at, None)
+        return self._add(K_ARRAY_FLOAT32, field_id, at, cap, count_at, None,
+                         default=default)
 
     def float64_array(
-        self, field_id: int, at: int, cap: int, count_at: int | None = None
+        self,
+        field_id: int,
+        at: int,
+        cap: int,
+        count_at: int | None = None,
+        default: Sequence[float] | None = None,
     ) -> Binding:
         """Bind an ``fp64`` array to ``words[at:at + cap]``."""
-        return self._add(K_ARRAY_FLOAT64, field_id, at, cap, count_at, None)
+        return self._add(K_ARRAY_FLOAT64, field_id, at, cap, count_at, None,
+                         default=default)
 
     def sequence(
         self, field_id: int, child: Binding, count_at: int | None = None
@@ -818,12 +902,121 @@ class Binding:
             0 <= hi <= (SIGNED_MAX if signed else UNSIGNED_MAX)
         ):
             raise SofaArgumentError("declared element width out of range")
-        bits = 0 if default is None else _default_bits(kind, default, lo, hi)
+        bits = 0
+        dval: Any = None
+        if default is not None:
+            if kind in _SCALAR_KINDS:
+                bits = _default_bits(kind, default, lo, hi)
+            else:
+                dval = self._default_payload(kind, default, n, lo, hi, into)
         entry = Entry(kind, fid, slot, n, cnt, child, lo, hi,
-                      elem_lo is not None or elem_hi is not None, into, bits)
+                      elem_lo is not None or elem_hi is not None, into, bits,
+                      dval)
         self._entries.append(entry)
         self._by_id[fid] = entry
         return self
+
+
+    def _default_payload(
+        self, kind: int, default: Any, cap: int, lo: int, hi: int, into: bool
+    ) -> Any:
+        """A ``string``/``blob``/``array`` default, prepared for the reset.
+
+        §4.2 refuses a non-empty ``default`` on a union *option* of these kinds,
+        and that rule is checked here rather than by kind: whether a row is an
+        option is whether *this table* is a one-of, which is known at bind time.
+        A member of a struct option is a row of an ordinary child table and
+        carries no such restriction — which is the whole of corelib-py#169.
+
+        Whether the row is *inside* a one-of subtree is not known until
+        :meth:`freeze` walks the tree, so a default outside one is accepted and
+        then ignored, exactly as a scalar ``default=`` is.
+        """
+        if kind == K_SEQUENCE:
+            raise SofaArgumentError(
+                "a struct/union row takes no default: it starts from the rows of "
+                "its child table (§4.2)"
+            )
+        if self._which_at >= 0:
+            raise SofaArgumentError(
+                "a string/blob/array option must not declare a non-empty "
+                "default; it starts empty (§4.2). A member of a struct option "
+                "may declare one"
+            )
+        if kind in _OBJECT_KINDS:
+            value = _default_object(kind, default, cap)
+            if into:
+                # The reset copies into the caller's buffer, so the value it
+                # copies is bytes whatever the kind: a string default is encoded
+                # once here rather than per reset.
+                return value.encode("utf-8") if kind == K_STRING else value
+            return value
+        return _default_elements(kind, default, cap, lo, hi)
+
+
+def _default_object(kind: int, default: Any, cap: int) -> Any:
+    """A ``string``/``blob`` default: the immutable value the reset stores.
+
+    The length is checked the way the schema checks it (SCHEMA_SPEC: a ``string``
+    default's length ≤ ``maxlen``, a ``blob``'s decoded length ≤ ``maxlen``) —
+    against the declared bound, in **bytes**, because that is what ``maxlen``
+    counts and what the wire would have carried.
+    """
+    if kind == K_STRING:
+        if not isinstance(default, str):
+            raise SofaArgumentError(
+                f"a string default must be str, got {type(default).__name__}"
+            )
+        value: Any = default
+        length = len(default.encode("utf-8"))
+    else:
+        if isinstance(default, str):
+            raise SofaArgumentError("a blob default must be bytes, not str")
+        try:
+            value = bytes(default)
+        except TypeError as exc:
+            raise SofaArgumentError(
+                f"a blob default must be bytes-like, got {type(default).__name__}"
+            ) from exc
+        length = len(value)
+    if cap and length > cap:
+        raise SofaArgumentError(
+            f"default of {length} bytes is longer than the declared maxlen {cap}"
+        )
+    return value
+
+
+def _default_elements(
+    kind: int, default: Any, cap: int, lo: int, hi: int
+) -> tuple[int, ...]:
+    """An array default, as one ``words`` value per element.
+
+    Each element goes through the same normalisation its own arrival would get:
+    a signed element in two's complement, a boolean through §4.4's "anything
+    other than 0 is true", a float as its ``double`` bits (an ``fp32`` rounded
+    through single precision first, like a scalar ``fp32`` default). The count is
+    checked against ``cap``, which is the schema's element count (SCHEMA_SPEC: an
+    array default's length ≤ ``items.count``).
+    """
+    try:
+        values = tuple(default)
+    except TypeError as exc:
+        raise SofaArgumentError(
+            f"an array default must be iterable, got {type(default).__name__}"
+        ) from exc
+    if len(values) > cap:
+        raise SofaArgumentError(
+            f"default of {len(values)} elements is longer than the declared "
+            f"capacity {cap}"
+        )
+    scalar_of = {
+        K_ARRAY_UNSIGNED: K_UNSIGNED,
+        K_ARRAY_SIGNED: K_SIGNED,
+        K_ARRAY_BOOLEAN: K_BOOLEAN,
+        K_ARRAY_FLOAT32: K_FLOAT32,
+        K_ARRAY_FLOAT64: K_FLOAT64,
+    }[kind]
+    return tuple(_default_bits(scalar_of, v, lo, hi) for v in values)
 
 
 def _default_bits(kind: int, default: Any, lo: int, hi: int) -> int:
@@ -837,8 +1030,9 @@ def _default_bits(kind: int, default: Any, lo: int, hi: int) -> int:
     """
     if kind not in _SCALAR_KINDS:
         raise SofaArgumentError(
-            "a default belongs to a scalar row: an array and a string/blob "
-            "option start empty, and a sequence option from its children (§4.2)"
+            "a default belongs to a scalar row or an array element; a "
+            "string/blob row goes through _default_object and a struct/union "
+            "row starts from its children (§4.2)"
         )
     if kind == K_FLOAT64 or kind == K_FLOAT32:
         try:
@@ -868,7 +1062,11 @@ def _default_bits(kind: int, default: Any, lo: int, hi: int) -> int:
 
 def _option_reset(
     e: Entry,
-) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, Any], ...]]:
+) -> tuple[
+    tuple[tuple[int, int], ...],
+    tuple[tuple[int, Any], ...],
+    tuple[tuple[int, bytes], ...],
+]:
     """Every slot an option owns, and the value it starts from (§7.4.1).
 
     Walked only when a *different* option arrives, which a conformant producer
@@ -880,6 +1078,7 @@ def _option_reset(
     """
     words = list(e.own_words)
     objects = list(e.own_objects)
+    into = list(e.own_into)
     child = e.child
     if child is not None:
         # A schema may be recursive, so each table is visited once: its rows
@@ -903,11 +1102,12 @@ def _option_reset(
             for row in rows:
                 words.extend(row.own_words)
                 objects.extend(row.own_objects)
+                into.extend(row.own_into)
                 grandchild = row.child
                 if grandchild is not None and id(grandchild) not in seen:
                     seen.add(id(grandchild))
                     stack.append(grandchild)
-    return tuple(words), tuple(objects)
+    return tuple(words), tuple(objects), tuple(into)
 
 
 def _index(value: Any, what: str) -> int:
