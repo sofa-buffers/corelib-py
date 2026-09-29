@@ -580,12 +580,20 @@ What follows from the caller owning the storage:
   own arrival, so they need nothing, while a `struct`/`union` option carries only
   the children it sends — the ones it leaves out have to read as their defaults
   again rather than as what the option held before it was discarded. Tell the
-  table those defaults: `default=` on the scalar binders, `default_id=` for a
-  union's own (a `string`/`blob`/`array` option needs none — §4.2 admits no
-  non-empty default for those). Outside a one-of table `default=` is ignored,
-  because an absent field must leave its slot exactly as you prepared it. The
-  reset walks a list derived once when the table is frozen, and only ever on
-  input a conformant sender never produces.
+  table those defaults: `default=` on **every** binder that takes a value, and
+  `default_id=` for a union's own. A `string`/`blob` default is a `str`/`bytes`
+  and an array's is a sequence of elements, each checked against the row's
+  declared `maxlen`, capacity and element width. A `string_into`/`blob_into`
+  default is **copied into the buffer you put there**, and the `count_at` slot
+  receives its byte length — a buffer that is missing, read-only or shorter than
+  the default is refused the way an arriving payload's destination is (§6.3).
+  §4.2 still admits no non-empty default on a row that *is* an option, because
+  such an option is replaced whole; a **member** of a `struct` option is an
+  ordinary field and may declare any default its type allows. Outside a one-of
+  table `default=` is ignored, because an absent field must leave its slot
+  exactly as you prepared it. The reset walks a list derived once when the table
+  is frozen — and it is not a rare path: a message holding any option other than
+  `default_id` runs it, which §4.2 says a conformant encoder always writes.
 * **A binding is build-once.** Building a decoder freezes the table and derives
   its destination map, so a table changed afterwards cannot leave a decoder
   reading a stale copy. The map is cached on the `Binding`, so building a decoder

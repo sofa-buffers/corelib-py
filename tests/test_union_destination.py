@@ -423,9 +423,87 @@ def test_a_string_option_starts_empty_again(engine):
     assert objects[0] == ""
 
 
-def test_a_default_belongs_to_a_scalar_row():
-    with pytest.raises(Exception, match="default belongs to a scalar row"):
-        Binding()._add(11, 1, 0, 4, None, None, default=3)  # an array kind
+def test_an_option_row_may_not_declare_a_non_empty_default():
+    # §4.2: a string/blob/array OPTION starts empty. Which rows are options is
+    # what `which_at` says, so the refusal hangs off the table, not off the kind
+    # -- a member of a struct option is an ordinary row (corelib-py#169).
+    one_of = Binding(closed=True, which_at=0)
+    with pytest.raises(Exception, match="must not declare a non-empty default"):
+        one_of.string(1, at=0, default="abc")
+    with pytest.raises(Exception, match="must not declare a non-empty default"):
+        one_of.unsigned_array(2, at=1, cap=4, default=(1, 2))
+    # The same rows in an ordinary table take it.
+    plain = Binding(closed=True)
+    plain.string(1, at=0, default="abc")
+    plain.unsigned_array(2, at=1, cap=4, count_at=5, default=(1, 2))
+
+
+def test_a_struct_union_row_takes_no_default():
+    # Through `_add`: `sequence()` exposes no `default=`, and this is the guard
+    # that keeps it that way. Kind 12 is K_SEQUENCE.
+    with pytest.raises(Exception, match="starts from the rows of its child"):
+        Binding()._add(12, 1, 0, 0, None, Binding(), default=3)
+
+
+def test_an_into_default_is_prepared_as_bytes():
+    # The slot holds the caller's buffer, so the default cannot be *stored* --
+    # it is copied in, and what is copied is bytes whatever the kind: a string
+    # default is UTF-8-encoded once at bind time, not per reset.
+    b = Binding(closed=True, which_at=0)
+    member = Binding(closed=True)
+    member.string_into(0, at=0, maxlen=8, count_at=1, default="ab\u00e4")
+    member.blob_into(1, at=1, maxlen=4, count_at=2, default=b"\x01\x02")
+    b.unsigned(0, at=3)
+    b.sequence(1, member)
+    b.freeze()
+    row = b._by_id[1]
+    assert row.reset_into == ((0, "ab\u00e4".encode()), (1, b"\x01\x02"))
+    # The length slot carries the default's BYTE length, not its character count.
+    plan = dict(row.reset_words)
+    assert plan[1] == 4, "'ab\u00e4' is four bytes"
+    assert plan[2] == 2
+    # An into row's own_objects stays empty: the caller's buffer is never
+    # replaced, only written into.
+    assert row.reset_objects == ()
+
+
+def test_a_default_that_does_not_fit_the_declared_bound_is_refused():
+    with pytest.raises(Exception, match="longer than the declared maxlen"):
+        Binding().string(1, at=0, maxlen=2, default="abcd")
+    with pytest.raises(Exception, match="longer than the declared capacity"):
+        Binding().unsigned_array(1, at=0, cap=2, default=(1, 2, 3))
+    # A string's maxlen counts BYTES, so a multi-byte character fills it faster.
+    with pytest.raises(Exception, match="longer than the declared maxlen"):
+        Binding().string(1, at=0, maxlen=2, default="\u00e4\u00f6")
+
+
+def test_an_array_default_is_checked_element_by_element():
+    with pytest.raises(Exception, match="outside the declared width"):
+        Binding().unsigned_array(1, at=0, cap=4, elem_max=0xFF, default=(1, 256))
+    with pytest.raises(Exception, match="must be iterable"):
+        Binding().unsigned_array(1, at=0, cap=4, default=3)
+    with pytest.raises(Exception, match="must be str"):
+        Binding().string(1, at=0, default=b"abc")
+    with pytest.raises(Exception, match="must be bytes, not str"):
+        Binding().bytes(1, at=0, default="abc")
+
+
+def test_an_array_default_normalizes_each_element_like_its_own_arrival():
+    import struct as _struct
+    b = Binding(closed=True, which_at=0)
+    member = Binding(closed=True)
+    member.boolean_array(0, at=1, cap=2, count_at=3, default=(42, 0))
+    member.float32_array(1, at=4, cap=2, count_at=6, default=(0.1,))
+    b.unsigned(0, at=7)
+    b.sequence(1, member)
+    b.freeze()
+    plan = dict(b._by_id[1].reset_words)
+    assert (plan[1], plan[2]) == (1, 0), "§4.4: anything other than 0 is true"
+    assert plan[3] == 2, "the count is the default's own length"
+    f32 = _struct.unpack("<Q", _struct.pack("<d", _struct.unpack(
+        "<f", _struct.pack("<f", 0.1))[0]))[0]
+    assert plan[4] == f32, "an fp32 element is the value an fp32 array can hold"
+    assert plan[6] == 1
 
 
 def test_a_float_default_that_is_not_a_number_is_refused():
