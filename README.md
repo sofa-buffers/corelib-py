@@ -565,6 +565,20 @@ What follows from the caller owning the storage:
 * **Nested messages share the same storage.** `b.sequence(id, child)` descends
   into a child table in the same two buffers, so a whole tree decodes into one
   flat pair. A sequence with no binding is skipped whole.
+* **A union's held option is one slot.** A child table built with
+  `Binding(closed=True, which_at=N)` says its rows are *alternatives*, not
+  siblings — which is what a union is (MESSAGE_SPEC §4.2: a sequence carrying one
+  child, whose id is the only tag it has). The decoder writes the arriving
+  option's **field id** into `words[N]` on every correctly typed arrival, so the
+  last one wins (§7.4.1); prepare the slot with the schema's `default_id` and an
+  absent union needs no sentinel, exactly like every other slot. A mistyped
+  option and an id the table does not name are skipped under §7.3 and therefore
+  neither switch nor discard the held option. Read `words[N]` first, then only
+  that option's slots: whatever a discarded option left behind is unreachable.
+  Every option kind a later arrival replaces *whole* works today — a scalar, a
+  `string`/`blob`, an array; a `struct`/`union` option is refused for now,
+  because §7.4.1 has it start again from its own default and that reset is not
+  built yet.
 * **A binding is build-once.** Building a decoder freezes the table and derives
   its destination map, so a table changed afterwards cannot leave a decoder
   reading a stale copy. The map is cached on the `Binding`, so building a decoder
