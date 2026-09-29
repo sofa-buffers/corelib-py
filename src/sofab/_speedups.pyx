@@ -1911,6 +1911,14 @@ cdef struct _BEntry:
     bint elem_bounded       # the schema declares the array's element width
     int64_t elem_lo
     uint64_t elem_hi
+    # MESSAGE_SPEC §7.4.1's reset payload for this row, as a slice of the
+    # _Compiled's two flat arrays. -1/0 for a row that is not an option.
+    Py_ssize_t reset_w_at
+    Py_ssize_t reset_w_n
+    Py_ssize_t reset_o_at
+    Py_ssize_t reset_o_n
+    Py_ssize_t reset_i_at
+    Py_ssize_t reset_i_n
 
 
 cdef struct _BTable:
@@ -1938,14 +1946,29 @@ cdef class _Compiled:
     cdef int ntab
     cdef Py_ssize_t words_required
     cdef Py_ssize_t objects_required
-    # Per entry, what a re-selected option starts from (MESSAGE_SPEC §7.4.1):
-    # ``sofab.Binding.freeze``'s own tuples, indexed by entry, ``None`` for a row
-    # that is not an option. Kept as Python objects on purpose -- this is the one
-    # path a conformant producer never reaches (§4.2 emits one child per union
-    # frame, §7.4 calls a repeated id not well-formed), so it buys correctness
-    # with no C allocation to own, free or leak.
-    cdef list reset_w
-    cdef list reset_o
+    # What a re-selected option starts from (MESSAGE_SPEC §7.4.1), flattened out
+    # of ``sofab.Binding.freeze``'s per-row tuples into two arrays every row
+    # slices into (``_BEntry.reset_w_at`` / ``reset_o_at``).
+    #
+    # In C, not as Python tuples, because the reset is NOT the rare path the
+    # first cut assumed. ``which_at`` is prepared with the schema's ``default_id``
+    # (§4.2), so every message whose held option is a different one -- which §4.2
+    # says a conformant encoder ALWAYS writes -- switches the option and runs
+    # this. It is once per message, not once in a blue moon: measured at 678 of
+    # ~6900 Ir/message for a struct option with four members (corelib-py#169,
+    # bench/union_struct_option_shapes.py). The word half is what that buys; the
+    # object half keeps its values in a Python list, because a str/bytes is a
+    # reference this array cannot own.
+    cdef Py_ssize_t* rw_slot
+    cdef uint64_t* rw_val
+    cdef Py_ssize_t nrw
+    cdef Py_ssize_t* ro_slot
+    cdef list ro_val
+    # The ``string_into``/``blob_into`` half: a slot holding the CALLER's buffer
+    # plus the bytes to copy into it. Separate from ``ro_*`` because this one
+    # copies rather than stores, and can refuse the buffer (§6.3).
+    cdef Py_ssize_t* ri_slot
+    cdef list ri_val
 
     def __cinit__(self):
         self.bent = NULL
@@ -1954,8 +1977,13 @@ cdef class _Compiled:
         self.ntab = 0
         self.words_required = 0
         self.objects_required = 0
-        self.reset_w = []
-        self.reset_o = []
+        self.rw_slot = NULL
+        self.rw_val = NULL
+        self.nrw = 0
+        self.ro_slot = NULL
+        self.ro_val = []
+        self.ri_slot = NULL
+        self.ri_val = []
 
     def __dealloc__(self):
         cdef int i
@@ -1968,6 +1996,18 @@ cdef class _Compiled:
         if self.bent != NULL:
             free(self.bent)
             self.bent = NULL
+        if self.rw_slot != NULL:
+            free(self.rw_slot)
+            self.rw_slot = NULL
+        if self.rw_val != NULL:
+            free(self.rw_val)
+            self.rw_val = NULL
+        if self.ro_slot != NULL:
+            free(self.ro_slot)
+            self.ro_slot = NULL
+        if self.ri_slot != NULL:
+            free(self.ri_slot)
+            self.ri_slot = NULL
 
     cdef int build(self, object binding) except -1:
         # Flatten the Binding tree into one entry array plus one table per
@@ -2003,8 +2043,30 @@ cdef class _Compiled:
         if self.bent == NULL:
             raise MemoryError()
         self.nent = total
-        self.reset_w = [None] * (total if total else 1)
-        self.reset_o = [None] * (total if total else 1)
+
+        # The reset payload, sized in one pass over the rows that have one and
+        # then filled in the row loop below. Both arrays are indexed by the
+        # slices ``_BEntry.reset_w_at`` / ``reset_o_at`` hand out, so one malloc
+        # each covers the whole tree.
+        cdef Py_ssize_t nrw = 0, nro = 0, nri = 0
+        for i in range(ntab):
+            for e in tables[i]._entries:
+                if e.which_at >= 0:
+                    nrw += len(e.reset_words)
+                    nro += len(e.reset_objects)
+                    nri += len(e.reset_into)
+        self.rw_slot = <Py_ssize_t*>malloc((nrw if nrw else 1) * sizeof(Py_ssize_t))
+        self.rw_val = <uint64_t*>malloc((nrw if nrw else 1) * sizeof(uint64_t))
+        self.ro_slot = <Py_ssize_t*>malloc((nro if nro else 1) * sizeof(Py_ssize_t))
+        self.ri_slot = <Py_ssize_t*>malloc((nri if nri else 1) * sizeof(Py_ssize_t))
+        if (self.rw_slot == NULL or self.rw_val == NULL or self.ro_slot == NULL
+                or self.ri_slot == NULL):
+            raise MemoryError()
+        self.nrw = nrw
+        self.ro_val = [None] * (nro if nro else 1)
+        self.ri_val = [None] * (nri if nri else 1)
+        cdef Py_ssize_t rw = 0, ro = 0, ri = 0
+        cdef object pair
 
         for ti in range(self.ntab):
             b = tables[ti]
@@ -2020,9 +2082,28 @@ cdef class _Compiled:
                 self.bent[k].cap = <Py_ssize_t>e.cap
                 self.bent[k].count_at = <Py_ssize_t>e.count_at
                 self.bent[k].which_at = <Py_ssize_t>e.which_at
+                self.bent[k].reset_w_at = rw
+                self.bent[k].reset_w_n = 0
+                self.bent[k].reset_o_at = ro
+                self.bent[k].reset_o_n = 0
+                self.bent[k].reset_i_at = ri
+                self.bent[k].reset_i_n = 0
                 if e.which_at >= 0:
-                    self.reset_w[k] = e.reset_words or None
-                    self.reset_o[k] = e.reset_objects or None
+                    for pair in e.reset_words:
+                        self.rw_slot[rw] = <Py_ssize_t>pair[0]
+                        self.rw_val[rw] = <uint64_t>pair[1]
+                        rw += 1
+                    self.bent[k].reset_w_n = rw - self.bent[k].reset_w_at
+                    for pair in e.reset_objects:
+                        self.ro_slot[ro] = <Py_ssize_t>pair[0]
+                        self.ro_val[ro] = pair[1]
+                        ro += 1
+                    self.bent[k].reset_o_n = ro - self.bent[k].reset_o_at
+                    for pair in e.reset_into:
+                        self.ri_slot[ri] = <Py_ssize_t>pair[0]
+                        self.ri_val[ri] = pair[1]
+                        ri += 1
+                    self.bent[k].reset_i_n = ri - self.bent[k].reset_i_at
                 self.bent[k].child = <int>seen[id(e.child)] if e.child is not None else -1
                 self.bent[k].into = <bint>e.into
                 self.bent[k].elem_bounded = <bint>e.elem_bounded
@@ -4053,23 +4134,57 @@ cdef class Decoder:
         option being *selected* is touched; what a discarded one leaves behind is
         unreachable, because a reader consults ``which_at`` first.
 
-        The slots and values are ``Binding.freeze``'s, precomputed over the
-        option's whole subtree. Python-level on purpose: a conformant producer
-        never reaches this path (§4.2, §7.4), so it has to be right, not quick,
-        and the pure engine's list is reused rather than copied into C.
+        The slots and values are ``Binding.freeze``'s, flattened into the
+        _Compiled's C arrays. Not the rare path it looks like: ``which_at``
+        starts at ``default_id``, so a message holding any other option runs this
+        once -- see the note on ``_Compiled.rw_slot`` for why the word half is a
+        C loop. The object half stays a list index, because a ``str``/``bytes``
+        is a reference no C array here can own.
         """
-        # Off the cached _Compiled, not off this decoder: a Decoder is built
-        # per message in the one-shot path, and two more fields on it would be
-        # paid for by every decode that never switches an option.
-        cdef object pairs = self._tables.reset_w[ei]
-        cdef object slot, value
-        if pairs is not None:
-            for slot, value in pairs:
-                self._words[<Py_ssize_t>slot] = <uint64_t>value
-        pairs = self._tables.reset_o[ei]
-        if pairs is not None and self._objects is not None:
-            for slot, value in pairs:
-                self._objects[<Py_ssize_t>slot] = value
+        # Off the cached _Compiled, not off this decoder: a Decoder is built per
+        # message in the one-shot path, and more fields on it would be paid for
+        # by every decode that never switches an option.
+        cdef _Compiled t = self._tables
+        cdef _BEntry* e = &self._bent[ei]
+        cdef Py_ssize_t i, base = e.reset_w_at
+        for i in range(e.reset_w_n):
+            self._words[t.rw_slot[base + i]] = t.rw_val[base + i]
+        if e.reset_o_n and self._objects is not None:
+            base = e.reset_o_at
+            for i in range(e.reset_o_n):
+                self._objects[t.ro_slot[base + i]] = t.ro_val[base + i]
+        if e.reset_i_n and self._objects is not None:
+            base = e.reset_i_at
+            for i in range(e.reset_i_n):
+                self._copy_default_into(
+                    self._objects[t.ri_slot[base + i]], t.ri_val[base + i])
+        return 0
+
+    cdef int _copy_default_into(self, object dst, bytes payload) except -1:
+        # A string_into/blob_into member's declared default: the slot holds the
+        # CALLER's buffer, so the default is copied in. The length slot was
+        # written with the word half above. The buffer is checked exactly as an
+        # arriving payload's destination is (S6.3) -- one rule, one verdict,
+        # whichever put the bytes there (S5.3.1). Mirrors the pure engine.
+        cdef Py_buffer view
+        cdef Py_ssize_t size = len(payload)
+        try:
+            PyObject_GetBuffer(dst, &view, PyBUF_WRITABLE | PyBUF_SIMPLE)
+        except (BufferError, TypeError) as exc:
+            raise SofaArgumentError(
+                "a declared default returned a destination that is not a "
+                "writable, contiguous buffer") from exc
+        try:
+            if view.itemsize != 1:
+                raise SofaArgumentError(
+                    "a declared default's destination must hold single bytes")
+            if view.len < size:
+                raise SofaArgumentError(
+                    "a declared default's destination gave %d bytes for a "
+                    "default of %d" % (view.len, size))
+            memcpy(view.buf, <const void*><const unsigned char*>payload, size)
+        finally:
+            PyBuffer_Release(&view)
         return 0
 
     cdef int _mapped_field(self, Py_ssize_t ei) except -1:
