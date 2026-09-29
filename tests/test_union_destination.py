@@ -231,3 +231,43 @@ def test_the_table_and_the_visitor_agree_about_the_held_option(engine):
 def test_a_sequence_option_is_refused_for_now(engine):
     with pytest.raises(Exception, match="not supported yet"):
         Binding(which_at=0).sequence(3, Binding())
+
+
+# --- the table's own bookkeeping --------------------------------------------
+
+
+def test_the_which_slot_is_counted_and_readable():
+    option = Binding(closed=True, which_at=7).unsigned(0, at=3)
+    assert option.which_at == 7
+    # The slot is words storage like any other, so the caller's buffer has to
+    # hold it -- even though no row names it.
+    assert option.words_required == 8
+    assert Binding().which_at == -1
+
+
+def test_a_which_slot_out_of_range_is_refused():
+    with pytest.raises(Exception, match="which slot"):
+        Binding(which_at=-1)
+
+
+def test_freeze_pushes_the_slot_onto_every_row_wherever_the_table_is_bound():
+    # A child bound from two places is one table, so both bindings see the same
+    # one-of behaviour -- the same argument ``closed`` is documented with.
+    option = Binding(closed=True, which_at=4).unsigned(0, at=0).signed(1, at=1)
+    root = Binding(closed=True).sequence(9, option).sequence(10, option)
+    root.freeze()
+    assert [e.which_at for e in option.entries] == [4, 4]
+    # The union's own rows in the parent are not alternatives.
+    assert [e.which_at for e in root.entries] == [-1, -1]
+
+
+def test_a_cycle_through_a_one_of_table_freezes_once():
+    # A recursive schema is legitimate, and freeze() walks each table once
+    # (``_reachable`` dedupes by identity), so pushing the slot onto the rows
+    # must not walk the cycle forever either.
+    union = Binding(closed=True, which_at=2).unsigned(0, at=0).signed(1, at=1)
+    outer = Binding(closed=True)
+    outer.sequence(9, union)     # the union field
+    outer.sequence(10, outer)    # a struct field of the message's own type
+    assert len(outer.freeze()) == 2
+    assert [e.which_at for e in union.entries] == [2, 2]
