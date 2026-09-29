@@ -1583,6 +1583,14 @@ class Decoder:
                 if entry is not None:
                     child = entry.child
                     assert child is not None
+                    w = entry.which_at
+                    if w >= 0:
+                        # A struct/union option: same rule as any other option
+                        # (§7.4.1), and the reset runs before the occurrence
+                        # count below, so a switched-to option counts from 1.
+                        if self._wu[w] != entry.field_id:
+                            self._reset_option(entry)
+                        self._wu[w] = entry.field_id
                     self._bstack[self._bsp] = bmap
                     self._bsp += 1
                     self._bmap = child._by_id
@@ -1760,6 +1768,33 @@ class Decoder:
             # Spent: the schema bounds this field, so the cap never governed it.
             self._pending = real
 
+    def _reset_option(self, e: Entry) -> None:
+        """A different option arrived: the new one starts from its own default.
+
+        MESSAGE_SPEC §7.4.1 — "the held option is discarded, and the new one
+        starts from its own default before its payload is applied". Only the
+        option being *selected* is touched: what a discarded option leaves in
+        its slots is unreachable, because a reader consults ``which_at`` first.
+
+        The slots and the values are :meth:`sofab.Binding.freeze`'s, precomputed
+        over the option's whole subtree, so nothing is derived here and nothing
+        allocates. It is also the one path in this file that a conformant
+        producer never reaches: §4.2 emits one child per union frame, and §7.4
+        calls a repeated id not well-formed. That is why it is a loop over a
+        prepared list rather than anything cleverer -- it has to be right, not
+        quick.
+
+        Runs at the option's field, after the §7.3 tag test and before the value
+        is stored, so a mistyped option switches nothing and resets nothing.
+        """
+        wu = self._wu
+        for slot, bits in e.reset_words:
+            wu[slot] = bits
+        objects = self._objects
+        if objects is not None:
+            for slot, value in e.reset_objects:
+                objects[slot] = value
+
     def _mapped_field(self, e: Entry) -> None:
         """A field the handler's declared destination map names.
 
@@ -1777,7 +1812,8 @@ class Decoder:
         retry redoes the whole value — including refilling a partly written
         array from element zero (§5.2).
         """
-        if e.which_at >= 0:
+        w = e.which_at
+        if w >= 0:
             # MESSAGE_SPEC §7.4.1: the held option of a union is the last
             # correctly-typed occurrence of any option id, so the arriving
             # option's id is what the caller needs. Written at the field: the
@@ -1790,7 +1826,9 @@ class Decoder:
             # ways, this engine pays the same either way (~150 Ir a mapped
             # field), and this is the same mechanism the accelerator uses, where
             # the row is already in cache and the compare is free.
-            self._wu[e.which_at] = e.field_id
+            if self._wu[w] != e.field_id:
+                self._reset_option(e)
+            self._wu[w] = e.field_id
         self._settle_bound(e.declared)
         k = e.kind
         at = e.at

@@ -1938,6 +1938,14 @@ cdef class _Compiled:
     cdef int ntab
     cdef Py_ssize_t words_required
     cdef Py_ssize_t objects_required
+    # Per entry, what a re-selected option starts from (MESSAGE_SPEC §7.4.1):
+    # ``sofab.Binding.freeze``'s own tuples, indexed by entry, ``None`` for a row
+    # that is not an option. Kept as Python objects on purpose -- this is the one
+    # path a conformant producer never reaches (§4.2 emits one child per union
+    # frame, §7.4 calls a repeated id not well-formed), so it buys correctness
+    # with no C allocation to own, free or leak.
+    cdef list reset_w
+    cdef list reset_o
 
     def __cinit__(self):
         self.bent = NULL
@@ -1946,6 +1954,8 @@ cdef class _Compiled:
         self.ntab = 0
         self.words_required = 0
         self.objects_required = 0
+        self.reset_w = []
+        self.reset_o = []
 
     def __dealloc__(self):
         cdef int i
@@ -1993,6 +2003,8 @@ cdef class _Compiled:
         if self.bent == NULL:
             raise MemoryError()
         self.nent = total
+        self.reset_w = [None] * (total if total else 1)
+        self.reset_o = [None] * (total if total else 1)
 
         for ti in range(self.ntab):
             b = tables[ti]
@@ -2008,6 +2020,9 @@ cdef class _Compiled:
                 self.bent[k].cap = <Py_ssize_t>e.cap
                 self.bent[k].count_at = <Py_ssize_t>e.count_at
                 self.bent[k].which_at = <Py_ssize_t>e.which_at
+                if e.which_at >= 0:
+                    self.reset_w[k] = e.reset_words or None
+                    self.reset_o[k] = e.reset_objects or None
                 self.bent[k].child = <int>seen[id(e.child)] if e.child is not None else -1
                 self.bent[k].into = <bint>e.into
                 self.bent[k].elem_bounded = <bint>e.elem_bounded
@@ -3564,6 +3579,14 @@ cdef class Decoder:
             if t == _WT_SEQUENCE_START:
                 if ei >= 0:
                     e = &self._bent[ei]
+                    if e.which_at >= 0:
+                        # A struct/union option: the same rule as any other
+                        # option (§7.4.1), and the reset runs before the
+                        # occurrence count below, so a switched-to option counts
+                        # from 1.
+                        if self._words[e.which_at] != e.field_id:
+                            self._reset_option(ei)
+                        self._words[e.which_at] = e.field_id
                     self._push_table(e.child)
                     mapped = self._tab >= 0
                     if e.count_at >= 0:
@@ -4022,6 +4045,33 @@ cdef class Decoder:
                         PyLong_FromUnsignedLongLong(self._pend_count),
                         _ST[self._pend_subtype])
 
+    cdef int _reset_option(self, Py_ssize_t ei) except -1:
+        """A different option arrived: the new one starts from its own default.
+
+        MESSAGE_SPEC §7.4.1 -- "the held option is discarded, and the new one
+        starts from its own default before its payload is applied". Only the
+        option being *selected* is touched; what a discarded one leaves behind is
+        unreachable, because a reader consults ``which_at`` first.
+
+        The slots and values are ``Binding.freeze``'s, precomputed over the
+        option's whole subtree. Python-level on purpose: a conformant producer
+        never reaches this path (§4.2, §7.4), so it has to be right, not quick,
+        and the pure engine's list is reused rather than copied into C.
+        """
+        # Off the cached _Compiled, not off this decoder: a Decoder is built
+        # per message in the one-shot path, and two more fields on it would be
+        # paid for by every decode that never switches an option.
+        cdef object pairs = self._tables.reset_w[ei]
+        cdef object slot, value
+        if pairs is not None:
+            for slot, value in pairs:
+                self._words[<Py_ssize_t>slot] = <uint64_t>value
+        pairs = self._tables.reset_o[ei]
+        if pairs is not None and self._objects is not None:
+            for slot, value in pairs:
+                self._objects[<Py_ssize_t>slot] = value
+        return 0
+
     cdef int _mapped_field(self, Py_ssize_t ei) except -1:
         # A field the handler's declared destination map names.
         #
@@ -4049,6 +4099,8 @@ cdef class Decoder:
             # occurrence of any option id. One store off the row already in
             # hand -- no per-scope state, so a field outside a one-of scope pays
             # a single compare against a value the cache line already carries.
+            if self._words[e.which_at] != e.field_id:
+                self._reset_option(ei)
             self._words[e.which_at] = e.field_id
         if _K_ARRAY_UNSIGNED <= e.kind < _K_SEQUENCE:
             # A declared array's destination IS its schema bound. The array

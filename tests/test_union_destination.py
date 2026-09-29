@@ -227,10 +227,241 @@ def test_the_table_and_the_visitor_agree_about_the_held_option(engine):
     assert h.held == OPT_U16  # the visitor's own, unfiltered last arrival
 
 
+# --- a struct option, and §7.4.1's reset (#167) ------------------------------
+#
+# The one option kind a later arrival does not rewrite whole: it carries only
+# the children it sends, so the ones it leaves out must read as their own
+# defaults rather than as whatever the option held before it was discarded.
+
+S_WHICH, S_U16, S_X, S_Y, S_COUNT, S_INNER, S_INNER_V = 0, 1, 2, 3, 4, 5, 6
+OPT_STRUCT = 2
+X_DEFAULT, Y_DEFAULT = 7, 0
+
+
+def _struct_table(inner: Binding | None = None) -> Binding:
+    """A union with a scalar option (id 0) and a struct option (id 2)."""
+    member = Binding(closed=True)
+    member.signed(0, at=S_X, default=X_DEFAULT)
+    member.signed(1, at=S_Y, default=Y_DEFAULT)
+    if inner is not None:
+        member.sequence(2, inner)
+    option = Binding(closed=True, which_at=S_WHICH, default_id=DEFAULT_ID)
+    option.unsigned(OPT_U16, at=S_U16, max_value=0xFFFF)
+    option.sequence(OPT_STRUCT, member, count_at=S_COUNT)
+    return Binding(closed=True).sequence(UNION_ID, option)
+
+
+def _decode_struct(engine, message, table: Binding, chunk: int | None = None):
+    words = bytearray(table.tree_words_required * 8)
+    view = memoryview(words).cast("Q")
+    signed = memoryview(words).cast("q")
+    view[S_WHICH] = DEFAULT_ID
+    signed[S_X] = X_DEFAULT  # the caller prepares its declared defaults (§2)
+    signed[S_Y] = Y_DEFAULT
+    data = encode(message)
+    dec = engine(binding=table, words=words, objects=[], **capped())
+    step = chunk or len(data)
+    status = None
+    for i in range(0, len(data), step):
+        status = dec.feed(data[i:i + step])
+    return status, view, signed
+
+
+@pytest.mark.parametrize("chunk", [None, 1])
 @pytest.mark.parametrize("engine", ENGINES)
-def test_a_sequence_option_is_refused_for_now(engine):
-    with pytest.raises(Exception, match="not supported yet"):
-        Binding(which_at=0).sequence(3, Binding())
+class TestStructOption:
+    def test_a_struct_option_continues_its_scope(self, engine, chunk):
+        # §7.4.1, second example: the same option twice continues under §7.4,
+        # so a child set by the earlier opening is retained.
+        def m(e):
+            e.write_sequence_begin_lazy(UNION_ID)
+            e.write_sequence_begin_lazy(OPT_STRUCT)
+            e.write_signed(0, 1)
+            e.write_sequence_end()
+            e.write_sequence_end()
+            e.write_sequence_begin_lazy(UNION_ID)
+            e.write_sequence_begin_lazy(OPT_STRUCT)
+            e.write_signed(1, 2)
+            e.write_sequence_end()
+            e.write_sequence_end()
+
+        status, view, signed = _decode_struct(engine, m, _struct_table(), chunk)
+        assert status == Status.COMPLETE
+        assert view[S_WHICH] == OPT_STRUCT
+        assert (signed[S_X], signed[S_Y]) == (1, 2)
+
+    def test_a_struct_option_that_returns_starts_from_its_default(self, engine, chunk):
+        # §7.4.1, THIRD example -- the whole reason #167 exists:
+        #   seq(struct(x=1))  seq(u16 5)  seq(struct(y=2))  ->  {x=default, y=2}
+        # The earlier x does not survive being discarded by option 0.
+        def m(e):
+            e.write_sequence_begin_lazy(UNION_ID)
+            e.write_sequence_begin_lazy(OPT_STRUCT)
+            e.write_signed(0, 1)
+            e.write_sequence_end()
+            e.write_sequence_end()
+            e.write_sequence_begin_lazy(UNION_ID)
+            e.write_unsigned(OPT_U16, 5)
+            e.write_sequence_end()
+            e.write_sequence_begin_lazy(UNION_ID)
+            e.write_sequence_begin_lazy(OPT_STRUCT)
+            e.write_signed(1, 2)
+            e.write_sequence_end()
+            e.write_sequence_end()
+
+        status, view, signed = _decode_struct(engine, m, _struct_table(), chunk)
+        assert status == Status.COMPLETE
+        assert view[S_WHICH] == OPT_STRUCT
+        assert signed[S_X] == X_DEFAULT, "the discarded option's x survived"
+        assert signed[S_Y] == 2
+        # The occurrence count restarts with the option, so it counts the
+        # arrivals of the option that is held, not of the ones before it.
+        assert view[S_COUNT] == 1
+
+    def test_the_scalar_option_is_not_reset_by_the_struct_option(self, engine, chunk):
+        # Only the option being SELECTED is touched (§7.4.1). The scalar's slot
+        # keeps what it received -- unreachable, because which_at names the
+        # struct -- which is what makes a reader that consults the slot safe.
+        def m(e):
+            e.write_sequence_begin_lazy(UNION_ID)
+            e.write_unsigned(OPT_U16, 5)
+            e.write_sequence_begin_lazy(OPT_STRUCT)
+            e.write_signed(1, 2)
+            e.write_sequence_end()
+            e.write_sequence_end()
+
+        status, view, signed = _decode_struct(engine, m, _struct_table(), chunk)
+        assert status == Status.COMPLETE
+        assert view[S_WHICH] == OPT_STRUCT
+        assert view[S_U16] == 5
+        assert (signed[S_X], signed[S_Y]) == (X_DEFAULT, 2)
+
+    def test_an_empty_struct_option_frame_holds_the_option_at_its_default(
+        self, engine, chunk
+    ):
+        # §4.2/§2: a held option that is not default_id is written even when
+        # every child is at its own default, so this frame is what a conformant
+        # encoder emits for it -- and it must switch the union.
+        def m(e):
+            e.write_sequence_begin_lazy(UNION_ID)
+            e.write_unsigned(OPT_U16, 5)
+            e.write_sequence_begin_lazy(OPT_STRUCT)
+            e.write_sequence_end_keep()
+            e.write_sequence_end()
+
+        status, view, signed = _decode_struct(engine, m, _struct_table(), chunk)
+        assert status == Status.COMPLETE
+        assert view[S_WHICH] == OPT_STRUCT
+        assert (signed[S_X], signed[S_Y]) == (X_DEFAULT, Y_DEFAULT)
+
+    def test_a_nested_union_starts_at_its_own_default_id(self, engine, chunk):
+        # A union option may be another union (§4.2). The inner union's held
+        # option is part of the outer option's storage, so re-selecting the
+        # outer one puts the inner back at ITS default_id -- the value the
+        # decoder cannot derive and the table therefore states.
+        inner = Binding(closed=True, which_at=S_INNER, default_id=4)
+        inner.signed(4, at=S_INNER_V, default=-1)
+        inner.signed(5, at=S_INNER_V)
+        table = _struct_table(inner)
+
+        def m(e):
+            e.write_sequence_begin_lazy(UNION_ID)
+            e.write_sequence_begin_lazy(OPT_STRUCT)
+            e.write_sequence_begin_lazy(2)      # the inner union
+            e.write_signed(5, 9)                # holding option 5
+            e.write_sequence_end()
+            e.write_sequence_end()
+            e.write_sequence_end()
+            e.write_sequence_begin_lazy(UNION_ID)
+            e.write_unsigned(OPT_U16, 5)        # discard the struct option
+            e.write_sequence_end()
+            e.write_sequence_begin_lazy(UNION_ID)
+            e.write_sequence_begin_lazy(OPT_STRUCT)
+            e.write_signed(1, 2)                # back, without the inner union
+            e.write_sequence_end()
+            e.write_sequence_end()
+
+        words = bytearray(table.tree_words_required * 8)
+        view = memoryview(words).cast("Q")
+        signed = memoryview(words).cast("q")
+        view[S_WHICH] = DEFAULT_ID
+        view[S_INNER] = 4
+        signed[S_X] = X_DEFAULT
+        data = encode(m)
+        dec = engine(binding=table, words=words, objects=[], **capped())
+        step = chunk or len(data)
+        for i in range(0, len(data), step):
+            status = dec.feed(data[i:i + step])
+        assert status == Status.COMPLETE
+        assert view[S_WHICH] == OPT_STRUCT
+        assert view[S_INNER] == 4, "the inner union kept a discarded option"
+        assert signed[S_INNER_V] == -1
+        assert (signed[S_X], signed[S_Y]) == (X_DEFAULT, 2)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_string_option_starts_empty_again(engine):
+    # §4.2 admits no non-empty default for a string option, so "" is what it
+    # starts from -- and the objects slot is what has to say so.
+    option = Binding(closed=True, which_at=0, default_id=1)
+    option.string(1, at=0)
+    option.unsigned(2, at=1)
+    root = Binding(closed=True).sequence(UNION_ID, option)
+
+    def m(e):
+        e.write_sequence_begin_lazy(UNION_ID)
+        e.write_string(1, "held")
+        e.write_unsigned(2, 3)      # option 2 discards the string option
+        e.write_string(1, "")       # ... and it comes back, empty on the wire
+        e.write_sequence_end()
+
+    words = bytearray(root.tree_words_required * 8)
+    objects: list[object] = ["prepared"]
+    dec = engine(binding=root, words=words, objects=objects, **capped())
+    assert dec.feed(encode(m)) == Status.COMPLETE
+    assert memoryview(words).cast("Q")[0] == 1
+    assert objects[0] == ""
+
+
+def test_a_default_belongs_to_a_scalar_row():
+    with pytest.raises(Exception, match="default belongs to a scalar row"):
+        Binding()._add(11, 1, 0, 4, None, None, default=3)  # an array kind
+
+
+def test_a_float_default_that_is_not_a_number_is_refused():
+    # A string that happens to parse is a mistake, not a default -- the same
+    # line ``_index`` draws for the integer binders.
+    with pytest.raises(Exception, match="must be a real number"):
+        Binding().float64(1, at=0, default="1.5e3")
+    assert Binding().float32(1, at=0, default=3).entries[0].reset_words == ()  # int ok
+
+
+def test_a_default_outside_the_declared_width_is_refused():
+    with pytest.raises(Exception, match="outside the declared width"):
+        Binding().unsigned(1, at=0, max_value=0xFF, default=256)
+
+
+def test_a_boolean_default_is_normalized_and_a_float_default_is_rounded():
+    b = Binding(closed=True, which_at=0)
+    b.boolean(1, at=1, default=42)
+    b.float32(2, at=2, default=0.1)
+    b.float64(3, at=3, default=0.1)
+    b.freeze()
+    rows = {e.field_id: e.reset_words for e in b.entries}
+    assert rows[1] == ((1, 1),), "every value other than 0 is true (§4.4)"
+    import struct as _struct
+    f32 = _struct.unpack("<Q", _struct.pack("<d", _struct.unpack(
+        "<f", _struct.pack("<f", 0.1))[0]))[0]
+    f64 = _struct.unpack("<Q", _struct.pack("<d", 0.1))[0]
+    assert rows[2] == ((2, f32),) and rows[3] == ((3, f64),)
+    assert f32 != f64, "an fp32 default is the value an fp32 field can hold"
+
+
+def test_the_default_id_is_range_checked_and_readable():
+    assert Binding(which_at=0, default_id=5).default_id == 5
+    assert Binding().default_id == 0
+    with pytest.raises(Exception, match="default id"):
+        Binding(which_at=0, default_id=-1)
 
 
 # --- the table's own bookkeeping --------------------------------------------
