@@ -396,6 +396,22 @@ size. It is a chunked reader that has to size it for the largest `string`, `blob
 or array payload it will take **across a chunk boundary** — including one it only
 means to skip, which is still buffered while it is walked.
 
+#### Float arrays against their default: `sofab.float_array_bits_equal`
+
+A float array field is omitted on the wire iff it equals its default, and floats
+round-trip bit-for-bit, so that comparison is on **bit patterns**, not IEEE
+`==`: `[-0.0, 1.5]` is not the default `[0.0, 1.5]`. `float_array_bits_equal(a, b)`
+is true iff the lengths match and every element has the identical 64-bit pattern
+of the held double (`+0.0` differs from `-0.0`; a NaN equals only a NaN with the
+same payload; an `int` compares as the double it converts to). It works for both
+`fp32` and `fp64` fields, under both engines.
+
+```python
+from sofab import float_array_bits_equal
+
+float_array_bits_equal([-0.0, 1.5], [0.0, 1.5])   # False; `==` says True
+```
+
 #### Arrays of strings, blobs or structs: `sofab.collectors`
 
 An array whose elements are not packed scalars — strings, blobs, structs — is a
