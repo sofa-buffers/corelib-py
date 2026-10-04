@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from ._varint import zigzag_decode, zigzag_encode
 from .binding import Binding
 from .collectors import UNBOUNDED, reserve_elem, reserve_leaf, reserve_row
+from .float_arrays import float_array_bits_equal
 from .types import (
     API_VERSION,
     ARRAY_MAX,
@@ -133,6 +134,7 @@ __all__ = [
     "reserve_leaf",
     "reserve_elem",
     "reserve_row",
+    "float_array_bits_equal",
     "IMPL",
     "__version__",
 ]
