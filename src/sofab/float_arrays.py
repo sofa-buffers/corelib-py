@@ -24,13 +24,13 @@ An ``int`` element is compared as the double it converts to, which is what the
 encoder would write for it; one outside the double range is not a
 float at all and raises ``struct.error``.
 
-It works under both engines: it is plain Python on top of the C-level
-``struct`` module and never touches the codec.
+It works under both engines: it is plain Python and never touches the codec.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from math import copysign
 from struct import pack
 
 
@@ -40,7 +40,16 @@ def float_array_bits_equal(a: Sequence[float], b: Sequence[float]) -> bool:
         return True
     if len(a) != len(b):
         return False
-    # One C-level pass per side packs the doubles; the comparison is then a
-    # block compare of the raw bytes, never of the values.
-    fmt = f"={len(a)}d"
-    return pack(fmt, *a) == pack(fmt, *b)
+    # Allocation-free walk with an early exit on the first differing element.
+    # Two values that compare ``==`` share one double, except the zeros, whose
+    # sign is checked; the ones that do not (including every NaN) fall back to
+    # their packed bytes, which is the only place a bit pattern is built.
+    for x, y in zip(a, b):
+        if x is y:
+            continue
+        if x == y:
+            if x == 0 and copysign(1.0, x) != copysign(1.0, y):
+                return False
+        elif pack("=d", x) != pack("=d", y):
+            return False
+    return True
