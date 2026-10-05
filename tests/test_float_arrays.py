@@ -156,9 +156,46 @@ def test_does_not_mutate_its_arguments() -> None:
     assert isinstance(a[2], int)
 
 
-def test_int_outside_the_double_range_is_refused() -> None:
-    with pytest.raises(struct.error):
-        eq([10**400], [1.0])
+def test_int_outside_the_double_range_equals_no_double() -> None:
+    assert not eq([10**400], [1.0])
+    assert not eq([1.0, 10**400], [1.0, 2.0])
+    assert not eq([2.0, 1.0], [10**400, 1.0])
+    assert eq([10**400], [10**400])
+
+
+def test_unequal_lists_with_a_nan_elsewhere_take_the_walk() -> None:
+    # The C-speed prefilter must not call a pair "different" because of a NaN
+    # in a position that is itself equal.
+    assert eq([NAN, 1.5], [NAN, 1.5])
+    assert not eq([NAN, 1.5], [NAN, 2.5])
+    assert not eq([NAN, 1.5], [NAN_PAYLOAD, 1.5])
+    assert eq([INF, -INF], [INF, -INF])
+    assert not eq([INF, 1.0], [-INF, 1.0])
+
+
+def test_equal_lists_with_zeros_check_every_sign() -> None:
+    assert eq([0.0, 1.5, -0.0], [0.0, 1.5, -0.0])
+    assert not eq([0.0, 1.5, -0.0], [0.0, 1.5, 0.0])
+    assert not eq([0.0, 1.5, 0.0], [0.0, 1.5, -0.0])
+    assert eq([1.5, 2.5], [1.5, 2.5])
+
+
+@pytest.mark.parametrize("n", [5, 8, 64])
+def test_all_zero_defaults_tell_every_sign_apart(n: int) -> None:
+    zeros = [0.0] * n
+    assert eq(list(zeros), zeros)
+    for i in (0, n // 2, n - 1):
+        v = list(zeros)
+        v[i] = -0.0
+        assert not eq(v, zeros)
+        assert not eq(zeros, v)
+        assert eq(v, list(v))
+
+
+def test_tuple_against_list_is_decided_by_elements_not_by_container() -> None:
+    assert eq((0.0, 1.5), [0.0, 1.5])
+    assert not eq((-0.0, 1.5), [0.0, 1.5])
+    assert not eq((0.0, 1.5), [0.0, 2.5])
 
 
 def test_pseudo_random_cross_check_against_a_reference_bit_loop() -> None:

@@ -21,8 +21,7 @@ Python holds every float, ``fp32`` fields included, as a double, so the pattern
 compared is that of the held double for both element widths. (The ``fp32``
 signaling-NaN raw-bytes path of CORELIB_PLAN §6.5 is separate and untouched.)
 An ``int`` element is compared as the double it converts to, which is what the
-encoder would write for it; one outside the double range is not a
-float at all and raises ``struct.error``.
+encoder would write for it; one outside the double range equals no double.
 
 It works under both engines: it is plain Python and never touches the codec.
 """
@@ -41,15 +40,18 @@ def float_array_bits_equal(a: Sequence[float], b: Sequence[float]) -> bool:
     if len(a) != len(b):
         return False
     # Allocation-free walk with an early exit on the first differing element.
-    # Two values that compare ``==`` share one double, except the zeros, whose
-    # sign is checked; the ones that do not (including every NaN) fall back to
-    # their packed bytes, which is the only place a bit pattern is built.
     for x, y in zip(a, b):
         if x is y:
             continue
         if x == y:
+            # Equal values share one double, except the zeros, whose sign is read.
             if x == 0 and copysign(1.0, x) != copysign(1.0, y):
                 return False
+        elif x == x or y == y:
+            # Unequal and at least one is not a NaN: different doubles. This is
+            # the answer for every ordinary difference, before any bytes are built.
+            return False
         elif pack("=d", x) != pack("=d", y):
+            # Both are NaN: the payload and sign decide, and only bytes show them.
             return False
     return True
