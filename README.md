@@ -412,6 +412,24 @@ from sofab import float_array_bits_equal
 float_array_bits_equal([-0.0, 1.5], [0.0, 1.5])   # False; `==` says True
 ```
 
+Generated code compares a field with the **same** declared default on every
+serialize, so it holds that default as a `sofab.FloatArrayDefault`, built once
+per field: `matches(a)` decides the same question for that one default, and
+picks how at construction. A default with no zero and no NaN is told apart by
+the plain list `==` (already bit-exact for every other double); a zero adds one
+sign read at its position; a NaN takes the element-wise path. Under the native
+engine it is one C loop over the bit patterns. An `int` matches the double it
+equals exactly (`0` is `+0.0`); anything not equal, an `int` outside the double
+range included, does not match, and nothing raises.
+
+```python
+from sofab import FloatArrayDefault
+
+d = FloatArrayDefault([0.0, 1.5])
+d.matches([0.0, 1.5])    # True
+d.matches([-0.0, 1.5])   # False
+```
+
 #### Arrays of strings, blobs or structs: `sofab.collectors`
 
 An array whose elements are not packed scalars — strings, blobs, structs — is a
