@@ -4455,5 +4455,76 @@ def reserve_row(object rows, Py_ssize_t id, Py_ssize_t cap, object rcap):
         rows[id] = []
 
 
+
+# --- float array defaults ----------------------------------------------------
+
+from .float_arrays import _elem_matches, _seq_matches
+
+# The largest magnitude every int up to which converts to a double exactly.
+cdef int64_t _EXACT_INT = 1 << 53
+
+
+@cython.final
+cdef class FloatArrayDefault:
+    """Native twin of :class:`sofab.float_arrays.FloatArrayDefault`.
+
+    The same element rule, decided the same way: an exact ``float`` element of
+    a ``list`` is compared by its 64-bit pattern in C (for a double that IS the
+    rule: equal values with the same zero sign, or the identical NaN), and so is
+    an exact ``int`` of magnitude at most 2**53, which converts to exactly one
+    double (``0`` to ``+0.0``); every other element, and every other sequence,
+    goes through the pure rule, so the two engines can never disagree on a large
+    ``int`` or a float-like object.
+    """
+
+    cdef readonly tuple values
+    cdef list _v
+    cdef uint64_t* _bits
+    cdef Py_ssize_t _n
+
+    def __cinit__(self, values):
+        cdef Py_ssize_t i
+        cdef double x
+        self._v = [float(x) for x in values]
+        self.values = tuple(self._v)
+        self._n = len(self._v)
+        self._bits = <uint64_t*>malloc((self._n if self._n > 0 else 1) * sizeof(uint64_t))
+        if self._bits == NULL:
+            raise MemoryError()
+        for i in range(self._n):
+            x = self._v[i]
+            memcpy(&self._bits[i], &x, sizeof(double))
+
+    def __dealloc__(self):
+        free(self._bits)
+
+    def matches(self, a):
+        cdef Py_ssize_t i
+        cdef PyObject* o
+        cdef double x
+        cdef uint64_t b
+        cdef int64_t k
+        if type(a) is not list:
+            return _seq_matches(a, self._v)
+        if PyList_GET_SIZE(a) != self._n:
+            return False
+        for i in range(self._n):
+            o = <PyObject*>PyList_GET_ITEM(a, i)
+            if _IsFloat(o):
+                x = _AsDouble(o)
+            elif _IsLong(o) and _ToI64(o, &k) and -_EXACT_INT <= k <= _EXACT_INT:
+                x = <double>k
+            elif _elem_matches(<object>o, self._v[i]):
+                continue
+            else:
+                return False
+            memcpy(&b, &x, sizeof(double))
+            if b != self._bits[i]:
+                return False
+        return True
+
+    def __repr__(self):
+        return f"FloatArrayDefault({list(self.values)!r})"
+
 # Marker so callers / tests can assert which implementation is active.
 IMPL = "native"

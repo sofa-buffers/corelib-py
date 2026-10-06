@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 from ._varint import zigzag_decode, zigzag_encode
 from .binding import Binding
 from .collectors import UNBOUNDED, reserve_elem, reserve_leaf, reserve_row
-from .float_arrays import float_array_bits_equal
+from .float_arrays import FloatArrayDefault, float_array_bits_equal
 from .types import (
     API_VERSION,
     ARRAY_MAX,
@@ -76,12 +76,15 @@ else:  # pragma: no cover - native branch: exercised only when the compiled
         # Field shadows types.Field. The three reserve_* helpers shadow the pure
         # sofab.collectors ones with their compiled twins: same contract, same
         # refusals, a C call instead of a Python frame per wrapper-array element.
+        # FloatArrayDefault shadows sofab.float_arrays' the same way: the same
+        # element rule, a C loop instead of a Python frame per omission test.
         # One import, so an extension built before the twins existed falls back
         # to the pure engine as a whole rather than mixing the two.
         from ._speedups import (
             Decoder,
             Encoder,
             Field,
+            FloatArrayDefault,
             reserve_elem,
             reserve_leaf,
             reserve_row,
@@ -135,6 +138,7 @@ __all__ = [
     "reserve_elem",
     "reserve_row",
     "float_array_bits_equal",
+    "FloatArrayDefault",
     "IMPL",
     "__version__",
 ]
