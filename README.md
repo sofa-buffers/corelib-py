@@ -130,6 +130,25 @@ enc.write_string(3, "hi")
 data = enc.getvalue()
 ```
 
+A schema's `maxlen` on a string counts UTF-8 **bytes**, which a `str` does not
+know; pass it as the third argument and `write_string` checks it in the same
+pass that produces those bytes, refusing a longer payload with
+`SofaArgumentError` before any byte of the field is written:
+
+```python
+from sofab import SofaArgumentError
+
+enc = Encoder()
+enc.write_string(4, "héllo", 8)       # 6 bytes: written
+try:
+    enc.write_string(5, "é" * 5, 8)   # 10 bytes: refused, nothing written
+except SofaArgumentError as exc:
+    print(exc)                        # string of 10 UTF-8 bytes exceeds maxlen 8
+```
+
+The bound is the caller's: the library holds none, and without the argument
+nothing is checked.
+
 `Encoder()` writes into a fixed 1 KiB scratch buffer and appends each bufferful
 to the result it hands back — it never grows a buffer mid-message (see [Memory
 handling](#memory-handling)). Pass a writer (anything with `write(bytes)`) and

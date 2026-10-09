@@ -619,7 +619,8 @@ class Encoder:
         """Write a 64-bit IEEE-754 float as a little-endian fixlen field."""
         self._write_fixlen(field_id, _core.pack_f64(value), _ST_FP64)
 
-    def write_string(self, field_id: SupportsIndex, text: str) -> None:
+    def write_string(self, field_id: SupportsIndex, text: str,
+                     maxlen: int | None = None) -> None:
         r"""Write a UTF-8 string as a fixlen field (STRING subtype).
 
         Encoding is strict UTF-8 (``str.encode("utf-8")`` with no ``errors=``).
@@ -631,6 +632,13 @@ class Encoder:
         ``InvalidArgument`` outcome, MESSAGE_SPEC §8 producer-side MUST NOT),
         never silently replaced. Embedded ``U+0000`` is valid UTF-8 and
         round-trips unchanged.
+
+        ``maxlen`` is the caller's bound on the payload in UTF-8 **bytes** -- the
+        unit a schema's ``maxlen`` counts in, which a ``str``'s own ``len()``
+        does not. Only this call knows that length without a second pass, so the
+        bound is taken here: a payload longer than ``maxlen`` is refused with
+        :class:`SofaArgumentError` before any byte of the field is written. The
+        library holds no bound of its own; ``None`` (the default) checks none.
         """
         if not self._begin():
             return
@@ -638,6 +646,10 @@ class Encoder:
             data = text.encode("utf-8")
         except UnicodeEncodeError as exc:
             self._fail(SofaArgumentError(f"string field is not valid UTF-8: {exc}"))
+            return
+        if maxlen is not None and len(data) > maxlen:
+            self._fail(SofaArgumentError(
+                f"string of {len(data)} UTF-8 bytes exceeds maxlen {maxlen}"))
             return
         self._write_fixlen(field_id, data, _ST_STRING)
 
