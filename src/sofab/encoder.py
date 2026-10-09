@@ -537,7 +537,8 @@ class Encoder:
 
     # --- scalars ------------------------------------------------------------
 
-    def write_unsigned(self, field_id: SupportsIndex, value: SupportsIndex) -> None:
+    def write_unsigned(self, field_id: SupportsIndex, value: SupportsIndex,
+                       max_value: int | None = None) -> None:
         """Write an unsigned integer field as a base-128 varint.
 
         ``value`` must be an integer in ``0..UNSIGNED_MAX`` (64-bit), else
@@ -545,6 +546,11 @@ class Encoder:
         ``__index__`` (``int``, ``bool``, ``IntEnum``, NumPy integers). A
         ``float`` is refused rather than truncated, ``3.0`` included; write
         ``int(x)`` if that is what you mean.
+
+        ``max_value`` is the caller's declared maximum -- the width a schema
+        gives a narrower field (255 for a ``u8``) -- and a value above it is
+        :class:`SofaArgumentError` before any byte is written. The library holds
+        no bound: ``None`` (the default) checks only the 64-bit range.
         """
         if not self._begin():
             return
@@ -553,17 +559,27 @@ class Encoder:
                 value = _as_int(value, "unsigned value")
             if value < 0 or value > UNSIGNED_MAX:
                 raise SofaArgumentError(f"unsigned value {value} out of range")
+            if max_value is not None and value > max_value:
+                raise SofaArgumentError(
+                    f"unsigned value {value} exceeds max_value {max_value}")
             self._header(field_id, _WT_UNSIGNED)
             self._emit_varint(value)
         except SofaError as exc:
             self._fail(exc)
 
-    def write_signed(self, field_id: SupportsIndex, value: SupportsIndex) -> None:
+    def write_signed(self, field_id: SupportsIndex, value: SupportsIndex,
+                     min_value: int | None = None,
+                     max_value: int | None = None) -> None:
         """Write a signed integer field, ZigZag-encoded into a varint.
 
         ``value`` must be an integer in ``SIGNED_MIN..SIGNED_MAX`` (64-bit),
         else :class:`SofaArgumentError` — see :meth:`write_unsigned` for what counts
         as an integer.
+
+        ``min_value``/``max_value`` are the caller's declared range -- the width
+        a schema gives a narrower field (-128..127 for an ``i8``) -- and a value
+        outside it is :class:`SofaArgumentError` before any byte is written.
+        ``None`` (the default) leaves that side at the 64-bit range.
         """
         if not self._begin():
             return
@@ -572,6 +588,10 @@ class Encoder:
                 value = _as_int(value, "signed value")
             if value < SIGNED_MIN or value > SIGNED_MAX:
                 raise SofaArgumentError(f"signed value {value} out of range")
+            if (min_value is not None and value < min_value) or \
+                    (max_value is not None and value > max_value):
+                raise SofaArgumentError(
+                    f"signed value {value} outside {min_value}..{max_value}")
             self._header(field_id, _WT_SIGNED)
             self._emit_varint(zigzag_encode(value))
         except SofaError as exc:
@@ -654,13 +674,19 @@ class Encoder:
         self._write_fixlen(field_id, data, _ST_STRING)
 
     def write_bytes(self, field_id: SupportsIndex,
-                    data: bytes | bytearray | memoryview) -> None:
+                    data: bytes | bytearray | memoryview,
+                    maxlen: int | None = None) -> None:
         """Write a raw byte blob as a fixlen field (BLOB subtype).
 
         A blob longer than :data:`sofab.FIXLEN_MAX` is refused with
         :class:`SofaArgumentError` (see :meth:`_write_fixlen`) — on the *declared*
         length, before the copy, so an oversized payload is never duplicated
         just to be rejected.
+
+        ``maxlen`` is the caller's bound on that length -- a schema's blob
+        ``maxlen`` -- checked on the same declared length: a longer blob is
+        :class:`SofaArgumentError` and nothing of the field is written. ``None``
+        (the default) checks none.
         """
         if not self._begin():
             return
@@ -668,6 +694,9 @@ class Encoder:
         if n > FIXLEN_MAX:
             self._fail(SofaArgumentError(
                 f"fixlen payload of {n} bytes exceeds FIXLEN_MAX={FIXLEN_MAX}"))
+            return
+        if maxlen is not None and n > maxlen:
+            self._fail(SofaArgumentError(f"blob of {n} bytes exceeds maxlen {maxlen}"))
             return
         self._write_fixlen(field_id, bytes(data), _ST_BLOB)
 
@@ -697,7 +726,8 @@ class Encoder:
     # --- arrays -------------------------------------------------------------
 
     def write_unsigned_array(self, field_id: SupportsIndex,
-                             values: Iterable[SupportsIndex]) -> None:
+                             values: Iterable[SupportsIndex],
+                             cap: int | None = None) -> None:
         """Write an array of unsigned integers, each as a varint.
 
         The element count must be ``0..ARRAY_MAX`` and every element an integer
@@ -705,12 +735,17 @@ class Encoder:
         :meth:`write_unsigned` for what counts as an integer). A zero-count array
         is a valid, fully-specified empty array on the wire
         (``[header][count=0]``).
+
+        ``cap`` is the caller's declared capacity -- a schema array's ``count``
+        -- and more elements than that is :class:`SofaArgumentError` before the
+        header, so nothing of the field is written. Every array writer takes it
+        the same way; ``None`` (the default) checks none.
         """
         if not self._begin():
             return
         try:
             seq = list(values)
-            self._array_header(field_id, _WT_ARRAY_UNSIGNED, len(seq))
+            self._array_header(field_id, _WT_ARRAY_UNSIGNED, len(seq), cap)
             # Hot path: the varint codec is inlined over the whole array so each
             # element costs a loop iteration rather than a Python call, and the
             # cursor lives in a local until the loop ends or has to drain. The
@@ -776,19 +811,21 @@ class Encoder:
             self._fail(exc)
 
     def write_signed_array(self, field_id: SupportsIndex,
-                           values: Iterable[SupportsIndex]) -> None:
+                           values: Iterable[SupportsIndex],
+                           cap: int | None = None) -> None:
         """Write an array of signed integers, each ZigZag-encoded into a varint.
 
         The element count must be ``0..ARRAY_MAX`` and every element an integer
         in ``SIGNED_MIN..SIGNED_MAX``, else :class:`SofaArgumentError` (see
         :meth:`write_unsigned` for what counts as an integer). A zero-count array
         is a valid, fully-specified empty array (``[header][count=0]``).
+        ``cap``: see :meth:`write_unsigned_array`.
         """
         if not self._begin():
             return
         try:
             seq = list(values)
-            self._array_header(field_id, _WT_ARRAY_SIGNED, len(seq))
+            self._array_header(field_id, _WT_ARRAY_SIGNED, len(seq), cap)
             buf = self._fixed_ba   # see write_unsigned_array: codec inlined
             limit = self._cap - _VARINT_MAX
             cursor = self._cursor
@@ -833,7 +870,8 @@ class Encoder:
             self._fail(exc)
 
     def write_bool_array(
-        self, field_id: SupportsIndex, values: Iterable[object]
+        self, field_id: SupportsIndex, values: Iterable[object],
+        cap: int | None = None,
     ) -> None:
         """Write an array of booleans, each as the varint ``1`` or ``0``.
 
@@ -849,13 +887,13 @@ class Encoder:
         test runs **per element, inside the loop** rather than up front, so a
         ``__bool__`` that raises leaves the same partial write the other array
         writers leave — the native engine reaches that state too, and the two
-        have to be indistinguishable.
+        have to be indistinguishable. ``cap``: see :meth:`write_unsigned_array`.
         """
         if not self._begin():
             return
         try:
             seq = list(values)
-            self._array_header(field_id, _WT_ARRAY_UNSIGNED, len(seq))
+            self._array_header(field_id, _WT_ARRAY_UNSIGNED, len(seq), cap)
             # A boolean element is always exactly one byte, 0x00 or 0x01, so
             # this is write_unsigned_array's inlined codec with every varint
             # case removed rather than a second copy of one. The view and the
@@ -886,15 +924,17 @@ class Encoder:
         except SofaError as exc:
             self._fail(exc)
 
-    def write_float32_array(self, field_id: SupportsIndex, values: Iterable[float]) -> None:
+    def write_float32_array(self, field_id: SupportsIndex, values: Iterable[float],
+                            cap: int | None = None) -> None:
         """Write an array of 32-bit floats as a packed little-endian fixlen array.
 
         The element count must be ``0..ARRAY_MAX``, else :class:`SofaArgumentError`.
         A zero-count array emits ``[header][count=0][fixlen_word]`` — the
         ``fixlen_word`` is always present (so empty fp32/fp64 arrays stay
-        distinguishable) but there is no payload (§4.8).
+        distinguishable) but there is no payload (§4.8). ``cap``: see
+        :meth:`write_unsigned_array`.
         """
-        self._write_float_array(field_id, values, _ST_FP32, _core.pack_f32_array, 4)
+        self._write_float_array(field_id, values, _ST_FP32, _core.pack_f32_array, 4, cap)
 
     def write_float32_array_bits(
         self, field_id: SupportsIndex, payload: Any, count: int | None = None
@@ -937,15 +977,17 @@ class Encoder:
         except SofaError as exc:
             self._fail(exc)
 
-    def write_float64_array(self, field_id: SupportsIndex, values: Iterable[float]) -> None:
+    def write_float64_array(self, field_id: SupportsIndex, values: Iterable[float],
+                            cap: int | None = None) -> None:
         """Write an array of 64-bit floats as a packed little-endian fixlen array.
 
         The element count must be ``0..ARRAY_MAX``, else :class:`SofaArgumentError`.
         A zero-count array emits ``[header][count=0][fixlen_word]`` — the
         ``fixlen_word`` is always present (so empty fp32/fp64 arrays stay
-        distinguishable) but there is no payload (§4.8).
+        distinguishable) but there is no payload (§4.8). ``cap``: see
+        :meth:`write_unsigned_array`.
         """
-        self._write_float_array(field_id, values, _ST_FP64, _core.pack_f64_array, 8)
+        self._write_float_array(field_id, values, _ST_FP64, _core.pack_f64_array, 8, cap)
 
     def _write_float_array(
         self,
@@ -954,12 +996,13 @@ class Encoder:
         subtype: int,
         pack_array: Callable[[list[float]], bytes],
         elem_size: int,
+        cap: int | None,
     ) -> None:
         if not self._begin():
             return
         try:
             seq = [float(v) for v in values]
-            self._array_header(field_id, _WT_ARRAY_FIXLEN, len(seq))
+            self._array_header(field_id, _WT_ARRAY_FIXLEN, len(seq), cap)
             # §4.8: a fixlen array ALWAYS carries its fixlen_word (the shared
             # element subtype/width), even when empty, so an empty fp32 and fp64
             # array stay distinguishable on the wire. The payload loop then runs
@@ -969,11 +1012,16 @@ class Encoder:
         except SofaError as exc:
             self._fail(exc)
 
-    def _array_header(self, field_id: SupportsIndex, wtype: int, count: int) -> None:
+    def _array_header(self, field_id: SupportsIndex, wtype: int, count: int,
+                      cap: int | None = None) -> None:
         # Defensive: count is always len() of a materialized list, so it is
         # non-negative and can't exceed ARRAY_MAX without exhausting memory first.
         if count < 0 or count > ARRAY_MAX:  # pragma: no cover
             raise SofaArgumentError(f"array count {count} out of range 0..{ARRAY_MAX}")
+        # The caller's declared capacity (a schema `count`), before the header:
+        # an array over it leaves nothing of the field behind.
+        if cap is not None and count > cap:
+            raise SofaArgumentError(f"array of {count} elements exceeds cap {cap}")
         self._header(field_id, wtype)
         self._emit_varint(count)
 

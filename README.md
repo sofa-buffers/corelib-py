@@ -146,8 +146,14 @@ except SofaArgumentError as exc:
     print(exc)                        # string of 10 UTF-8 bytes exceeds maxlen 8
 ```
 
-The bound is the caller's: the library holds none, and without the argument
-nothing is checked.
+The other writers take a declared bound the same way, as an optional last
+argument checked against what the call measures anyway: `write_bytes(id, data,
+maxlen)`, `write_unsigned(id, value, max_value)`, `write_signed(id, value,
+min_value, max_value)` -- the width of a narrower integer, which a Python `int`
+does not carry -- and `cap` on every array writer
+(`write_unsigned_array(id, values, cap)` and its siblings). Each refuses with
+`SofaArgumentError` before the field's header. The bound is the caller's: the
+library holds none, and without the argument nothing is checked.
 
 `Encoder()` writes into a fixed 1 KiB scratch buffer and appends each bufferful
 to the result it hands back — it never grows a buffer mid-message (see [Memory
