@@ -1497,7 +1497,7 @@ cdef class Encoder:
         _pack_f64(value, buf)
         self._write_fixlen_raw(field_id, buf, 8, _ST_FP64)
 
-    def write_string(self, object field_id, str text):
+    def write_string(self, object field_id, str text, object maxlen=None):
         # Strict UTF-8: no errors= argument, so a lone/unpaired surrogate raises
         # UnicodeEncodeError, which we map to SofaArgumentError — the encode-side
         # InvalidArgument outcome (CORELIB_PLAN §6.4 / MESSAGE_SPEC §8). Python
@@ -1508,6 +1508,10 @@ cdef class Encoder:
         # fresh ``text.encode("utf-8")`` bytes object: the bytes were only ever a
         # vehicle for a pointer and a length, and this is the same encoder, same
         # strictness, one allocation fewer per string field.
+        #
+        # ``maxlen`` bounds that UTF-8 length, which is known here and nowhere
+        # else without a second encode: over it is SofaArgumentError before the
+        # header, exactly as the pure engine. None checks nothing.
         if not self._begin():
             return
         cdef const char* utf8
@@ -1516,6 +1520,10 @@ cdef class Encoder:
             utf8 = PyUnicode_AsUTF8AndSize(text, &n)
         except UnicodeEncodeError as exc:
             self._fail(SofaArgumentError("string field is not valid UTF-8: %s" % exc))
+            return
+        if maxlen is not None and n > <Py_ssize_t>maxlen:
+            self._fail(SofaArgumentError(
+                "string of %d UTF-8 bytes exceeds maxlen %s" % (n, maxlen)))
             return
         self._write_fixlen_raw(field_id, <const unsigned char*>utf8, <size_t>n, _ST_STRING)
 
