@@ -140,6 +140,16 @@ cdef extern from *:
 
     static int __sofab_digits_ok = 0;   /* set by the self-test at import time */
 
+    /* The converters below run once per value written, inside the hot loops.
+     * GCC decides inlining per translation unit, and a change anywhere in this
+     * (large) module can tip it into calling them out of line -- measured at
+     * +0.4% Ir/op on the plain array writer alone. Forced, so it cannot. */
+    #if defined(__GNUC__)
+      #define __SOFAB_HOT static inline __attribute__((always_inline))
+    #else
+      #define __SOFAB_HOT static inline
+    #endif
+
     /* How many digits a 64-bit magnitude can occupy, and how many bits the most
      * significant of them may carry. With PyLong_SHIFT == 30 that is 3 digits
      * whose top one holds 4 bits; with 15 it is 5 digits, top one 4 bits. Both
@@ -150,7 +160,7 @@ cdef extern from *:
 
     /* |x| as a uint64_t, ignoring its sign. Returns 0 (leaving no exception set)
        when the magnitude does not fit in 64 bits. */
-    static int __sofab_mag_digits(PyObject *x, uint64_t *out) {
+    __SOFAB_HOT int __sofab_mag_digits(PyObject *x, uint64_t *out) {
         Py_ssize_t n = __sofab_ndigits(x);
         const digit *d = __sofab_digits(x);
         uint64_t v = 0;
@@ -168,12 +178,12 @@ cdef extern from *:
 
     /* Magnitude as a uint64_t. Returns 0 (leaving no exception set) when the
        value does not fit, which is exactly the format's unsigned domain. */
-    static int __sofab_u64_digits(PyObject *x, uint64_t *out) {
+    __SOFAB_HOT int __sofab_u64_digits(PyObject *x, uint64_t *out) {
         if (__sofab_isneg(x)) return 0;
         return __sofab_mag_digits(x, out);
     }
 
-    static int __sofab_u64(PyObject *x, uint64_t *out) {
+    __SOFAB_HOT int __sofab_u64(PyObject *x, uint64_t *out) {
         unsigned long long v;
         if (__sofab_digits_ok) return __sofab_u64_digits(x, out);
         v = __sofab_as_u64(x);
@@ -195,7 +205,7 @@ cdef extern from *:
         }
     }
 
-    static int __sofab_i64(PyObject *x, int64_t *out) {
+    __SOFAB_HOT int __sofab_i64(PyObject *x, int64_t *out) {
         long long v;
         uint64_t mag;
         if (__sofab_digits_ok) {
@@ -982,6 +992,94 @@ cdef int64_t _i64_other(object value, int what) except? -0xDEAD:
         return out
     raise SofaArgumentError("%s %d out of range" % (_WHATS[what], idx))
 
+# --- caller bounds (the ``*_bounded`` writers) ---------------------------------
+#
+# A bound is the caller's -- a schema maxlen, count or declared width -- and is
+# compared as a number, exactly as the pure engine compares it: a bound no value
+# can meet refuses every value, one past the 64-bit range refuses none, and one
+# that is no number raises Python's own TypeError. The usual bound, an exact int
+# inside the C range, becomes a C limit; anything else is compared as a Python
+# object. Out of line, so the converters keep their call sites in the hot loops.
+cdef int _u_limit(object bound, uint64_t* out) except -1:
+    # 1: ``*out`` is the limit as a C value (None: the 64-bit range's own end);
+    # 0: there is none -- compare as Python numbers (_u_over_obj).
+    if bound is None:
+        out[0] = _UNSIGNED_MAX
+        return 1
+    if _IsLong(<PyObject*>bound) and _ToU64(<PyObject*>bound, out):
+        return 1
+    out[0] = _UNSIGNED_MAX
+    return 1 if bound > UNSIGNED_MAX else 0
+
+cdef int _s_limit(object bound, int64_t* out, bint upper) except -1:
+    # _u_limit for one side of a signed range.
+    if bound is None:
+        out[0] = _SIGNED_MAX if upper else _SIGNED_MIN
+        return 1
+    if _IsLong(<PyObject*>bound) and _ToI64(<PyObject*>bound, out):
+        return 1
+    out[0] = _SIGNED_MAX if upper else _SIGNED_MIN
+    if upper:
+        return 1 if bound > SIGNED_MAX else 0
+    return 1 if bound < SIGNED_MIN else 0
+
+cdef uint64_t _u64_elem_cold(PyObject* p, int what) except? 0xDEAD:
+    return _u64_elem(p, what)
+
+cdef int64_t _i64_elem_cold(PyObject* p, int what) except? -0xDEAD:
+    return _i64_elem(p, what)
+
+cdef int _u_over_obj(uint64_t v, object bound) except -1:
+    return 1 if PyLong_FromUnsignedLongLong(v) > bound else 0
+
+cdef int _s_outside_obj(int64_t v, object lo, object hi, bint lo_slow,
+                        bint hi_slow) except -1:
+    cdef object o = PyLong_FromLongLong(v)
+    return 1 if (lo_slow and o < lo) or (hi_slow and o > hi) else 0
+
+cdef int _s_outside(int64_t v, object bound, bint upper) except -1:
+    # ``v`` past one side of the caller's signed range?
+    cdef int64_t lim
+    if _s_limit(bound, &lim, upper):
+        return 1 if (v > lim if upper else v < lim) else 0
+    if upper:
+        return _s_outside_obj(v, None, bound, False, True)
+    return _s_outside_obj(v, bound, None, True, False)
+
+cdef int _u_over(uint64_t v, object bound) except -1:
+    # ``v`` above the caller's bound? None checks nothing.
+    cdef uint64_t lim
+    if _u_limit(bound, &lim):
+        return 1 if v > lim else 0
+    return _u_over_obj(v, bound)
+
+cdef inline int _u_over_fast(uint64_t v, object bound) except -1:
+    # _u_over with the usual bound -- an exact int in the C range -- inline.
+    cdef uint64_t lim
+    if _IsLong(<PyObject*>bound) and _ToU64(<PyObject*>bound, &lim):
+        return 1 if v > lim else 0
+    return _u_over(v, bound)
+
+cdef inline int _s_outside_fast(int64_t v, object bound, bint upper) except -1:
+    cdef int64_t lim
+    if _IsLong(<PyObject*>bound) and _ToI64(<PyObject*>bound, &lim):
+        return 1 if (v > lim if upper else v < lim) else 0
+    return _s_outside(v, bound, upper)
+
+cdef inline int _check_cap(Py_ssize_t count, object cap) except -1:
+    # More than ``cap`` elements, before the header. None checks nothing.
+    if cap is not None and _u_over(<uint64_t>count, cap):
+        raise SofaArgumentError("array of %d elements exceeds cap %s" % (count, cap))
+    return 0
+
+cdef int _elem_refusal(int what, object v, object elem_min, object elem_max) except -1:
+    # Cold, and out of line so the element loop stays as small as the plain one:
+    # an element past the caller's width (the 64-bit range has already been
+    # checked by the converter, with its own words).
+    if what == _WHAT_UA:
+        raise SofaArgumentError("unsigned array value %s exceeds elem_max %s" % (v, elem_max))
+    raise SofaArgumentError("signed array value %s outside %s..%s" % (v, elem_min, elem_max))
+
 cdef inline uint64_t _id_arg(object field_id) except? 0xDEAD:
     # Field ids are 0..ID_MAX (2**31-1), so the *value* range is narrower than
     # what the converter itself rejects; the explicit bound stays, but on C ints.
@@ -1424,16 +1522,42 @@ cdef class Encoder:
 
     # --- scalars ------------------------------------------------------------
 
-    def write_unsigned(self, object field_id, object value, object max_value=None):
-        # max_value: the caller's declared maximum (a schema width), checked
-        # after the 64-bit range and before the header -- the pure engine's order.
+    def write_unsigned(self, object field_id, object value):
         if not self._begin():
             return
         cdef uint64_t fid
         cdef uint64_t uv
         try:
             uv = _u64_arg(value)          # value range first, as the pure engine does
-            if max_value is not None and uv > <uint64_t>max_value:
+            fid = _id_arg(field_id)
+            self._header_c(fid, _WT_UNSIGNED)
+            self._emit_varint(uv)
+        except SofaError as exc:
+            self._fail(exc)
+
+    def write_signed(self, object field_id, object value):
+        if not self._begin():
+            return
+        cdef uint64_t fid
+        cdef int64_t sv
+        try:
+            sv = _i64_arg(value)          # value range first, as the pure engine does
+            fid = _id_arg(field_id)
+            self._header_c(fid, _WT_SIGNED)
+            self._emit_varint(_zigzag_encode(sv))
+        except SofaError as exc:
+            self._fail(exc)
+
+    def write_unsigned_bounded(self, object field_id, object value, object max_value, /):
+        # write_unsigned with the caller's maximum (a schema width). The value's
+        # own range first, then the bound, then the header: the pure engine's order.
+        if not self._begin():
+            return
+        cdef uint64_t fid
+        cdef uint64_t uv
+        try:
+            uv = _u64_arg(value)
+            if max_value is not None and _u_over_fast(uv, max_value):
                 raise SofaArgumentError(
                     "unsigned value %d exceeds max_value %s" % (uv, max_value))
             fid = _id_arg(field_id)
@@ -1442,18 +1566,17 @@ cdef class Encoder:
         except SofaError as exc:
             self._fail(exc)
 
-    def write_signed(self, object field_id, object value, object min_value=None,
-                     object max_value=None):
-        # min_value/max_value: the caller's declared range (a schema width), as
-        # write_unsigned's max_value.
+    def write_signed_bounded(self, object field_id, object value, object min_value,
+                             object max_value, /):
+        # write_signed with the caller's range (a schema width).
         if not self._begin():
             return
         cdef uint64_t fid
         cdef int64_t sv
         try:
-            sv = _i64_arg(value)          # value range first, as the pure engine does
-            if (min_value is not None and sv < <int64_t>min_value) or \
-                    (max_value is not None and sv > <int64_t>max_value):
+            sv = _i64_arg(value)
+            if (min_value is not None and _s_outside_fast(sv, min_value, False)) or \
+                    (max_value is not None and _s_outside_fast(sv, max_value, True)):
                 raise SofaArgumentError(
                     "signed value %d outside %s..%s" % (sv, min_value, max_value))
             fid = _id_arg(field_id)
@@ -1509,7 +1632,7 @@ cdef class Encoder:
         _pack_f64(value, buf)
         self._write_fixlen_raw(field_id, buf, 8, _ST_FP64)
 
-    def write_string(self, object field_id, str text, object maxlen=None):
+    def write_string(self, object field_id, str text):
         # Strict UTF-8: no errors= argument, so a lone/unpaired surrogate raises
         # UnicodeEncodeError, which we map to SofaArgumentError — the encode-side
         # InvalidArgument outcome (CORELIB_PLAN §6.4 / MESSAGE_SPEC §8). Python
@@ -1520,10 +1643,6 @@ cdef class Encoder:
         # fresh ``text.encode("utf-8")`` bytes object: the bytes were only ever a
         # vehicle for a pointer and a length, and this is the same encoder, same
         # strictness, one allocation fewer per string field.
-        #
-        # ``maxlen`` bounds that UTF-8 length, which is known here and nowhere
-        # else without a second encode: over it is SofaArgumentError before the
-        # header, exactly as the pure engine. None checks nothing.
         if not self._begin():
             return
         cdef const char* utf8
@@ -1533,13 +1652,9 @@ cdef class Encoder:
         except UnicodeEncodeError as exc:
             self._fail(SofaArgumentError("string field is not valid UTF-8: %s" % exc))
             return
-        if maxlen is not None and n > <Py_ssize_t>maxlen:
-            self._fail(SofaArgumentError(
-                "string of %d UTF-8 bytes exceeds maxlen %s" % (n, maxlen)))
-            return
         self._write_fixlen_raw(field_id, <const unsigned char*>utf8, <size_t>n, _ST_STRING)
 
-    def write_bytes(self, object field_id, object data, object maxlen=None):
+    def write_bytes(self, object field_id, object data):
         if not self._begin():
             return
         # Screen the blob on its declared length before the copy (§6.2
@@ -1552,8 +1667,38 @@ cdef class Encoder:
             self._fail(SofaArgumentError(
                 "fixlen payload of %d bytes exceeds FIXLEN_MAX=%d" % (n, _FIXLEN_MAX)))
             return
-        # The caller's bound (a schema blob maxlen) on the same declared length.
-        if maxlen is not None and n > <Py_ssize_t>maxlen:
+        cdef bytes b = bytes(data)
+        self._write_fixlen_bytes(field_id, b, _ST_BLOB)
+
+    def write_string_bounded(self, object field_id, str text, object maxlen, /):
+        # write_string with the caller's bound on the UTF-8 length (a schema
+        # maxlen), which exists only here: compared to the length the encode
+        # already produced, before the header. Mirrors the pure engine.
+        if not self._begin():
+            return
+        cdef const char* utf8
+        cdef Py_ssize_t n
+        try:
+            utf8 = PyUnicode_AsUTF8AndSize(text, &n)
+        except UnicodeEncodeError as exc:
+            self._fail(SofaArgumentError("string field is not valid UTF-8: %s" % exc))
+            return
+        if maxlen is not None and _u_over_fast(<uint64_t>n, maxlen):
+            self._fail(SofaArgumentError(
+                "string of %d UTF-8 bytes exceeds maxlen %s" % (n, maxlen)))
+            return
+        self._write_fixlen_raw(field_id, <const unsigned char*>utf8, <size_t>n, _ST_STRING)
+
+    def write_bytes_bounded(self, object field_id, object data, object maxlen, /):
+        # write_bytes with the caller's bound on the declared length, before the copy.
+        if not self._begin():
+            return
+        cdef Py_ssize_t n = len(data)
+        if n > <Py_ssize_t>_FIXLEN_MAX:
+            self._fail(SofaArgumentError(
+                "fixlen payload of %d bytes exceeds FIXLEN_MAX=%d" % (n, _FIXLEN_MAX)))
+            return
+        if maxlen is not None and _u_over_fast(<uint64_t>n, maxlen):
             self._fail(SofaArgumentError("blob of %d bytes exceeds maxlen %s" % (n, maxlen)))
             return
         cdef bytes b = bytes(data)
@@ -1596,7 +1741,7 @@ cdef class Encoder:
 
     # --- arrays -------------------------------------------------------------
 
-    def write_unsigned_array(self, object field_id, values, object cap=None):
+    def write_unsigned_array(self, object field_id, values):
         if not self._begin():
             return
         cdef list seq
@@ -1604,13 +1749,13 @@ cdef class Encoder:
         try:
             seq = _as_list(values)
             count = PyList_GET_SIZE(seq)
-            self._array_header(field_id, _WT_ARRAY_UNSIGNED, count, cap)
+            self._array_header(field_id, _WT_ARRAY_UNSIGNED, count)
             for i in range(count):
                 self._emit_varint(_u64_elem(_elem(seq, i), _WHAT_UA))
         except SofaError as exc:
             self._fail(exc)
 
-    def write_signed_array(self, object field_id, values, object cap=None):
+    def write_signed_array(self, object field_id, values):
         if not self._begin():
             return
         cdef list seq
@@ -1618,13 +1763,13 @@ cdef class Encoder:
         try:
             seq = _as_list(values)
             count = PyList_GET_SIZE(seq)
-            self._array_header(field_id, _WT_ARRAY_SIGNED, count, cap)
+            self._array_header(field_id, _WT_ARRAY_SIGNED, count)
             for i in range(count):
                 self._emit_varint(_zigzag_encode(_i64_elem(_elem(seq, i), _WHAT_SA)))
         except SofaError as exc:
             self._fail(exc)
 
-    def write_bool_array(self, object field_id, values, object cap=None):
+    def write_bool_array(self, object field_id, values):
         # The array half of write_bool (S4.4): each element is tested for truth
         # and goes out as 1 or 0, so the encode stays canonical. An array of
         # boolean IS an array of unsigned on the wire. Written here rather than
@@ -1637,16 +1782,146 @@ cdef class Encoder:
         try:
             seq = _as_list(values)
             count = PyList_GET_SIZE(seq)
-            self._array_header(field_id, _WT_ARRAY_UNSIGNED, count, cap)
+            self._array_header(field_id, _WT_ARRAY_UNSIGNED, count)
             for i in range(count):
                 self._emit_varint(1 if PyObject_IsTrue(_elem(seq, i)) else 0)
         except SofaError as exc:
             self._fail(exc)
 
-    def write_float32_array(self, object field_id, values, object cap=None):
+    def write_float32_array(self, object field_id, values):
+        self._write_float_array(field_id, values, _ST_FP32, 4, None)
+
+    def write_float64_array(self, object field_id, values):
+        self._write_float_array(field_id, values, _ST_FP64, 8, None)
+
+    # The *_bounded array writers take the caller's bounds -- a schema count as
+    # ``cap``, checked before the header, and an integer element's declared width
+    # as ``elem_min``/``elem_max``, checked on each element right after the
+    # 64-bit conversion it already goes through. None checks none on that side.
+    # Separate methods rather than optional parameters: an optional parameter
+    # costs every unbounded call its default handling in the Cython wrapper.
+
+    # The bounded writers are their own, so the plain writers above keep exactly
+    # the loop they had: a caller that passes no bound pays nothing for them.
+    # The element loops are small functions of their own (_unsigned_elems,
+    # _signed_elems) and the refusal is out of line (_elem_refusal), so the loop
+    # stays as small as the plain one and its emitter stays inlined.
+    def write_unsigned_array_bounded(self, object field_id, values, object cap,
+                                     object elem_max, /):
+        if not self._begin():
+            return
+        cdef list seq
+        cdef Py_ssize_t count
+        cdef uint64_t hi
+        try:
+            seq = _as_list(values)
+            count = PyList_GET_SIZE(seq)
+            _check_cap(count, cap)
+            if _u_limit(elem_max, &hi):
+                self._array_header(field_id, _WT_ARRAY_UNSIGNED, count)
+                self._unsigned_elems(seq, count, hi, elem_max)
+            else:
+                self._array_header(field_id, _WT_ARRAY_UNSIGNED, count)
+                self._unsigned_elems_obj(seq, count, elem_max)
+        except SofaError as exc:
+            self._fail(exc)
+
+    def write_signed_array_bounded(self, object field_id, values, object cap,
+                                   object elem_min, object elem_max, /):
+        if not self._begin():
+            return
+        cdef list seq
+        cdef Py_ssize_t count
+        cdef int64_t lo, hi
+        cdef bint lo_slow, hi_slow
+        try:
+            seq = _as_list(values)
+            count = PyList_GET_SIZE(seq)
+            _check_cap(count, cap)
+            lo_slow = not _s_limit(elem_min, &lo, False)
+            hi_slow = not _s_limit(elem_max, &hi, True)
+            self._array_header(field_id, _WT_ARRAY_SIGNED, count)
+            if lo_slow or hi_slow:
+                self._signed_elems_obj(seq, count, elem_min, elem_max, lo_slow, hi_slow)
+            else:
+                self._signed_elems(seq, count, lo, hi, elem_min, elem_max)
+        except SofaError as exc:
+            self._fail(exc)
+
+    cdef int _unsigned_elems(self, list seq, Py_ssize_t count, uint64_t hi,
+                             object elem_max) except -1:
+        cdef Py_ssize_t i
+        cdef uint64_t uv
+        for i in range(count):
+            uv = _u64_elem(_elem(seq, i), _WHAT_UA)
+            if uv > hi:
+                _elem_refusal(_WHAT_UA, uv, None, elem_max)
+            self._emit_varint(uv)
+        return 0
+
+    cdef int _signed_elems(self, list seq, Py_ssize_t count, int64_t lo, int64_t hi,
+                           object elem_min, object elem_max) except -1:
+        cdef Py_ssize_t i
+        cdef int64_t sv
+        for i in range(count):
+            sv = _i64_elem(_elem(seq, i), _WHAT_SA)
+            if sv < lo or sv > hi:
+                _elem_refusal(_WHAT_SA, sv, elem_min, elem_max)
+            self._emit_varint(_zigzag_encode(sv))
+        return 0
+
+    # A width bound with no C value (outside the C range, or not an int) is
+    # compared as a Python number per element. Its own loop, so the usual one
+    # above stays as small as the plain writer's.
+    # Cold, so through out-of-line converters and the out-of-line emitter: an
+    # inline copy here would count against the inlining the hot loops get.
+    cdef int _unsigned_elems_obj(self, list seq, Py_ssize_t count, object elem_max) except -1:
+        cdef Py_ssize_t i
+        cdef uint64_t uv
+        for i in range(count):
+            uv = _u64_elem_cold(_elem(seq, i), _WHAT_UA)
+            if _u_over_obj(uv, elem_max):
+                _elem_refusal(_WHAT_UA, uv, None, elem_max)
+            self._emit_varint_cold(uv)
+        return 0
+
+    cdef int _emit_varint_cold(self, uint64_t value) except -1:
+        return self._emit_varint(value)
+
+    cdef int _signed_elems_obj(self, list seq, Py_ssize_t count, object elem_min,
+                               object elem_max, bint lo_slow, bint hi_slow) except -1:
+        cdef Py_ssize_t i
+        cdef int64_t sv, lo, hi
+        _s_limit(elem_min, &lo, False)
+        _s_limit(elem_max, &hi, True)
+        for i in range(count):
+            sv = _i64_elem_cold(_elem(seq, i), _WHAT_SA)
+            if (not lo_slow and sv < lo) or (not hi_slow and sv > hi) or \
+                    _s_outside_obj(sv, elem_min, elem_max, lo_slow, hi_slow):
+                _elem_refusal(_WHAT_SA, sv, elem_min, elem_max)
+            self._emit_varint_cold(_zigzag_encode(sv))
+        return 0
+
+    def write_bool_array_bounded(self, object field_id, values, object cap, /):
+        # A boolean has no width (S4.4): ``cap`` only.
+        if not self._begin():
+            return
+        cdef list seq
+        cdef Py_ssize_t i, count
+        try:
+            seq = _as_list(values)
+            count = PyList_GET_SIZE(seq)
+            _check_cap(count, cap)
+            self._array_header(field_id, _WT_ARRAY_UNSIGNED, count)
+            for i in range(count):
+                self._emit_varint(1 if PyObject_IsTrue(_elem(seq, i)) else 0)
+        except SofaError as exc:
+            self._fail(exc)
+
+    def write_float32_array_bounded(self, object field_id, values, object cap, /):
         self._write_float_array(field_id, values, _ST_FP32, 4, cap)
 
-    def write_float64_array(self, object field_id, values, object cap=None):
+    def write_float64_array_bounded(self, object field_id, values, object cap, /):
         self._write_float_array(field_id, values, _ST_FP64, 8, cap)
 
     @cython.always_allow_keywords(True)
@@ -1670,7 +1945,7 @@ cdef class Encoder:
                     raise SofaArgumentError(
                         "count=%s does not match the %d elements %d payload "
                         "bytes carry" % (count, have, n))
-                self._array_header(field_id, _WT_ARRAY_FIXLEN, have, None)
+                self._array_header(field_id, _WT_ARRAY_FIXLEN, have)
                 # S4.8: the fixlen_word is always present, empty array included.
                 self._emit_varint((<uint64_t>4 << 3) | <uint64_t>_ST_FP32)
                 if n:
@@ -1691,7 +1966,8 @@ cdef class Encoder:
         try:
             seq = _as_float_list(values)
             count = PyList_GET_SIZE(seq)
-            self._array_header(field_id, _WT_ARRAY_FIXLEN, count, cap)
+            _check_cap(count, cap)
+            self._array_header(field_id, _WT_ARRAY_FIXLEN, count)
             # §4.8: the fixlen_word is ALWAYS emitted (even for an empty array),
             # then the packed payload (zero bytes when empty).
             self._emit_varint((<uint64_t>elem_size << 3) | <uint64_t>subtype)
@@ -1732,13 +2008,9 @@ cdef class Encoder:
         self._put(buf, 8)
         return 0
 
-    cdef int _array_header(self, object field_id, int wtype, Py_ssize_t count,
-                           object cap) except -1:
+    cdef int _array_header(self, object field_id, int wtype, Py_ssize_t count) except -1:
         if count < 0 or count > <Py_ssize_t>_ARRAY_MAX:
             raise SofaArgumentError("array count %d out of range 0..%d" % (count, _ARRAY_MAX))
-        # The caller's declared capacity (a schema count), before the header.
-        if cap is not None and count > <Py_ssize_t>cap:
-            raise SofaArgumentError("array of %d elements exceeds cap %s" % (count, cap))
         self._header(field_id, wtype)
         self._emit_varint(<uint64_t>count)
         return 0
