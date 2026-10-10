@@ -529,8 +529,9 @@ class _Index:
         return self.v
 
 
-class _OversizedBlob:
-    """One byte past ``FIXLEN_MAX`` by its declared length; never materialised."""
+class _OversizedBlob(bytes):
+    """A ``bytes`` one byte past ``FIXLEN_MAX`` by its declared length; never
+    materialised."""
 
     def __len__(self) -> int:
         from sofab.types import FIXLEN_MAX
