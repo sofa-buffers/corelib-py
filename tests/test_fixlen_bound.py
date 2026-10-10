@@ -26,12 +26,13 @@ from sofab.encoder import Encoder as PyEncoder
 from sofab.types import FIXLEN_MAX, FixlenSubtype, SofaArgumentError, WireType
 
 
-class OversizedBlob:
-    """A bytes-like one byte past ``FIXLEN_MAX``, whose payload is a tripwire.
+class OversizedBlob(bytes):
+    """A ``bytes`` one byte past ``FIXLEN_MAX``, whose payload is a tripwire.
 
-    Every route to the actual bytes (the buffer protocol on 3.12+, ``__bytes__``,
-    iteration) raises: the encoder must decide on the declared length and refuse,
-    never copy 2 GiB it is about to reject.
+    A ``bytes`` subclass, so it is a byte string a blob writer accepts and
+    measures with ``len()``. Every route to the actual bytes (the buffer
+    protocol on 3.12+, ``__bytes__``, iteration) raises: the encoder must decide
+    on the declared length and refuse, never copy 2 GiB it is about to reject.
     """
 
     def __len__(self) -> int:
