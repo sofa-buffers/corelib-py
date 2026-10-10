@@ -133,26 +133,268 @@ def _as_int(value: object, what: str) -> int:
         ) from None
 
 
-# --- caller bounds (the ``*_bounded`` writers) ---------------------------------
+# --- caller bounds -------------------------------------------------------------
 #
-# A ``*_bounded`` writer takes the caller's bound -- a schema's maxlen, count or
-# declared width -- as an argument; the library holds none of its own. ``None``
-# leaves that side unchecked. A bound is compared as a number, exactly as Python
-# compares (a bound no value can meet refuses every value, one past the 64-bit
-# range refuses none), and a bound that is no number raises Python's own
-# TypeError. The native engine does the same, case for case.
+# Two kinds of bound reach a writer, and neither is held by the library.
+#
+# * A schema's maxlen or count is a number only the caller knows: it rides the
+#   call as an argument (``write_string_bounded``, ``write_bytes_bounded``, the
+#   ``cap`` of the array writers). ``None`` (or a negative ``cap``) leaves it
+#   unchecked. Such a bound is compared as a number, exactly as Python compares
+#   (a bound no value can meet refuses every value), and one that is no number
+#   raises Python's own TypeError. The native engine does the same.
+# * A declared integer width is a TYPE: it is in the writer's name
+#   (``write_u8``, ``write_i16_array``, ...), the way other ports spell
+#   ``writeUInt8``. A width passed as an argument would cost an argument on every
+#   call of a native writer for a number that is one of six constants.
+
+#: The C ssize_t range the native engine's ``cap`` parameter is converted to.
+_SSIZE_MAX = (1 << 63) - 1
+_SSIZE_MIN = -(1 << 63)
+
+#: The range of each width-typed writer: name -> (lo, hi).
+_WIDTHS = {
+    "u8": (0, 0xFF), "u16": (0, 0xFFFF), "u32": (0, 0xFFFFFFFF), "u64": (0, UNSIGNED_MAX),
+    "i8": (-0x80, 0x7F), "i16": (-0x8000, 0x7FFF), "i32": (-0x80000000, 0x7FFFFFFF),
+    "i64": (SIGNED_MIN, SIGNED_MAX),
+}
 
 
-def _elem_refusal(kind: str, v: int, elem_min: object, elem_max: object) -> str:
+def _elem_refusal(kind: str, v: int, width: str | None) -> str:
     """The text an array element outside its range is refused with: the 64-bit
-    range's own wording first, so an unbounded writer's message is unchanged."""
+    range's own wording first, so an untyped writer's message is unchanged."""
     if kind == "unsigned":
         if v < 0 or v > UNSIGNED_MAX:
             return f"unsigned array value {v} out of range"
-        return f"unsigned array value {v} exceeds elem_max {elem_max}"
+        return f"unsigned array value {v} exceeds {width}"
     if v < SIGNED_MIN or v > SIGNED_MAX:
         return f"signed array value {v} out of range"
-    return f"signed array value {v} outside {elem_min}..{elem_max}"
+    return f"signed array value {v} outside {width}"
+
+
+def _cap_of(cap: int) -> int:
+    """A width-typed array writer's ``cap`` that is not a plain int in C
+    ``ssize_t`` range: its integer value, or the error the native engine's
+    C-typed parameter raises -- Python's own TypeError for a non-integer, an
+    OverflowError outside the range. A negative cap means no count bound."""
+    cap = int(_index(cap))   # an exact int: Python 3.9 index() returns a bool as is
+    if cap > _SSIZE_MAX or cap < _SSIZE_MIN:
+        raise OverflowError(f"cap {cap} does not fit a C ssize_t")
+    return cap
+
+
+# --- width-typed writer factories ---------------------------------------------
+#
+# Each width-typed writer is its own function, made here once per width at class
+# creation, so the width is a closure constant and a call is one Python call: a
+# thin method delegating to a shared one costs every call a second, which the
+# encode of a whole message measured at +2%. The body is written once, here.
+
+
+_ScalarWriter = Callable[["Encoder", SupportsIndex, SupportsIndex], None]
+
+
+def _unsigned_scalar(width: str, doc: str) -> _ScalarWriter:
+    hi = _WIDTHS[width][1]
+
+    def write(self: Encoder, field_id: SupportsIndex, value: SupportsIndex, /) -> None:
+        # write_unsigned within the width: the value's own 64-bit range first,
+        # then the width, then the header -- the native engine's order.
+        if not self._begin():
+            return
+        try:
+            if not isinstance(value, int):
+                value = _as_int(value, "unsigned value")
+            if value < 0 or value > UNSIGNED_MAX:
+                raise SofaArgumentError(f"unsigned value {value} out of range")
+            if value > hi:
+                raise SofaArgumentError(f"unsigned value {value} exceeds {width}")
+            self._header(field_id, _WT_UNSIGNED)
+            self._emit_varint(value)
+        except SofaError as exc:
+            self._fail(exc)
+
+    write.__name__ = write.__qualname__ = f"write_{width}"
+    write.__doc__ = doc
+    return write
+
+
+def _signed_scalar(width: str, doc: str) -> _ScalarWriter:
+    lo, hi = _WIDTHS[width]
+
+    def write(self: Encoder, field_id: SupportsIndex, value: SupportsIndex, /) -> None:
+        # write_signed within the width; see _unsigned_scalar.
+        if not self._begin():
+            return
+        try:
+            if not isinstance(value, int):
+                value = _as_int(value, "signed value")
+            if value < SIGNED_MIN or value > SIGNED_MAX:
+                raise SofaArgumentError(f"signed value {value} out of range")
+            if value < lo or value > hi:
+                raise SofaArgumentError(f"signed value {value} outside {width}")
+            self._header(field_id, _WT_SIGNED)
+            self._emit_varint(zigzag_encode(value))
+        except SofaError as exc:
+            self._fail(exc)
+
+    write.__name__ = write.__qualname__ = f"write_{width}"
+    write.__doc__ = doc
+    return write
+
+
+_ArrayWriter = Callable[["Encoder", SupportsIndex, Iterable[SupportsIndex], int], None]
+
+
+def _unsigned_array_writer(width: str, doc: str) -> _ArrayWriter:
+    top = _WIDTHS[width][1]   # the width's end, never past the 64-bit range's
+
+    def write(self: Encoder, field_id: SupportsIndex, values: Iterable[SupportsIndex],
+              cap: int, /) -> None:
+        # The count bound is checked as an integer before anything else, as the
+        # native engine's C-typed parameter is converted before its body runs;
+        # a plain int in range -- every generated call -- costs no Python call.
+        if type(cap) is not int or not _SSIZE_MIN <= cap <= _SSIZE_MAX:
+            cap = _cap_of(cap)
+        if not self._begin():
+            return
+        try:
+            seq = list(values)
+            if cap >= 0 and len(seq) > cap:
+                raise SofaArgumentError(f"array of {len(seq)} elements exceeds cap {cap}")
+            self._array_header(field_id, _WT_ARRAY_UNSIGNED, len(seq))
+            # Hot path: the varint codec is inlined over the whole array so each
+            # element costs a loop iteration rather than a Python call, and the
+            # cursor lives in a local until the loop ends or has to drain. The
+            # view and capacity are re-read after every drain — a sink may
+            # install a different buffer (see _put).
+            hi = top   # read per element: a local, not the closure's cell
+            buf = self._fixed_ba
+            limit = self._cap - _VARINT_MAX   # last cursor an inline varint fits at
+            cursor = self._cursor
+            try:
+                for v in seq:
+                    if not isinstance(v, int):
+                        v = _as_int(v, "unsigned array value")
+                    if v < 0 or v > hi:
+                        raise SofaArgumentError(_elem_refusal("unsigned", v, width))
+                    if cursor > limit:
+                        # Too close to the end for the inline path: _put splits
+                        # the element across the drain and may land in a fresh
+                        # buffer, so everything it touches is re-read after it.
+                        self._cursor = cursor
+                        try:
+                            self._put(encode_varint(v))
+                        finally:
+                            # Whatever _put reached is authoritative, including
+                            # when it failed partway: the outer finally must not
+                            # rewind the cursor over bytes it already wrote.
+                            cursor = self._cursor
+                        buf = self._fixed_ba
+                        limit = self._cap - _VARINT_MAX
+                        continue
+                    # Varints are emitted by width, not one group at a time.
+                    # One and two bytes get a straight line each -- between them
+                    # that is nearly every id, length and count on the wire --
+                    # and anything longer runs a loop that does TWO 7-bit groups
+                    # a turn: five steps where two single-group turns cost eight.
+                    # ``>= 0x4000`` means at least three groups remain, so both
+                    # bytes that loop writes are certain to need a continuation
+                    # bit. The array elements this loop encodes are the case that
+                    # gets there -- 8.4 groups per element on the u64 workload.
+                    if v < 0x80:
+                        buf[cursor] = v
+                        cursor += 1
+                    elif v < 0x4000:
+                        buf[cursor] = (v & 0x7F) | 0x80
+                        buf[cursor + 1] = v >> 7
+                        cursor += 2
+                    else:
+                        while v >= 0x4000:
+                            buf[cursor] = (v & 0x7F) | 0x80
+                            buf[cursor + 1] = ((v >> 7) & 0x7F) | 0x80
+                            cursor += 2
+                            v >>= 14
+                        if v >= 0x80:
+                            buf[cursor] = (v & 0x7F) | 0x80
+                            cursor += 1
+                            v >>= 7
+                        buf[cursor] = v
+                        cursor += 1
+            finally:
+                # Also on the way out of a rejected element: what was written
+                # stays written, exactly as it did when the buffer was growable.
+                self._cursor = cursor
+        except SofaError as exc:
+            self._fail(exc)
+
+    write.__name__ = write.__qualname__ = f"write_{width}_array"
+    write.__doc__ = doc
+    return write
+
+
+def _signed_array_writer(width: str, doc: str) -> _ArrayWriter:
+    bottom, top = _WIDTHS[width]
+
+    def write(self: Encoder, field_id: SupportsIndex, values: Iterable[SupportsIndex],
+              cap: int, /) -> None:
+        # See _unsigned_array_writer.
+        if type(cap) is not int or not _SSIZE_MIN <= cap <= _SSIZE_MAX:
+            cap = _cap_of(cap)
+        if not self._begin():
+            return
+        try:
+            seq = list(values)
+            if cap >= 0 and len(seq) > cap:
+                raise SofaArgumentError(f"array of {len(seq)} elements exceeds cap {cap}")
+            self._array_header(field_id, _WT_ARRAY_SIGNED, len(seq))
+            lo, hi = bottom, top   # see _unsigned_array_writer
+            buf = self._fixed_ba   # see _unsigned_array_writer: codec inlined
+            limit = self._cap - _VARINT_MAX
+            cursor = self._cursor
+            try:
+                for v in seq:
+                    if not isinstance(v, int):
+                        v = _as_int(v, "signed array value")
+                    if v < lo or v > hi:
+                        raise SofaArgumentError(_elem_refusal("signed", v, width))
+                    u = (v << 1) ^ (v >> 63)
+                    if cursor > limit:
+                        self._cursor = cursor
+                        try:
+                            self._put(encode_varint(u))
+                        finally:
+                            cursor = self._cursor   # see _unsigned_array_writer
+                        buf = self._fixed_ba
+                        limit = self._cap - _VARINT_MAX
+                        continue
+                    if u < 0x80:
+                        buf[cursor] = u
+                        cursor += 1
+                    elif u < 0x4000:
+                        buf[cursor] = (u & 0x7F) | 0x80
+                        buf[cursor + 1] = u >> 7
+                        cursor += 2
+                    else:
+                        while u >= 0x4000:
+                            buf[cursor] = (u & 0x7F) | 0x80
+                            buf[cursor + 1] = ((u >> 7) & 0x7F) | 0x80
+                            cursor += 2
+                            u >>= 14
+                        if u >= 0x80:
+                            buf[cursor] = (u & 0x7F) | 0x80
+                            cursor += 1
+                            u >>= 7
+                        buf[cursor] = u
+                        cursor += 1
+            finally:
+                self._cursor = cursor
+        except SofaError as exc:
+            self._fail(exc)
+
+    write.__name__ = write.__qualname__ = f"write_{width}_array"
+    write.__doc__ = doc
+    return write
 
 
 class Encoder:
@@ -484,7 +726,7 @@ class Encoder:
         cursor = self._cursor
         if cursor + _VARINT_MAX <= self._cap:
             buf = self._fixed_ba
-            # By width -- see write_unsigned_array. A field header is one byte
+            # By width -- see _unsigned_array_writer. A field header is one byte
             # while the id is below 16 and two up to 4096, so those two are the
             # ones this site sees.
             if value < 0x80:
@@ -599,55 +841,23 @@ class Encoder:
         except SofaError as exc:
             self._fail(exc)
 
-    def write_unsigned_bounded(self, field_id: SupportsIndex, value: SupportsIndex,
-                               max_value: int | None, /) -> None:
-        """:meth:`write_unsigned` with the caller's maximum.
-
-        ``max_value`` is the width a schema gives a narrower field (255 for a
-        ``u8``); a value above it is :class:`SofaArgumentError` before any byte of
-        the field is written. ``None`` checks only the 64-bit range. The bound
-        is the caller's: the library holds none.
-        """
-        if not self._begin():
-            return
-        try:
-            if not isinstance(value, int):
-                value = _as_int(value, "unsigned value")
-            if value < 0 or value > UNSIGNED_MAX:
-                raise SofaArgumentError(f"unsigned value {value} out of range")
-            if max_value is not None and value > max_value:
-                raise SofaArgumentError(
-                    f"unsigned value {value} exceeds max_value {max_value}")
-            self._header(field_id, _WT_UNSIGNED)
-            self._emit_varint(value)
-        except SofaError as exc:
-            self._fail(exc)
-
-    def write_signed_bounded(self, field_id: SupportsIndex, value: SupportsIndex,
-                             min_value: int | None,
-                             max_value: int | None, /) -> None:
-        """:meth:`write_signed` with the caller's range.
-
-        ``min_value``/``max_value`` are the width a schema gives a narrower field
-        (-128..127 for an ``i8``); a value outside is :class:`SofaArgumentError`
-        before any byte of the field is written. ``None`` leaves that side at
-        the 64-bit range.
-        """
-        if not self._begin():
-            return
-        try:
-            if not isinstance(value, int):
-                value = _as_int(value, "signed value")
-            if value < SIGNED_MIN or value > SIGNED_MAX:
-                raise SofaArgumentError(f"signed value {value} out of range")
-            if (min_value is not None and value < min_value) or \
-                    (max_value is not None and value > max_value):
-                raise SofaArgumentError(
-                    f"signed value {value} outside {min_value}..{max_value}")
-            self._header(field_id, _WT_SIGNED)
-            self._emit_varint(zigzag_encode(value))
-        except SofaError as exc:
-            self._fail(exc)
+    # The width-typed scalar writers (see "caller bounds" above), one per width.
+    # Made by _unsigned_scalar / _signed_scalar so that each holds its own code:
+    # one shared method behind six thin ones would cost every call a second
+    # Python call, which measured +2% on the encode of a whole message.
+    write_u8 = _unsigned_scalar(
+        "u8", """:meth:`write_unsigned` for a field declared ``u8`` (or an enum or
+        bitfield of that width): a value above 255 is :class:`SofaArgumentError`
+        before any byte of the field is written.""")
+    write_u16 = _unsigned_scalar("u16", """:meth:`write_u8` for ``u16``: 0..65535.""")
+    write_u32 = _unsigned_scalar("u32", """:meth:`write_u8` for ``u32``: 0..4294967295.""")
+    write_i8 = _signed_scalar(
+        "i8", """:meth:`write_signed` for a field declared ``i8`` (or an enum of
+        that width): a value outside -128..127 is :class:`SofaArgumentError`
+        before any byte of the field is written.""")
+    write_i16 = _signed_scalar("i16", """:meth:`write_i8` for ``i16``: -32768..32767.""")
+    write_i32 = _signed_scalar(
+        "i32", """:meth:`write_i8` for ``i32``: -2147483648..2147483647.""")
 
     def write_bool(self, field_id: SupportsIndex, value: bool) -> None:
         """Write a boolean as an unsigned field (``1``/``0``)."""
@@ -810,94 +1020,29 @@ class Encoder:
         is a valid, fully-specified empty array on the wire
         (``[header][count=0]``).
         """
-        self.write_unsigned_array_bounded(field_id, values, None, None)
+        self.write_u64_array(field_id, values, -1)
 
-    def write_unsigned_array_bounded(self, field_id: SupportsIndex,
-                                     values: Iterable[SupportsIndex],
-                                     cap: int | None,
-                                     elem_max: int | None, /) -> None:
-        """:meth:`write_unsigned_array` with the caller's bounds.
+    # The width-typed unsigned array writers, one per element width; see
+    # _unsigned_array_writer and the scalar writers above.
+    write_u8_array = _unsigned_array_writer(
+        "u8", """:meth:`write_unsigned_array` for an array of ``u8`` (or of an enum
+        or bitfield of that width), with the schema's ``count`` as ``cap``.
 
-        ``cap`` is a schema array's ``count``: more elements than that is
-        :class:`SofaArgumentError` before the header, so nothing of the field is
-        written. ``elem_max`` is the element's declared width (255 for
-        ``array<u8>``): an element above it is :class:`SofaArgumentError` from
-        the same per-element range check every element already passes. ``None``
-        checks none on that side.
-        """
-        if not self._begin():
-            return
-        try:
-            seq = list(values)
-            if cap is not None and len(seq) > cap:
-                raise SofaArgumentError(f"array of {len(seq)} elements exceeds cap {cap}")
-            # The element test is one comparison against the tighter of the two
-            # ends, the 64-bit range's and the caller's.
-            hi = UNSIGNED_MAX if elem_max is None or elem_max > UNSIGNED_MAX else elem_max
-            self._array_header(field_id, _WT_ARRAY_UNSIGNED, len(seq))
-            # Hot path: the varint codec is inlined over the whole array so each
-            # element costs a loop iteration rather than a Python call, and the
-            # cursor lives in a local until the loop ends or has to drain. The
-            # view and capacity are re-read after every drain — a sink may
-            # install a different buffer (see _put).
-            buf = self._fixed_ba
-            limit = self._cap - _VARINT_MAX   # last cursor an inline varint fits at
-            cursor = self._cursor
-            try:
-                for v in seq:
-                    if not isinstance(v, int):
-                        v = _as_int(v, "unsigned array value")
-                    if v < 0 or v > hi:
-                        raise SofaArgumentError(_elem_refusal("unsigned", v, None, elem_max))
-                    if cursor > limit:
-                        # Too close to the end for the inline path: _put splits
-                        # the element across the drain and may land in a fresh
-                        # buffer, so everything it touches is re-read after it.
-                        self._cursor = cursor
-                        try:
-                            self._put(encode_varint(v))
-                        finally:
-                            # Whatever _put reached is authoritative, including
-                            # when it failed partway: the outer finally must not
-                            # rewind the cursor over bytes it already wrote.
-                            cursor = self._cursor
-                        buf = self._fixed_ba
-                        limit = self._cap - _VARINT_MAX
-                        continue
-                    # Varints are emitted by width, not one group at a time.
-                    # One and two bytes get a straight line each -- between them
-                    # that is nearly every id, length and count on the wire --
-                    # and anything longer runs a loop that does TWO 7-bit groups
-                    # a turn: five steps where two single-group turns cost eight.
-                    # ``>= 0x4000`` means at least three groups remain, so both
-                    # bytes that loop writes are certain to need a continuation
-                    # bit. The array elements this loop encodes are the case that
-                    # gets there -- 8.4 groups per element on the u64 workload.
-                    if v < 0x80:
-                        buf[cursor] = v
-                        cursor += 1
-                    elif v < 0x4000:
-                        buf[cursor] = (v & 0x7F) | 0x80
-                        buf[cursor + 1] = v >> 7
-                        cursor += 2
-                    else:
-                        while v >= 0x4000:
-                            buf[cursor] = (v & 0x7F) | 0x80
-                            buf[cursor + 1] = ((v >> 7) & 0x7F) | 0x80
-                            cursor += 2
-                            v >>= 14
-                        if v >= 0x80:
-                            buf[cursor] = (v & 0x7F) | 0x80
-                            cursor += 1
-                            v >>= 7
-                        buf[cursor] = v
-                        cursor += 1
-            finally:
-                # Also on the way out of a rejected element: what was written
-                # stays written, exactly as it did when the buffer was growable.
-                self._cursor = cursor
-        except SofaError as exc:
-            self._fail(exc)
+        More than ``cap`` elements is :class:`SofaArgumentError` before the header,
+        so nothing of the field is written; a negative ``cap`` checks no count. An
+        element above 255 is :class:`SofaArgumentError` from the per-element range
+        check every element already passes -- where the loop reaches it, so the
+        header and the elements before it are already written: the message is
+        failed and must be discarded, as generated ``encode()`` does by raising.
+        ``cap`` is an integer: anything else is a TypeError, one outside a C
+        ``ssize_t`` an OverflowError.""")
+    write_u16_array = _unsigned_array_writer(
+        "u16", """:meth:`write_u8_array` for ``u16`` elements.""")
+    write_u32_array = _unsigned_array_writer(
+        "u32", """:meth:`write_u8_array` for ``u32`` elements.""")
+    write_u64_array = _unsigned_array_writer(
+        "u64", """:meth:`write_u8_array` for ``u64`` elements: only the count is the
+        caller's bound, an element is held to the 64-bit range as always.""")
 
     def write_signed_array(self, field_id: SupportsIndex,
                            values: Iterable[SupportsIndex]) -> None:
@@ -908,72 +1053,20 @@ class Encoder:
         :meth:`write_unsigned` for what counts as an integer). A zero-count array
         is a valid, fully-specified empty array (``[header][count=0]``).
         """
-        self.write_signed_array_bounded(field_id, values, None, None, None)
+        self.write_i64_array(field_id, values, -1)
 
-    def write_signed_array_bounded(self, field_id: SupportsIndex,
-                                   values: Iterable[SupportsIndex],
-                                   cap: int | None,
-                                   elem_min: int | None,
-                                   elem_max: int | None, /) -> None:
-        """:meth:`write_signed_array` with the caller's bounds.
-
-        ``cap`` as for :meth:`write_unsigned_array_bounded`; ``elem_min`` and
-        ``elem_max`` are the element's declared width (-128..127 for
-        ``array<i8>``), checked by the per-element range check every element
-        already passes. ``None`` checks none on that side.
-        """
-        if not self._begin():
-            return
-        try:
-            seq = list(values)
-            if cap is not None and len(seq) > cap:
-                raise SofaArgumentError(f"array of {len(seq)} elements exceeds cap {cap}")
-            lo = SIGNED_MIN if elem_min is None or elem_min < SIGNED_MIN else elem_min
-            hi = SIGNED_MAX if elem_max is None or elem_max > SIGNED_MAX else elem_max
-            self._array_header(field_id, _WT_ARRAY_SIGNED, len(seq))
-            buf = self._fixed_ba   # see write_unsigned_array: codec inlined
-            limit = self._cap - _VARINT_MAX
-            cursor = self._cursor
-            try:
-                for v in seq:
-                    if not isinstance(v, int):
-                        v = _as_int(v, "signed array value")
-                    if v < lo or v > hi:
-                        raise SofaArgumentError(
-                            _elem_refusal("signed", v, elem_min, elem_max))
-                    u = (v << 1) ^ (v >> 63)
-                    if cursor > limit:
-                        self._cursor = cursor
-                        try:
-                            self._put(encode_varint(u))
-                        finally:
-                            cursor = self._cursor   # see write_unsigned_array
-                        buf = self._fixed_ba
-                        limit = self._cap - _VARINT_MAX
-                        continue
-                    if u < 0x80:
-                        buf[cursor] = u
-                        cursor += 1
-                    elif u < 0x4000:
-                        buf[cursor] = (u & 0x7F) | 0x80
-                        buf[cursor + 1] = u >> 7
-                        cursor += 2
-                    else:
-                        while u >= 0x4000:
-                            buf[cursor] = (u & 0x7F) | 0x80
-                            buf[cursor + 1] = ((u >> 7) & 0x7F) | 0x80
-                            cursor += 2
-                            u >>= 14
-                        if u >= 0x80:
-                            buf[cursor] = (u & 0x7F) | 0x80
-                            cursor += 1
-                            u >>= 7
-                        buf[cursor] = u
-                        cursor += 1
-            finally:
-                self._cursor = cursor
-        except SofaError as exc:
-            self._fail(exc)
+    # The width-typed signed array writers; see write_u8_array.
+    write_i8_array = _signed_array_writer(
+        "i8", """:meth:`write_signed_array` for an array of ``i8`` (or of an enum of
+        that width), with the schema's ``count`` as ``cap`` -- see
+        :meth:`write_u8_array`. An element outside -128..127 is refused.""")
+    write_i16_array = _signed_array_writer(
+        "i16", """:meth:`write_i8_array` for ``i16`` elements.""")
+    write_i32_array = _signed_array_writer(
+        "i32", """:meth:`write_i8_array` for ``i32`` elements.""")
+    write_i64_array = _signed_array_writer(
+        "i64", """:meth:`write_i8_array` for ``i64`` elements: only the count is the
+        caller's bound.""")
 
     def write_bool_array(
         self, field_id: SupportsIndex, values: Iterable[object]
@@ -999,18 +1092,19 @@ class Encoder:
     def write_bool_array_bounded(self, field_id: SupportsIndex,
                                  values: Iterable[object],
                                  cap: int | None, /) -> None:
-        """:meth:`write_bool_array` with the caller's ``cap`` (see
-        :meth:`write_unsigned_array_bounded`). A boolean has no width (§4.4), so
-        there is no element bound."""
+        """:meth:`write_bool_array` with the caller's ``cap``: more elements than
+        that is :class:`SofaArgumentError` before the header; ``None`` or a
+        negative ``cap`` checks no count, as on the width-typed array writers. A
+        boolean has no width (§4.4), so there is no element bound."""
         if not self._begin():
             return
         try:
             seq = list(values)
-            if cap is not None and len(seq) > cap:
+            if cap is not None and len(seq) > cap and cap >= 0:
                 raise SofaArgumentError(f"array of {len(seq)} elements exceeds cap {cap}")
             self._array_header(field_id, _WT_ARRAY_UNSIGNED, len(seq))
             # A boolean element is always exactly one byte, 0x00 or 0x01, so
-            # this is write_unsigned_array's inlined codec with every varint
+            # this is _unsigned_array_writer's inlined codec with every varint
             # case removed rather than a second copy of one. The view and the
             # capacity are re-read after each drain — a sink may install a
             # different buffer (see _put).
@@ -1053,7 +1147,7 @@ class Encoder:
                                     values: Iterable[float],
                                     cap: int | None, /) -> None:
         """:meth:`write_float32_array` with the caller's ``cap`` (see
-        :meth:`write_unsigned_array_bounded`)."""
+        :meth:`write_bool_array_bounded`)."""
         self._write_float_array(field_id, values, _ST_FP32, _core.pack_f32_array, 4, cap)
 
     def write_float32_array_bits(
@@ -1111,7 +1205,7 @@ class Encoder:
                                     values: Iterable[float],
                                     cap: int | None, /) -> None:
         """:meth:`write_float64_array` with the caller's ``cap`` (see
-        :meth:`write_unsigned_array_bounded`)."""
+        :meth:`write_bool_array_bounded`)."""
         self._write_float_array(field_id, values, _ST_FP64, _core.pack_f64_array, 8, cap)
 
     def _write_float_array(
@@ -1127,7 +1221,7 @@ class Encoder:
             return
         try:
             seq = [float(v) for v in values]
-            if cap is not None and len(seq) > cap:
+            if cap is not None and len(seq) > cap and cap >= 0:
                 raise SofaArgumentError(f"array of {len(seq)} elements exceeds cap {cap}")
             self._array_header(field_id, _WT_ARRAY_FIXLEN, len(seq))
             # §4.8: a fixlen array ALWAYS carries its fixlen_word (the shared

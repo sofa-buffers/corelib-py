@@ -130,11 +130,14 @@ enc.write_string(3, "hi")
 data = enc.getvalue()
 ```
 
-Every writer that measures its value has a `*_bounded` twin that takes the
-caller's declared bound and refuses a value past it with `SofaArgumentError`
-before any byte of the field is written. A schema's `maxlen` on a string counts
-UTF-8 **bytes**, which a `str` does not know; `write_string_bounded` checks it
-on the bytes the encode produces anyway:
+A schema bound is checked by the writer that already measures the value, and a
+value past it is refused with `SofaArgumentError`. A scalar, a string, a blob and
+an array's count are refused before any byte of the field is written; an array
+*element* past its width is refused where the loop reaches it, after the header and
+the elements before it, so the encoder's output is then no valid message and must
+be discarded (generated `encode()` raises and returns nothing). A schema's `maxlen` on a string counts UTF-8 **bytes**, which a `str`
+does not know; `write_string_bounded` checks it on the bytes the encode produces
+anyway:
 
 ```python
 from sofab import SofaArgumentError
@@ -147,19 +150,25 @@ except SofaArgumentError as exc:
     print(exc)                                # string of 10 UTF-8 bytes exceeds maxlen 8
 ```
 
-The others: `write_bytes_bounded(id, data, maxlen)`,
-`write_unsigned_bounded(id, value, max_value)` and
-`write_signed_bounded(id, value, min_value, max_value)` -- the width of a
-narrower integer, which a Python `int` does not carry --
-`write_unsigned_array_bounded(id, values, cap, elem_max)`,
-`write_signed_array_bounded(id, values, cap, elem_min, elem_max)` and
-`write_bool_array_bounded` / `write_float32_array_bounded` /
-`write_float64_array_bounded(id, values, cap)`. `cap` is checked before the
-array's header, an element width on each element. `None` leaves a bound
-unchecked, and a bound is compared as a number, exactly as Python compares it.
+A `maxlen` or `count` is the caller's number and rides the call:
+`write_bytes_bounded(id, data, maxlen)` and `write_bool_array_bounded` /
+`write_float32_array_bounded` / `write_float64_array_bounded(id, values, cap)`.
+It is compared as a number, exactly as Python compares it.
+
+A declared integer **width** is a type, so it is in the writer's name rather than
+an argument -- a Python `int` carries no width of its own:
+`write_u8`, `write_u16`, `write_u32`, `write_i8`, `write_i16`, `write_i32(id,
+value)` for a scalar (an enum or bitfield uses the width its declaration implies),
+and `write_u8_array` ... `write_u64_array`, `write_i8_array` ...
+`write_i64_array(id, values, cap)` for an array, where `cap` is the schema's
+`count`, checked before the header, and every element is held to the width.
+On every array writer a negative `cap` means no count bound (`None` too, except on
+the width-typed ones, whose `cap` is a plain integer). On the native engine a width as an argument would cost
+every call its unpacking; in the name it is a constant compare.
+
 The bound is the caller's: the library holds none, and the plain writers keep
 their signatures and their cost, checking nothing beyond the format's own
-limits. The bounded writers take their arguments by position only.
+limits. All of these writers take their arguments by position only.
 
 `Encoder()` writes into a fixed 1 KiB scratch buffer and appends each bufferful
 to the result it hands back — it never grows a buffer mid-message (see [Memory
