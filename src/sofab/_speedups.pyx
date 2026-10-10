@@ -941,15 +941,19 @@ cdef int _WHAT_ID = 4
 cdef tuple _WHATS = ("unsigned value", "signed value",
                      "unsigned array value", "signed array value", "id")
 
+# The fast path takes every int, subclasses included: a bool, an IntEnum or an
+# IntFlag member shares PyLongObject's layout (see _IsLongLike), and the
+# converters range-check it as they do an exact int. Only a non-int -- a float
+# among them, refused by _index_arg -- or an int outside 64 bits goes cold.
 cdef inline uint64_t _u64_elem(PyObject* p, int what) except? 0xDEAD:
     cdef uint64_t r
-    if _IsLong(p) and _ToU64(p, &r):
+    if _IsLongLike(p) and _ToU64(p, &r):
         return r
     return _u64_other(<object>p, what)
 
 cdef inline int64_t _i64_elem(PyObject* p, int what) except? -0xDEAD:
     cdef int64_t r
-    if _IsLong(p) and _ToI64(p, &r):
+    if _IsLongLike(p) and _ToI64(p, &r):
         return r
     return _i64_other(<object>p, what)
 
@@ -977,8 +981,8 @@ cdef object _index_arg(object value, int what):
                              % (_WHATS[what], type(value).__name__)) from None
 
 cdef uint64_t _u64_other(object value, int what) except? 0xDEAD:
-    # Cold: an exact int the converter rejected (outside the 64-bit domain), or
-    # something that is not an exact int at all.
+    # Cold: an int the converter rejected (outside the 64-bit domain), or
+    # something that is not an int at all.
     cdef object idx = _index_arg(value, what)
     cdef uint64_t out
     if _IsLongLike(<PyObject*>idx) and _ToU64(<PyObject*>idx, &out):
@@ -991,6 +995,23 @@ cdef int64_t _i64_other(object value, int what) except? -0xDEAD:
     if _IsLongLike(<PyObject*>idx) and _ToI64(<PyObject*>idx, &out):
         return out
     raise SofaArgumentError("%s %d out of range" % (_WHATS[what], idx))
+
+cdef Py_ssize_t _blob_len(object data) except -1:
+    """The byte length of a blob value that is not an exact bytes or bytearray,
+    or SofaArgumentError. Mirrors sofab.encoder._blob_len exactly: a blob is a
+    byte string -- bytes, bytearray (subclasses included) or a one-dimensional
+    memoryview of format 'B', the values that compare equal to a bytes of the
+    same content -- and anything else (an int, a list, an array.array, a
+    memoryview of wider items, whose len() counts items) is refused, never
+    converted."""
+    if isinstance(data, (bytes, bytearray)):
+        return len(data)
+    if isinstance(data, memoryview) and data.format == "B" and data.ndim == 1:
+        return data.nbytes
+    raise SofaArgumentError(
+        "blob must be bytes, bytearray or a memoryview of format 'B', not %s%s"
+        % (type(data).__name__,
+           " of format %r" % (data.format,) if isinstance(data, memoryview) else ""))
 
 # --- caller bounds --------------------------------------------------------------
 #
@@ -1691,13 +1712,25 @@ cdef class Encoder:
         # FIXLEN_MAX): a payload that is about to be refused is not worth
         # duplicating first. _write_fixlen_bytes re-checks the materialised
         # length, which is what actually reaches the wire. Mirrors the
-        # pure-Python Encoder.write_bytes.
-        cdef Py_ssize_t n = len(data)
+        # pure-Python Encoder.write_bytes, the byte-string contract (_blob_len)
+        # included.
+        cdef Py_ssize_t n
+        cdef type t = type(data)
+        if t is bytes:
+            n = PyBytes_GET_SIZE(data)
+        elif t is bytearray:
+            n = PyByteArray_GET_SIZE(data)
+        else:
+            try:
+                n = _blob_len(data)
+            except SofaError as exc:
+                self._fail(exc)
+                return
         if n > <Py_ssize_t>_FIXLEN_MAX:
             self._fail(SofaArgumentError(
                 "fixlen payload of %d bytes exceeds FIXLEN_MAX=%d" % (n, _FIXLEN_MAX)))
             return
-        cdef bytes b = bytes(data)
+        cdef bytes b = data if t is bytes else bytes(data)
         self._write_fixlen_bytes(field_id, b, _ST_BLOB)
 
     def write_string_bounded(self, object field_id, str text, object maxlen, /):
@@ -1723,7 +1756,18 @@ cdef class Encoder:
         # write_bytes with the caller's bound on the declared length, before the copy.
         if not self._begin():
             return
-        cdef Py_ssize_t n = len(data)
+        cdef Py_ssize_t n
+        cdef type t = type(data)
+        if t is bytes:
+            n = PyBytes_GET_SIZE(data)
+        elif t is bytearray:
+            n = PyByteArray_GET_SIZE(data)
+        else:
+            try:
+                n = _blob_len(data)
+            except SofaError as exc:
+                self._fail(exc)
+                return
         if n > <Py_ssize_t>_FIXLEN_MAX:
             self._fail(SofaArgumentError(
                 "fixlen payload of %d bytes exceeds FIXLEN_MAX=%d" % (n, _FIXLEN_MAX)))
@@ -1731,7 +1775,7 @@ cdef class Encoder:
         if maxlen is not None and _u_over_fast(<uint64_t>n, maxlen):
             self._fail(SofaArgumentError("blob of %d bytes exceeds maxlen %s" % (n, maxlen)))
             return
-        cdef bytes b = bytes(data)
+        cdef bytes b = data if t is bytes else bytes(data)
         self._write_fixlen_bytes(field_id, b, _ST_BLOB)
 
     cdef int _write_fixlen_raw(self, object field_id, const unsigned char* data,

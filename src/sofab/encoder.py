@@ -46,6 +46,7 @@ piece of the codec's bounded working state.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterable
 from operator import index as _index
 from struct import Struct as _Struct
@@ -108,6 +109,18 @@ Writer = object  # anything with .write(bytes)
 #: never from a float (§6.5).
 _U32_LE = _Struct("<I")
 
+#: ``operator.index`` where it already returns an exact ``int`` (3.10 on). The
+#: integer writers send every value that is not an exact ``int`` through it, so
+#: their varint math runs on a plain ``int`` and never on a subclass whose ``&``
+#: / ``|`` are Python code (an ``IntFlag`` builds a new member per byte). Before
+#: 3.10 ``index()`` returns an ``int`` subclass as it is, so there the exact
+#: ``int`` is made from it -- after ``index()``, so a float is still refused.
+if sys.version_info >= (3, 10):
+    _int_index = _index
+else:  # pragma: no cover - Python 3.9 only
+    def _int_index(value: SupportsIndex) -> int:
+        return int(_index(value))
+
 
 def _as_int(value: object, what: str) -> int:
     """Coerce ``value`` to the ``int`` an integer field will be written from.
@@ -131,6 +144,32 @@ def _as_int(value: object, what: str) -> int:
         raise SofaArgumentError(
             f"{what} must be an integer, not {type(value).__name__}"
         ) from None
+
+
+def _blob_len(data: object) -> int:
+    """The byte length of a blob value that is not an exact ``bytes`` or
+    ``bytearray``, or :class:`SofaArgumentError`.
+
+    A blob is a byte string, so the value must be one: ``bytes``, ``bytearray``
+    (subclasses included) or a one-dimensional ``memoryview`` of format ``'B'``
+    -- exactly the values that compare equal to a ``bytes`` of the same content,
+    which is what a generated omission test compares a blob field with. Its
+    ``len()`` is then its byte count, the unit a schema ``maxlen`` counts in.
+
+    Anything else is refused rather than converted: ``bytes(n)`` would turn an
+    int into ``n`` zero bytes, ``bytes([...])`` a list into a payload, and a
+    buffer of wider items (``array('H')``, a ``memoryview`` cast to ``'H'``)
+    has a ``len()`` that counts items, not the bytes that reach the wire.
+    """
+    if isinstance(data, (bytes, bytearray)):
+        return len(data)
+    if isinstance(data, memoryview) and data.format == "B" and data.ndim == 1:
+        return data.nbytes
+    raise SofaArgumentError(
+        "blob must be bytes, bytearray or a memoryview of format 'B', "
+        f"not {type(data).__name__}"
+        + (f" of format {data.format!r}" if isinstance(data, memoryview) else "")
+    )
 
 
 # --- caller bounds -------------------------------------------------------------
@@ -203,8 +242,11 @@ def _unsigned_scalar(width: str, doc: str) -> _ScalarWriter:
         if not self._begin():
             return
         try:
-            if not isinstance(value, int):
-                value = _as_int(value, "unsigned value")
+            if type(value) is not int:
+                try:
+                    value = _int_index(value)
+                except TypeError:
+                    value = _as_int(value, "unsigned value")
             if value < 0 or value > UNSIGNED_MAX:
                 raise SofaArgumentError(f"unsigned value {value} out of range")
             if value > hi:
@@ -227,8 +269,11 @@ def _signed_scalar(width: str, doc: str) -> _ScalarWriter:
         if not self._begin():
             return
         try:
-            if not isinstance(value, int):
-                value = _as_int(value, "signed value")
+            if type(value) is not int:
+                try:
+                    value = _int_index(value)
+                except TypeError:
+                    value = _as_int(value, "signed value")
             if value < SIGNED_MIN or value > SIGNED_MAX:
                 raise SofaArgumentError(f"signed value {value} out of range")
             if value < lo or value > hi:
@@ -274,8 +319,11 @@ def _unsigned_array_writer(width: str, doc: str) -> _ArrayWriter:
             cursor = self._cursor
             try:
                 for v in seq:
-                    if not isinstance(v, int):
-                        v = _as_int(v, "unsigned array value")
+                    if type(v) is not int:
+                        try:
+                            v = _int_index(v)
+                        except TypeError:
+                            v = _as_int(v, "unsigned array value")
                     if v < 0 or v > hi:
                         raise SofaArgumentError(_elem_refusal("unsigned", v, width))
                     if cursor > limit:
@@ -354,8 +402,11 @@ def _signed_array_writer(width: str, doc: str) -> _ArrayWriter:
             cursor = self._cursor
             try:
                 for v in seq:
-                    if not isinstance(v, int):
-                        v = _as_int(v, "signed array value")
+                    if type(v) is not int:
+                        try:
+                            v = _int_index(v)
+                        except TypeError:
+                            v = _as_int(v, "signed array value")
                     if v < lo or v > hi:
                         raise SofaArgumentError(_elem_refusal("signed", v, width))
                     u = (v << 1) ^ (v >> 63)
@@ -813,8 +864,11 @@ class Encoder:
         if not self._begin():
             return
         try:
-            if not isinstance(value, int):
-                value = _as_int(value, "unsigned value")
+            if type(value) is not int:
+                try:
+                    value = _int_index(value)
+                except TypeError:
+                    value = _as_int(value, "unsigned value")
             if value < 0 or value > UNSIGNED_MAX:
                 raise SofaArgumentError(f"unsigned value {value} out of range")
             self._header(field_id, _WT_UNSIGNED)
@@ -832,8 +886,11 @@ class Encoder:
         if not self._begin():
             return
         try:
-            if not isinstance(value, int):
-                value = _as_int(value, "signed value")
+            if type(value) is not int:
+                try:
+                    value = _int_index(value)
+                except TypeError:
+                    value = _as_int(value, "signed value")
             if value < SIGNED_MIN or value > SIGNED_MAX:
                 raise SofaArgumentError(f"signed value {value} out of range")
             self._header(field_id, _WT_SIGNED)
@@ -927,6 +984,11 @@ class Encoder:
                     data: bytes | bytearray | memoryview) -> None:
         """Write a raw byte blob as a fixlen field (BLOB subtype).
 
+        ``data`` must be a byte string: ``bytes``, ``bytearray`` or a
+        one-dimensional ``memoryview`` of format ``'B'``. Anything else -- an
+        int, a list, an ``array.array`` or a ``memoryview`` of wider items -- is
+        :class:`SofaArgumentError`, never converted (see :func:`_blob_len`).
+
         A blob longer than :data:`sofab.FIXLEN_MAX` is refused with
         :class:`SofaArgumentError` (see :meth:`_write_fixlen`) — on the *declared*
         length, before the copy, so an oversized payload is never duplicated
@@ -934,12 +996,21 @@ class Encoder:
         """
         if not self._begin():
             return
-        n = len(data)
+        t = type(data)
+        try:
+            n = len(data) if t is bytes or t is bytearray else _blob_len(data)
+        except SofaError as exc:
+            self._fail(exc)
+            return
         if n > FIXLEN_MAX:
             self._fail(SofaArgumentError(
                 f"fixlen payload of {n} bytes exceeds FIXLEN_MAX={FIXLEN_MAX}"))
             return
-        self._write_fixlen(field_id, bytes(data), _ST_BLOB)
+        # An exact bytes is immutable and goes out as it is (bytes() would hand
+        # back the same object, at the price of a call); anything else is copied
+        # once, so a sink that runs mid-write cannot change what is written.
+        self._write_fixlen(field_id, data if t is bytes else bytes(data),  # type: ignore[arg-type]
+                           _ST_BLOB)
 
     def write_string_bounded(self, field_id: SupportsIndex, text: str,
                              maxlen: int | None, /) -> None:
@@ -975,7 +1046,12 @@ class Encoder:
         """
         if not self._begin():
             return
-        n = len(data)
+        t = type(data)
+        try:
+            n = len(data) if t is bytes or t is bytearray else _blob_len(data)
+        except SofaError as exc:
+            self._fail(exc)
+            return
         if n > FIXLEN_MAX:
             self._fail(SofaArgumentError(
                 f"fixlen payload of {n} bytes exceeds FIXLEN_MAX={FIXLEN_MAX}"))
@@ -983,7 +1059,11 @@ class Encoder:
         if maxlen is not None and n > maxlen:
             self._fail(SofaArgumentError(f"blob of {n} bytes exceeds maxlen {maxlen}"))
             return
-        self._write_fixlen(field_id, bytes(data), _ST_BLOB)
+        # An exact bytes is immutable and goes out as it is (bytes() would hand
+        # back the same object, at the price of a call); anything else is copied
+        # once, so a sink that runs mid-write cannot change what is written.
+        self._write_fixlen(field_id, data if t is bytes else bytes(data),  # type: ignore[arg-type]
+                           _ST_BLOB)
 
     def _write_fixlen(self, field_id: SupportsIndex, data: bytes,
                       subtype: int) -> None:
