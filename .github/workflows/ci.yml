@@ -50,7 +50,7 @@ jobs:
           # python_version in [tool.mypy] and follows the running interpreter --
           # so it runs per leg in the test matrix instead, and here only as a
           # fast gate against the newest.
-          python-version: '3.14'
+          python-version: '3.15'
           cache: 'pip'
 
       - name: Install package and tooling
@@ -167,7 +167,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: '3.14'
+          python-version: '3.15'
           cache: 'pip'
 
       - name: Install without the native accelerator
@@ -200,7 +200,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: '3.14'
+          python-version: '3.15'
           cache: 'pip'
 
       - name: Install package and tooling

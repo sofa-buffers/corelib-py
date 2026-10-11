@@ -68,7 +68,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: '3.14'
+          python-version: '3.15'
       - name: Build
         run: |
           python -m pip install --upgrade build
@@ -168,7 +168,7 @@ jobs:
           merge-multiple: true
       - uses: actions/setup-python@v7
         with:
-          python-version: '3.14'
+          python-version: '3.15'
       - name: Guard — one sdist, some wheels, all at the tag version
         shell: bash
         run: |
@@ -271,7 +271,7 @@ jobs:
           merge-multiple: true
       - uses: actions/setup-python@v7
         with:
-          python-version: '3.14'
+          python-version: '3.15'
       - name: Compare the published file set with the built one
         shell: bash
         run: |
