@@ -68,8 +68,11 @@ sofab = ["_speedups.pyx", "_speedups.c"]
 # compile degrades to pure Python), which is right for a from-source install and
 # wrong here, so every wheel is tested for IMPL == "native" before it may ship.
 build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
-# 32-bit and PyPy: not covered by the test matrix, and not worth the build time.
-skip = "*-win32 *_i686 pp*"
+# 32-bit: not covered by the test matrix, and not worth the build time. PyPy
+# needs no entry at all — `build` above selects CPython only, and since
+# cibuildwheel 4 PyPy is off unless `enable` asks for it, so a `pp*` skip is
+# a selector for a group that was never built: it warns and does nothing.
+skip = "*-win32 *_i686"
 build-frontend = "build"
 test-requires = "pytest"
 test-command = [
